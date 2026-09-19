@@ -288,10 +288,18 @@ in scrollback after a top-up reports a solved problem as live.
 
 ### A spend cap, measured in (2026-09-18)
 
-opencode spent **$952 in one day against ~$18 the day before.** fleet-watch now reads `opencode stats` (cached
-30 minutes — it reads a very large database) and, at or over `opencode_daily_usd` in the caps file, stops
-new opencode dispatches and reviews while running work finishes. The pause logs once when it starts and once
-when it lifts. (`ops/oc-compact.sh` exists because that database had grown to 133 GB.)
+opencode spent **$290, then $376** on two consecutive days, against $27–$82 on each of the four days before.
+At or over `opencode_daily_usd` in the caps file, fleet-watch stops new opencode dispatches and reviews while
+running work finishes; the pause logs once when it starts and once when it lifts.
+
+**The first version of the cap measured the wrong thing, and so did the headline number.** It read
+`opencode stats --days 1`, which reported **$952** for that day. That command sums the *lifetime* cost of every
+session touched in the window: at the moment it said $856.01, `sum(session.cost)` over sessions updated in the
+last 24 h was $856.01 to the cent, while the per-message cost inside those 24 h was $212.60. So a long-lived
+session that did one cheap thing today counts its whole history, and yesterday's spend blocks today. The cap
+now sums per-message cost since local midnight straight from opencode's database — an indexed query that takes
+milliseconds instead of a multi-second stats run. The number was quoted for a day before anyone asked what the
+instrument added up. (`ops/oc-compact.sh` exists because that database had grown to 133 GB.)
 
 ## Idle non-coders go hunting (2026-09-07)
 

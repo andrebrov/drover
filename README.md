@@ -23,7 +23,9 @@ noticing, and the ledger says what that cost:
   error**, and were dispatched into again.
 - Reports announced "DONE, landable" **for the ninth time** — each one a paid round that re-verified
   commits that already existed.
-- One day's opencode bill was **$952 against ~$18 the day before**.
+- opencode spent **$290, then $376** on two consecutive days, against $27–$82 on each of the four days before.
+  The first meter built to watch it (`opencode stats --days 1`) reported **$952**: it adds up the lifetime
+  cost of every session touched in the window. The cap now sums per-message cost since midnight.
 
 drover's answers: agents announce completion (`fleet-done`) instead of being polled; state is judged by
 artifacts (a commit on the branch, a report on disk), never by status fields; a watcher reacts within a
@@ -70,7 +72,7 @@ against current main, runs migrations, and pushes.
    rate-limit model switch). A generic "Enter to confirm" match once hit a folder-trust dialog whose cursor sat
    on "No, exit" and killed three seats.
 2. **Budget** — `fleet-budget` reads each non-working pane for out-of-credits / usage-limit / session-limit
-   banners (ignoring stale scrollback); the spend guard compares `opencode stats` against your daily cap; any
+   banners (ignoring stale scrollback); the spend guard sums today's per-message opencode cost from its database and compares it with your daily cap; any
    harness listed in `state/harness-off` is off. A broke harness gets no new dispatches or reviews.
 3. **Harvest beans** that agents filed in their worktrees onto main (the board follows main).
 4. **Drain the inbox** — route each announcement: DONE → a cross-harness review; PARTIAL → back to the coder;

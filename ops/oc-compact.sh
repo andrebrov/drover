@@ -9,8 +9,7 @@
 # swaps, removes the old 133 GB file, and resumes the watcher. Aborts without touching the DB on any doubt.
 # The free-space floor below was sized for that 49 GB copy; set MIN_FREE_GB for your own database.
 #
-# Why it matters to the fleet: fleet-watch's spend guard runs `opencode stats`, which reads this database;
-# at 133 GB that read was slow enough to need a 30-minute cache.
+# Why it matters to the fleet: every opencode seat writes this one database, and at 133 GB it ate the disk.
 set -uo pipefail
 DB="$HOME/.local/share/opencode/opencode.db"; NEW="$DB.compact"; OUT="$HOME/.local/share/opencode-archive/$(date +%F)"
 PLIST="$HOME/Library/LaunchAgents/dev.drover.fleet-watch.plist"

@@ -123,10 +123,16 @@ check_budget(){
   spend_guard
 }
 
-# --- guardrail: opencode daily spend cap (2026-09-18: $952 in one day vs ~$18 the day before) ---
+# --- guardrail: opencode daily spend cap (2026-09-17/18: $290 then $376 a day, vs $27-$82 on each of the four days before) ---
 # Cap in $FLEET_CAPS (opencode_daily_usd=N), re-read every tick. At or over the cap opencode joins BROKE:
-# no new opencode dispatches or reviews; running work finishes. `opencode stats` reads a very large
-# database, so the figure is cached for 30 minutes. The pause logs once when it starts and once when it lifts.
+# no new opencode dispatches or reviews; running work finishes. The pause logs once when it starts and once when it lifts.
+#
+# Spend = per-message cost since LOCAL MIDNIGHT, read straight from opencode's database (indexed, milliseconds).
+# NOT `opencode stats --days 1`: that sums the LIFETIME cost of every session touched in the window. Measured
+# 2026-09-19: stats said $856.01, which equals sum(session.cost) over sessions updated in the last 24h; the
+# per-message cost in the same 24h was $212.60. The cap's first version used stats and reported "$952 in one
+# day" for a day whose real spend was $376. A calendar day also keeps yesterday's spend from blocking today.
+OPENCODE_DB="${OPENCODE_DB:-$HOME/.local/share/opencode/opencode.db}"
 spend_guard(){
   local cap cache="$STATE/spend-opencode" now; now=$(date +%s)
   cap=$(sed -n 's/^opencode_daily_usd=\([0-9.]*\).*/\1/p' "$FLEET_CAPS" 2>/dev/null | head -1)
@@ -136,14 +142,16 @@ spend_guard(){
   if [ -n "$from" ] && [[ "$(date +%F)" < "$from" ]]; then
     [ -f "$STATE/spend-capped" ] && { rm -f "$STATE/spend-capped"; log "SPEND CAP off until $from"; }
     return 0; fi
-  if [ ! -f "$cache" ] || [ $(( now - $(stat -f %m "$cache") )) -ge 1800 ]; then
-    local usd; usd=$(opencode stats --days 1 2>/dev/null | sed -n 's/.*Total Cost[^$]*\$\([0-9.,]*\).*/\1/p' | tr -d , | head -1)
+  if [ ! -f "$cache" ] || [ $(( now - $(stat -f %m "$cache") )) -ge 300 ] || [ "$(date -r "$(stat -f %m "$cache")" +%F)" != "$(date +%F)" ]; then
+    local usd mid; mid=$(( $(date -j -f '%Y-%m-%d %H:%M:%S' "$(date +%F) 00:00:00" +%s) * 1000 ))
+    usd=$(sqlite3 -readonly "file:$OPENCODE_DB?mode=ro" \
+      "select printf('%.2f',coalesce(sum(json_extract(m.data,'\$.cost')),0)) from session s join message m on m.session_id=s.id and m.time_created >= $mid;" 2>/dev/null)
     [ -n "$usd" ] && printf '%s\n' "$usd" > "$cache"
   fi
   local spent; spent=$(cat "$cache" 2>/dev/null); [ -n "$spent" ] || return 0
   if awk -v s="$spent" -v c="$cap" 'BEGIN{exit !(s+0 >= c+0)}'; then
     BROKE="$BROKE opencode"
-    [ -f "$STATE/spend-capped" ] || { : > "$STATE/spend-capped"; log "SPEND CAP: opencode \$$spent in the last day >= \$$cap cap — no new opencode dispatches or reviews (raise opencode_daily_usd in $FLEET_CAPS to override)"; }
+    [ -f "$STATE/spend-capped" ] || { : > "$STATE/spend-capped"; log "SPEND CAP: opencode \$$spent today >= \$$cap cap — no new opencode dispatches or reviews (raise opencode_daily_usd in $FLEET_CAPS to override)"; }
   elif [ -f "$STATE/spend-capped" ]; then rm -f "$STATE/spend-capped"; log "SPEND CAP lifted: opencode \$$spent < \$$cap"; fi
 }
 
