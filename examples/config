@@ -34,3 +34,8 @@ DROVER_GENERATED="${DROVER_GENERATED:-}"
 # DROVER_RULES="${DROVER_RULES:-$HOME/.config/drover/PEERS.md}"  # your own agent rules, replaces the shipped skill
 # DROVER_BACKUP_LEAD="${DROVER_BACKUP_LEAD:-lead-backup}"        # the seat lead-watchdog wakes
 # FLEET_TICK="${FLEET_TICK:-60}"                                 # fleet-watch tick, seconds
+
+# fleet-sweep may delete stale dirs inside Claude Code scratchpads (every session on this machine must be a seat)
+# DROVER_SWEEP_SCRATCHPADS="${DROVER_SWEEP_SCRATCHPADS:-0}"
+# Seats bypass approval prompts; 0 turns that off
+# DROVER_YOLO="${DROVER_YOLO:-1}"

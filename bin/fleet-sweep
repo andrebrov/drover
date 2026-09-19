@@ -13,6 +13,9 @@ MIN_AGE=${MIN_AGE:-120}
 DRY=${DRY:-0}
 now=$(date +%s); freed=0
 before=$(df -g / | awk 'NR==2{print $4}')
+# Opt-in: this deletes directories inside OTHER Claude Code sessions' scratchpads. Enable it only on a machine
+# where every session is a fleet seat (DROVER_SWEEP_SCRATCHPADS=1 in ~/.config/drover/config).
+[ "${DROVER_SWEEP_SCRATCHPADS:-0}" = 1 ] || SCRATCH_ROOT=/nonexistent
 while read -r sp; do
   while read -r d; do
     sz=$(du -sm "$d" 2>/dev/null | cut -f1) || continue

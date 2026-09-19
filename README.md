@@ -119,7 +119,7 @@ one-word tag (ROUTED, DISPATCH, FOLLOWUP, PARTIAL, SKIP, STALE, BUDGET, APPROVED
 |---|---|---|---|
 | `noop` | P(this round produced no new work) | AUC 0.98 | At p ≥ 0.8, counts a no-op round; two in a row hold the bean for the lead. |
 | `verdict` | P(this review says land it as it is), verdict words removed | AUC 0.96; 0 of 17 CHANGES reviews read as approve at p ≥ 0.8 | Used only when neither the announcement nor a `VERDICT:` line says; p between 0.2 and 0.8 goes to the lead. |
-| `seat` | working / idle / out_of_credits / prompt_typed_not_sent / blocked_on_dialog | At confidence ≥ 0.8: 5 of 5 firings correct, 0 false on 25 labeled panes; 3 of 3 dialogs | out_of_credits → seat marked dead, bean requeued. Dialogs and unsent prompts are flagged for the human once, never answered. |
+| `seat` | working / idle / out_of_credits / prompt_typed_not_sent / blocked_on_dialog | On the shipped fixtures (`eval/`, 28 panes incl. 3 dialogs): 25 of 28 top-1; at confidence ≥ 0.8, 7 firings, 7 correct, 0 false | out_of_credits → seat marked dead, bean requeued. Dialogs and unsent prompts are flagged for the human once, never answered. |
 
 `eval/` has the seat-state fixtures (real pane tails, rewritten to remove paths and task text) and a script that
 scores the shipped detector against them. The numbers above were measured on the unscrubbed originals; the
@@ -207,6 +207,8 @@ values as `${VAR:-value}` so an environment variable still wins. See [`examples/
 | `DROVER_BEAN_PREFIX` | from `.beans.yml` | Bean id prefix; ids are `<prefix>` + 4 chars (`DROVER_BEAN_RE` to change). |
 | `DROVER_RULES` | `~/.config/drover/PEERS.md` | If present, replaces the shipped skill body in `fleet rules`. |
 | `FLEET_TICK` | `60` | Watcher tick, seconds. |
+| `DROVER_YOLO` | `1` | Launch seats with the harness's approval-bypass flag. `0` makes every seat stop at permission prompts (and stop being unattended). |
+| `DROVER_SWEEP_SCRATCHPADS` | `0` | Let `fleet-sweep` delete stale >= 50 MB dirs inside Claude Code scratchpads. Only on a machine where every session is a seat. |
 | `FLEET_OPENCODE_MODEL`, `FLEET_CLAUDE_MODEL`, `FLEET_AGY_MODEL` | harness default | Spawn-time model pins. |
 
 Spend caps live in `~/.config/drover/caps` (`opencode_daily_usd=`, `active_from=`), re-read every tick.

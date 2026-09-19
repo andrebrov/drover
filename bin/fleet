@@ -43,10 +43,10 @@ herdr() {
 FLEET_ROOT="${FLEET_ROOT:-${DROVER_REPO:-}}"
 FLEET_WS="${FLEET_WS:-fleet}"                # shared-tree mode only
 FLEET_WORKTREES="${FLEET_WORKTREES:-1}"
-# Seats always launch with their harness's approval-bypass flag. This is deliberate and must survive
-# herdr/session restarts (fleet-yolo re-applies it); an inherited environment variable must not
-# silently turn it off.
-FLEET_YOLO=1
+# Seats launch with their harness's approval-bypass flag by default. This is deliberate and must survive
+# herdr/session restarts (fleet-yolo re-applies it). Turn it off only on purpose, in the config file:
+# DROVER_YOLO=0 (a stray FLEET_YOLO in an inherited environment is ignored).
+FLEET_YOLO="${DROVER_YOLO:-1}"
 FLEET_SEED_WIP="${FLEET_SEED_WIP:-1}"
 FLEET_ADOPT="${FLEET_ADOPT:-0}"
 # The model is a SPAWN-TIME flag (see agent_args below), so changing a default does NOT move a pane
