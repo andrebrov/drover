@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# fleet-tasks — a task ledger: one row per task, from assignment to landing.
+#
+#   fleet-tasks sync              close out finished tasks by reading reports + git
+#   fleet-tasks board             open tasks: who holds what, and for how long
+#   fleet-tasks stats             per-agent outcome rates — the routing evidence
+#   fleet-tasks show <agent>      that agent's task history
+#
+# The event log (fleet-ledger.tsv) records dispatches but under-records finishes:
+# 356 assigns to 94 finishes on 2026-09-03, so it cannot answer "who is good at what".
+# This derives the missing half from artefacts that cannot lie: report files, review
+# VERDICT lines, and whether the work reached origin/main.
+set +u
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+EV="$FLEET_LEDGER"
+DB="$DROVER_HOME/task-ledger.tsv"
+ROOT="${FLEET_ROOT:-${DROVER_REPO:?set DROVER_REPO (env or ~/.config/drover/config) to your project checkout}}"
+REPORTS="$FLEET_REPORTS"
+mkdir -p "$DROVER_HOME"
+[ -f "$DB" ] || printf 'task_id\tagent\trole\tharness\tbean\tassigned_at\tfinished_at\treport\tverdict\trounds\tlanded\n' > "$DB"
+
+sync_tasks() {
+  local added=0
+  # every dispatch in the event log is a task; the report file is its completion proof
+  awk -F'\t' '$2=="assign"||$2=="review" {print $1"\t"$3"\t"$4"\t"$5"\t"$6}' "$EV" 2>/dev/null | while IFS=$'\t' read -r ts agent harness role bean; do
+    [ -n "$agent" ] || continue
+    local id="${agent}:${bean:-none}:${ts}"
+    grep -qF "$id" "$DB" 2>/dev/null && continue
+    # newest report naming this agent and bean
+    local rep verdict fin rounds landed
+    # match ONLY on agent AND bean. A fallback to "this agent's newest report" pinned the
+    # same file to every one of its tasks and made the verdict column fiction.
+    [ -n "$bean" ] && [ "$bean" != "-" ] && rep=$(ls -t "$REPORTS"/*"$agent"*"$bean"*.md 2>/dev/null | head -1)
+    if [ -n "$rep" ]; then
+      fin=$(date -u -r "$rep" +%FT%TZ 2>/dev/null)
+      # the verdict is the LAST such line: reports quote the instruction ("last line
+      # exactly VERDICT: APPROVE or VERDICT: CHANGES") near the top, and reading the
+      # first match scored every review as CHANGES.
+      verdict=$(grep -oE 'VERDICT: (APPROVE|CHANGES)' "$rep" 2>/dev/null | tail -1 | awk '{print $2}')
+      rounds=$(printf '%s' "$rep" | grep -oE 'r[0-9]+\.md$' | tr -dc '0-9')
+    fi
+    [ -n "$bean" ] && [ "$bean" != "-" ] && landed=$(git -C "$ROOT" log --oneline origin/main --grep "$bean" 2>/dev/null | head -1 | awk '{print $1}')
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$id" "$agent" "$role" "$harness" "${bean:--}" "$ts" "${fin:--}" "$(basename "${rep:--}")" "${verdict:--}" "${rounds:-1}" "${landed:--}" >> "$DB"
+  done
+  echo "ledger rows: $(( $(wc -l < "$DB") - 1 ))"
+}
+
+case "${1:-board}" in
+sync)  sync_tasks ;;
+board)
+  printf '%-20s %-10s %-12s %-9s %s\n' AGENT ROLE BEAN VERDICT AGE
+  awk -F'\t' 'NR>1 && $7=="-" {print}' "$DB" | while IFS=$'\t' read -r id agent role harness bean at fin rep v r landed; do
+    printf '%-20s %-10s %-12s %-9s %s\n' "$agent" "$role" "$bean" "${v:--}" "$at"; done | tail -20 ;;
+stats)
+  # UNVALIDATED — do not use for routing. Checked 2026-09-04 against ground truth
+  # (tail -1 of every review file): this view reported 1 APPROVE / 319 CHANGES where the
+  # files say 18 / 34. Cause: one report matches many task rows, because a bean is
+  # dispatched repeatedly across rounds and every dispatch becomes a row. Needs
+  # round-aware matching before any number here means anything.
+  echo "stats: DISABLED — the verdict column does not match the review files (1 vs 18 approvals)."
+  echo "Use the review files directly: for f in $REPORTS/*review*.md; do tail -1 \$f; done"
+  exit 0
+  printf '%-20s %-9s %6s %8s %8s %7s %s\n' AGENT HARNESS TASKS APPROVE CHANGES LANDED 'APPROVE RATE'
+  awk -F'\t' 'NR>1 {t[$2]++; h[$2]=$4; if($9=="APPROVE")a[$2]++; if($9=="CHANGES")c[$2]++; if($11!="-")l[$2]++}
+    END{for(k in t){rate=(a[k]+c[k])>0?sprintf("%.0f%%",100*a[k]/(a[k]+c[k])):"--";
+      printf "%-20s %-9s %6d %8d %8d %7d %s\n",k,h[k],t[k],a[k],c[k],l[k],rate}}' "$DB" | sort -k3 -rn ;;
+show)
+  awk -F'\t' -v a="$2" 'NR>1 && $2==a {printf "  %-12s %-9s %-28s %s\n", $5, $9, $8, $6}' "$DB" | tail -25 ;;
+*) sed -n '2,9p' "$0"; exit 2 ;;
+esac

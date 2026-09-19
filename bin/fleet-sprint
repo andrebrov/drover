@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# fleet-sprint — run the fleet in themed sprints instead of ad-hoc assignment.
+#
+#   fleet-sprint start "<theme>" <bean> [bean...]   open a sprint, assign coders round-robin
+#   fleet-sprint board                              what this sprint is doing, one line per bean
+#   fleet-sprint close [note]                       close it; prints what landed and what did not
+#
+# A sprint is a theme + its beans + the agents on them. It exists so every agent is
+# pointed at ONE area at a time: related fixes review each other, land together, and a
+# reviewer holds one context instead of ten. State: $DROVER_HOME/sprint.tsv
+set +u
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+SPRINT="$DROVER_HOME/sprint.tsv"
+FLEET_BIN="$DROVER_BIN"/fleet
+REPORTS="$FLEET_REPORTS"
+REPO="${DROVER_REPO:?set DROVER_REPO (env or ~/.config/drover/config) to your project checkout}"
+mkdir -p "$DROVER_HOME"
+
+coders()    { $FLEET_BIN status 2>/dev/null | awk '$1 ~ /-coder$/ {print $1}'; }
+
+case "${1:-board}" in
+start)
+  theme=$2; shift 2; beans=("$@")
+  [ -n "$theme" ] && [ ${#beans[@]} -gt 0 ] || { echo "usage: fleet-sprint start \"<theme>\" <bean> [bean...]"; exit 2; }
+  id="s$(date +%m%d%H%M)"
+  : > "$SPRINT"
+  printf 'sprint\t%s\t%s\t%s\n' "$id" "$(date -u +%FT%TZ)" "$theme" >> "$SPRINT"
+  cs=(); while IFS= read -r line; do cs+=("$line"); done < <(coders)
+  [ ${#cs[@]} -gt 0 ] || { echo "no coders available"; exit 1; }
+  i=0
+  for b in "${beans[@]}"; do
+    c=${cs[$((i % ${#cs[@]}))]}; i=$((i+1))
+    printf 'bean\t%s\t%s\t%s\t%s\n' "$id" "$b" "$c" assigned >> "$SPRINT"
+    printf '%-12s -> %s\n' "$b" "$c"
+  done
+  echo "sprint $id opened: $theme  (${#beans[@]} beans over ${#cs[@]} coders)"
+  echo "dispatch them with your own briefs; fleet-sprint only tracks the board." ;;
+board)
+  [ -s "$SPRINT" ] || { echo "no sprint open"; exit 0; }
+  awk -F'\t' '$1=="sprint"{printf "sprint %s  %s\n  opened %s\n", $2, $4, $3}' "$SPRINT"
+  printf '  %-12s %-20s %-10s %s\n' BEAN OWNER STATE EVIDENCE
+  awk -F'\t' '$1=="bean"{print $3"\t"$4}' "$SPRINT" | while IFS=$'\t' read -r b owner; do
+    st=$($FLEET_BIN status 2>/dev/null | awk -v n="$owner" '$1==n {print $3}')
+    rep=$(ls -t $REPORTS/*"$b"*.md 2>/dev/null | head -1)
+    rev=$(ls -t $REPORTS/*review*"$b"*.md 2>/dev/null | head -1)
+    ev=""
+    [ -n "$rep" ] && ev="report"
+    [ -n "$rev" ] && ev="$(grep -m1 '^VERDICT' "$rev" 2>/dev/null || echo review)"
+    printf '  %-12s %-20s %-10s %s\n' "$b" "$owner" "${st:-?}" "${ev:-—}"
+  done ;;
+close)
+  [ -s "$SPRINT" ] || { echo "no sprint open"; exit 0; }
+  id=$(awk -F'\t' '$1=="sprint"{print $2}' "$SPRINT")
+  theme=$(awk -F'\t' '$1=="sprint"{print $4}' "$SPRINT")
+  echo "closing sprint $id: $theme"
+  awk -F'\t' '$1=="bean"{print $3}' "$SPRINT" | while read -r b; do
+    landed=$(git -C "$REPO" log --oneline origin/main --grep "$b" | head -1)
+    printf '  %-12s %s\n' "$b" "${landed:-NOT LANDED}"
+  done
+  printf 'closed\t%s\t%s\t%s\n' "$id" "$(date -u +%FT%TZ)" "${2:-}" >> "$SPRINT"
+  cp "$SPRINT" "$DROVER_HOME/sprint-$id.tsv"
+  : > "$SPRINT"
+  echo "archived to $DROVER_HOME/sprint-$id.tsv" ;;
+*) sed -n '2,12p' "$0"; exit 2 ;;
+esac

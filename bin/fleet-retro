@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# fleet-retro — mine a session's own artifacts for recurring defect CLASSES.
+#
+# Not a discussion. Agents have no memory continuity, so a retro whose output is
+# a conversation is inert by construction. The output is (a) a dated record and
+# (b) rule candidates for the fleet-peers rules, which every agent loads.
+#
+# The session is fully recorded, so this reads evidence rather than recollection —
+# the one advantage this has over a human retro, and the reason it can be counted.
+set -uo pipefail
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+SINCE="${1:-24 hours ago}"
+REPORTS="$FLEET_REPORTS"
+REPO="${DROVER_REPO:?set DROVER_REPO (env or ~/.config/drover/config) to your project checkout}"
+mkdir -p "$DROVER_HOME/retro"
+OUT="$DROVER_HOME/retro/$(date +%Y-%m-%d-%H%M).md"
+# The rules the fleet already had: a local override if you keep one, else the shipped skill.
+RULES="${DROVER_RULES:-$HOME/.config/drover/PEERS.md}"
+[ -f "$RULES" ] || RULES="$DROVER_SRC/skills/fleet-peers/SKILL.md"
+
+{
+  echo "# Fleet retro — $(date '+%Y-%m-%d %H:%M')"
+  echo
+  echo "Window: since ${SINCE}. Evidence: $REPORTS/*.md, git, beans."
+  echo
+
+  echo "## Volume"
+  echo
+  printf -- "- review artifacts: %s\n" "$(find "$REPORTS" -name '*review*.md' -newermt "$SINCE" 2>/dev/null | wc -l | tr -d ' ')"
+  printf -- "- coder reports:    %s\n" "$(find "$REPORTS" -name "*-$DROVER_BEAN_PREFIX*.md" ! -name '*review*' -newermt "$SINCE" 2>/dev/null | wc -l | tr -d ' ')"
+  printf -- "- commits landed:   %s\n" "$(git -C "$REPO" log --oneline --since="$SINCE" main 2>/dev/null | wc -l | tr -d ' ')"
+  echo
+
+  echo "## Findings, verbatim"
+  echo
+  echo "One line per finding. Classify each by CLASS, not by incident — the value"
+  echo "is in spotting that many share a shape."
+  echo '```'
+  find "$REPORTS" -name '*review*.md' -newermt "$SINCE" 2>/dev/null -print0 \
+    | xargs -0 grep -hoE "^#+ *(HIGH|MEDIUM|LOW|CRITICAL)-?[0-9]* — .{0,100}" 2>/dev/null \
+    | sed 's/^#* *//' | sort -u
+  echo '```'
+  echo
+
+  echo "## Rules that already existed"
+  echo
+  echo "If a finding below matches a rule here, the RULE FAILED — it was loaded and"
+  echo "the defect happened anyway. That is the most valuable output of a retro, and"
+  echo "the reason to delete or sharpen a rule rather than add another."
+  echo '```'
+  grep -E "^## " "$RULES" 2>/dev/null | sed 's/^## //'
+  echo '```'
+  echo
+
+  echo "## To fill in by hand"
+  echo
+  echo "- [ ] Class counts: how many findings share each shape?"
+  echo "- [ ] Which existing rule failed to prevent a repeat?"
+  echo "- [ ] Lead errors — count them too; the lead is the largest single source of"
+  echo "      statements the user acts on."
+  echo "- [ ] Rule candidates: only ones that could FIRE. A rule nobody can violate"
+  echo "      visibly is the inert-signal defect in prose form."
+  echo "- [ ] Next-session metric: which class should shrink, and how will we know?"
+} > "$OUT"
+echo "$OUT"

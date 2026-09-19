@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# fleet-snapshot — copy every agent worktree's DIRTY TRACKED files somewhere safe.
+#
+# Why this exists (2026-09-08): a coder ran `git reset --hard` in its own worktree
+# and destroyed ~87 uncommitted tracked modifications. They were unrecoverable, and that
+# is not a git defect — UNSTAGED edits are never written to the object database, so
+# `fsck --lost-found`, `stash list` and the reflog all legitimately return nothing.
+#
+# The rule "never git checkout/reset/stash" already existed and was violated anyway. A
+# rule that depends on compliance is not a safety net. This is the mechanical one.
+#
+# Deliberately NOT a `git` wrapper. Intercepting git for ~15 agents to stop one command
+# risks breaking every agent's workflow to prevent a rare mistake. A copy costs nothing
+# and cannot break anything.
+#
+#   fleet-snapshot            snapshot every worktree's dirty tracked files
+#   fleet-snapshot list       what has been captured, newest first
+#   fleet-snapshot prune      drop snapshots older than KEEP_HOURS (default 48)
+#
+set -uo pipefail
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+WT_ROOT="$DROVER_WORKTREES"
+DEST="${FLEET_SNAPSHOT_DIR:-$DROVER_HOME/snapshots}"
+KEEP_HOURS="${KEEP_HOURS:-48}"
+mkdir -p "$DEST"
+
+case "${1:-run}" in
+list)
+  ls -1t "$DEST" 2>/dev/null | head -40
+  echo "-- $(du -sh "$DEST" 2>/dev/null | cut -f1) total in $DEST"
+  exit 0 ;;
+prune)
+  n=$(find "$DEST" -maxdepth 1 -mindepth 1 -type d -mmin +$((KEEP_HOURS*60)) 2>/dev/null | wc -l | tr -d ' ')
+  find "$DEST" -maxdepth 1 -mindepth 1 -type d -mmin +$((KEEP_HOURS*60)) -exec rm -rf {} + 2>/dev/null
+  echo "pruned $n snapshot(s) older than ${KEEP_HOURS}h"
+  exit 0 ;;
+esac
+
+ts=$(date +%Y%m%d-%H%M%S)
+total=0; trees=0
+for wt in "$WT_ROOT"/*; do
+  [ -d "$wt/.git" ] || [ -f "$wt/.git" ] || continue
+  name=$(basename "$wt")
+  # Tracked-and-modified only. Untracked files survive reset --hard, so they are not the
+  # loss this guards against, and copying them would sweep in node_modules-scale noise.
+  files=$(git -C "$wt" diff --name-only 2>/dev/null; git -C "$wt" diff --cached --name-only 2>/dev/null)
+  files=$(printf '%s\n' "$files" | sort -u | sed '/^$/d')
+  [ -n "$files" ] || continue
+  n=0
+  while IFS= read -r f; do
+    [ -f "$wt/$f" ] || continue          # a WIP deletion has no bytes to copy
+    mkdir -p "$DEST/$ts/$name/$(dirname "$f")"
+    cp "$wt/$f" "$DEST/$ts/$name/$f" 2>/dev/null && n=$((n+1))
+  done <<< "$files"
+  [ "$n" -gt 0 ] && { echo "  $name: $n dirty file(s)"; total=$((total+n)); trees=$((trees+1)); }
+done
+if [ "$total" -eq 0 ]; then
+  rmdir "$DEST/$ts" 2>/dev/null
+  echo "no dirty tracked files in any worktree — nothing to snapshot"
+else
+  echo "snapshot $ts: $total file(s) from $trees worktree(s) -> $DEST/$ts"
+fi

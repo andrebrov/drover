@@ -1,0 +1,10 @@
+    main, 205/206 render suite green + 7/7 generator + 52/52 extractor, build 0 at 8b8769b50, mutant killed 2/12 then 12/12 restored, merge-tree vs origin/main CLEAN; one MEDIUM filed as followup bean-
+    bs6rc" ~/.local/share/drover/reports/opencode-reviewer-review-bean-x0w3-by-agy-coder.md
+    reported: opencode-reviewer bean-x0w3 DONE
+     + Thought: 415ms
+     REVIEWED ~/.local/share/drover/reports/opencode-reviewer-review-bean-x0w3-by-agy-coder.md
+     ▣  Sisyphus - Ultraworker · GLM 5.3 Fast · 14m 38s
+                                                                                                                                                                                                             ~/.herdr/worktrees/myapp/fleet-
+                                                                                                                                                                                                             opencode-reviewer:fleet/opencode-
+    Sisyphus - Ultraworker auto · GLM 5.3 Fast Fireworks AI · max                                                                                                                                            reviewer
+   ~/.herdr/worktrees/myapp/fleet-opencode-reviewer                                                                                                 148.5K (14%) · $2.18  ctrl+p commands    • OpenCode 1.18.31

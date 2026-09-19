@@ -1,0 +1,10 @@
+    python3 <<'PY' 0ms in backend
+    … 31 input + 25 output lines hidden · ctrl+o to expand
+    Force exiting Jest: Have you considered using `--detectOpenHandles` to detect async operations that kept running after all tests finished?
+    restored
+ ⠘⠣ Running  97.02k tokens
+ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+  → Add a follow-up                                                                                                                                                                                                                  ctrl+c to stop
+  1 task
+  Auto · 66.4% · 124 files edited                                                                                                                                                                                                    Run Everything
+  ~/.herdr/worktrees/myapp/fleet-cursor-coder · fleet/cursor-coder-bean-a663

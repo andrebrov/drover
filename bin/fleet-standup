@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# fleet-standup — one bounded screen: agent states, new reports (headline only),
+# review verdicts since the last standup. Never prints report bodies.
+set +u
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+mkdir -p "$DROVER_HOME"
+MARK="$DROVER_HOME/.standup-mark"
+SINCE_ARGS=(); [ -f "$MARK" ] && SINCE_ARGS=(-newer "$MARK")
+echo "== agents =="
+"$DROVER_BIN"/fleet status 2>/dev/null | awk 'NR>1 && $1!="-" && $1!="lead" {printf "  %-19s %-9s %s\n",$1,$2,$3}' | sort -k3
+echo "== new since last standup =="
+find "$FLEET_REPORTS" -maxdepth 1 -name '*.md' "${SINCE_ARGS[@]}" -mmin -720 2>/dev/null | sort | while read -r f; do
+  b=$(basename "$f" .md)
+  if [[ $b == *review* ]]; then
+    printf "  %-52s %s\n" "$b" "$(grep -m1 '^VERDICT' "$f" || echo 'VERDICT: (none)')"
+  else
+    printf "  %-52s %s\n" "$b" "$(grep -m1 -oE '[0-9a-f]{9,12}\b' "$f" | head -1) $(grep -m1 -iE '^(#|summary|status|result)' "$f" | cut -c1-70)"
+  fi
+done
+touch "$MARK"

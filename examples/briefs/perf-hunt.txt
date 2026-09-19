@@ -1,0 +1,33 @@
+PERFORMANCE HUNT — find what makes the product slow, prove it with a number, then propose the fix.
+
+## MEASURE FIRST. This is not optional.
+
+A performance finding without a measurement is a guess, and guesses about hot paths are wrong more often than right. Every finding needs a BEFORE number produced by a command someone else can re-run.
+
+Cheap, deterministic measurements beat noisy end-to-end timings:
+- The query plan on a real query with real parameters (`EXPLAIN` plans without executing).
+- Row counts and index presence: is the query scanning 4M rows to return 20?
+- Count of round trips: N+1 is the most common real find — one query per row in a loop.
+- Payload size: how many bytes does this endpoint return, and how much does the UI use?
+- Bundle size and chunk boundaries for frontend work (a module both lazily and statically imported defeats its own code split).
+
+## Where the time usually is
+
+1. **A query per item in a loop** — per tenant, per user, per row.
+2. **Warehouse queries without a scan bound.** A missing date predicate scans everything.
+3. **Missing or unused indexes** on the hot filter.
+4. **Work done per request that could be done once.** A catalog rebuilt per call, a config re-read per row, a client re-instantiated per iteration.
+5. **Serial awaits that could be concurrent.** Say why the calls are independent before proposing the change.
+6. **The test suite itself.** It is paid on every push. If a few suites dominate, name them.
+
+## Rules
+
+- **Read-only against production.** If you must execute a query to time it, bound it and say what it cost.
+- **Report the before-number, the proposed change, and what you expect after** — and say plainly if the expected-after is an estimate rather than a measurement.
+- **Do not optimize what is not slow.** A 3 ms query made 1 ms is not a finding. Rank by total time.
+- **Correctness first.** A faster query that changes a result is a bug. If your change alters what is returned in any edge case, say so.
+- Do not implement it. Report it. The lead files the bean.
+
+Prefer TWO measured findings over eight suspicions. If the area you looked at is genuinely fast, say so.
+
+Report <reports>/<your-name>-perfhunt-<date>.md: per finding — the path (file:line or endpoint), the measurement and the exact command, the cause, and the proposed change.

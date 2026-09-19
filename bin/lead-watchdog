@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# lead-watchdog — zero-token standby: no model runs until the primary lead's heartbeat is stale.
+# The primary lead touches $FLEET_STATE/lead-heartbeat every few minutes while alive. When the file is
+# older than DROVER_TAKEOVER_SEC (default 45 min) this sends ONE prompt to the backup-lead seat and sets a
+# flag; the flag clears when the heartbeat is fresh again. launchd keeps it running (dev.drover.lead-watchdog).
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+HB="$FLEET_STATE/lead-heartbeat"; FLAG="$FLEET_STATE/lead-takeover"; LOG="$(dirname "$FLEET_STATE")/watchdog.log"
+BACKUP="${DROVER_BACKUP_LEAD:-lead-backup}"; LIMIT="${DROVER_TAKEOVER_SEC:-2700}"
+RUNBOOK="${DROVER_RUNBOOK:-$DROVER_SRC/docs/RUNBOOK.md}"
+mkdir -p "$FLEET_STATE"
+while true; do
+  now=$(date +%s); hb=$(stat -f %m "$HB" 2>/dev/null || echo 0); age=$((now-hb))
+  if [ "$hb" -eq 0 ]; then
+    :   # no heartbeat file yet: no primary lead has started, so there is nothing to take over
+  elif [ "$age" -gt "$LIMIT" ] && [ ! -f "$FLAG" ]; then
+    echo "$(date '+%F %T') heartbeat ${age}s old — prompting $BACKUP to take over" >> "$LOG"; date > "$FLAG"
+    herdr agent prompt "$BACKUP" "TAKE OVER — the primary lead's heartbeat is ${age}s old. Follow $RUNBOOK: write $BACKUP-takeover-$(date +%H%M).md in $FLEET_REPORTS, ensure fleet-watch runs, work $FLEET_STATE/blocked, land APPROVED work per the runbook (ancestry + deploy check), hourly standup files. You are the lead until a human says otherwise." --wait --timeout 60000 >> "$LOG" 2>&1
+  elif [ "$age" -le "$LIMIT" ] && [ -f "$FLAG" ]; then
+    echo "$(date '+%F %T') heartbeat fresh again — clearing takeover flag" >> "$LOG"; rm -f "$FLAG"
+  fi
+  sleep 300
+done

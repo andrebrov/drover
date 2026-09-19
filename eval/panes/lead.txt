@@ -1,0 +1,10 @@
+     a['agent'], a['agent_status'])" >
+     $D/index.txt; while read n k s…
+✻ Julienning… (1m 44s · ↓ 3.6k tokens)
+         ✔ Update installed · Restart to update
+─────────────────────────────────────────────────
+❯
+─────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc t…
+  ⏺ main
+  ◯ Explore  Find LLM jud… 18s · ↓ 29.5k tokens

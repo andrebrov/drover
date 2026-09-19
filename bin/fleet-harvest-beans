@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# fleet-harvest-beans — copy every bean file an agent created in its worktree into the main checkout
+# and commit it there. The board follows main: a bean that lives only in a worktree cannot be dispatched.
+# Commits only the harvested paths (--only), so the human's staged work in that checkout is untouched.
+set -euo pipefail
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+REPO="${DROVER_REPO:?set DROVER_REPO (env or ~/.config/drover/config) to your project checkout}"
+new=()
+for f in "$DROVER_WORKTREES"/*/.beans/"$DROVER_BEAN_PREFIX"*--*.md; do
+  [ -f "$f" ] || continue
+  b=$(basename "$f"); id=${b%%--*}
+  compgen -G "$REPO/.beans/$id--*" >/dev/null && continue   # already on the board (or harvested this run)
+  cp -p "$f" "$REPO/.beans/$b"; new+=(".beans/$b")
+done
+[ ${#new[@]} -gt 0 ] || { echo 'nothing to harvest'; exit 0; }
+git -C "$REPO" add -- "${new[@]}"
+git -C "$REPO" commit --only --no-verify -q -m 'chore(beans): harvest bean files filed by agents in their worktrees' -- "${new[@]}"
+echo "harvested: ${new[*]}"

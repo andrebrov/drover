@@ -1,0 +1,10 @@
+    fleet-done opencode-coder bean-43ab DONE "no work needed: agy-coder's f81ca85c2 already completes the bean; independently verified landable — clean cherry-pick onto current origin/main 6d8b3d0c5,
+    build 0, 271/271 (267 backend + 4 frontend); land it or re-review it, do not re-dispatch; measured: local main diverged from origin 30/79 (docs-only local side)" ~/.local/share/
+    drover/reports/opencode-coder-bean-43ab.md
+    reported: opencode-coder bean-43ab DONE
+     DONE ~/.local/share/drover/reports/opencode-coder-bean-43ab.md
+     ▣  Sisyphus - Ultraworker · GLM 5.3 Fast · 5m 33s
+                                                                                                                                                                                                             ~/.herdr/worktrees/myapp/fleet-
+                                                                                                                                                                                                             opencode-coder:fleet/opencode-coder-
+    Sisyphus - Ultraworker auto · GLM 5.3 Fast Fireworks AI · max                                                                                                                                            bean-43ab
+   ~/.herdr/worktrees/myapp/fleet-opencode-coder                                                                                                   413.0K (39%) · $29.97  ctrl+p commands    • OpenCode 1.18.31

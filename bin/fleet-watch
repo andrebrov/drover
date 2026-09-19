@@ -1,0 +1,509 @@
+#!/usr/bin/env bash
+# fleet-watch — the loop that keeps agents working without the lead in the path.
+#
+# MEASURED 2026-09-07 from the ledger, 650 gaps: median 44 minutes between one
+# dispatch and the next to the same agent; p90 285 minutes. A task takes 10-20.
+# The cause was structural: every transition (done -> review -> next bean)
+# waited for the lead to notice, and the lead polled in 8-minute sleeps.
+#
+# This loop does the noticing. Every TICK seconds it:
+#   1. drains the fleet-done inbox — a coder DONE gets a cross-harness review
+#      routed immediately; BLOCKED and CHANGES are logged for the lead
+#   2. refills free coders from a global FIFO queue ($FLEET_QUEUE)
+#      — "free" is judged by ARTIFACT (announced DONE, or never dispatched),
+#      never by `fleet status`, which reports done mid-turn
+#   3. clears the known blocking dialogs (auto-mode prompt, save-config,
+#      rate-limit model switch) that silently park an agent
+#   4. checks fleet-budget and stops dispatching to a spent harness
+# Landing stays with the lead — that is a rule, not a gap.
+#
+#   fleet-watch                 run the loop (foreground; background it)
+#   fleet-watch once            one tick, then exit
+#   fleet-watch enqueue <bean>  add a bean to the global queue
+#   fleet-watch queue           show the queue
+set -uo pipefail
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+TICK="${FLEET_TICK:-60}"
+Q="$FLEET_QUEUE"; INBOX="$FLEET_INBOX"; STATE="$FLEET_STATE"; LOG="$(dirname "$STATE")/watch.log"
+TASKS="$FLEET_TASKS"; REPORTS="$FLEET_REPORTS"
+REPO="${DROVER_REPO:-}"
+
+FLEET_HELP=0 FLEET_DRY_RUN=0
+FLEET_ARGS=()
+for _a in "$@"; do
+  case $_a in
+    --help|-h) FLEET_HELP=1 ;;
+    --dry-run) FLEET_DRY_RUN=1 ;;
+    *) FLEET_ARGS+=("$_a") ;;
+  esac
+done
+if ((${#FLEET_ARGS[@]})); then set -- "${FLEET_ARGS[@]}"; else set --; fi
+verb=${1:-run}
+
+watch_help() {
+  case "$1" in
+    enqueue) cat <<'H'
+fleet-watch enqueue <bean>
+Add a bean to the global FIFO queue.
+--dry-run  print agent, brief, branch, prompt; do not write the queue
+H
+      ;;
+    queue) cat <<'H'
+fleet-watch queue
+List beans in the global FIFO queue. Read-only.
+H
+      ;;
+    once) cat <<'H'
+fleet-watch once
+Run one watcher tick (dialogs, budget, inbox, refill), then exit. Mutating.
+--dry-run  print preview; do not tick
+H
+      ;;
+    run) sed -n '2,23p' "$0" ;;
+    *) sed -n '2,23p' "$0" ;;
+  esac
+}
+
+if [ "$FLEET_HELP" = 1 ]; then
+  watch_help "$verb"
+  exit 0
+fi
+
+if [ "$FLEET_DRY_RUN" = 1 ]; then
+  case "$verb" in
+    enqueue)
+      echo "agent="; echo "brief="; echo "branch="; echo "prompt=enqueue ${2:-}"
+      exit 0 ;;
+    once|run)
+      echo "agent="; echo "brief="; echo "branch="; echo "prompt=tick"
+      exit 0 ;;
+    *)
+      echo "$verb does not support --dry-run" >&2
+      exit 2 ;;
+  esac
+fi
+
+: "${REPO:?set DROVER_REPO (env or ~/.config/drover/config) to your project checkout}"
+mkdir -p "$Q" "$INBOX" "$(dirname "$LOG")" "$TASKS" "$STATE"
+log(){ printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG"; }
+kind_of(){ "$DROVER_BIN"/fleet status 2>/dev/null | awk -v n="$1" '$1==n{print $2}'; }
+
+case "$verb" in
+  enqueue)
+    : > "$Q/$(date +%s%N)-$2"; echo "queued $2"; exit 0 ;;
+  queue)   ls "$Q" 2>/dev/null | sed 's/^[0-9]*-//' ; exit 0 ;;
+esac
+
+# --- 3. dialogs -------------------------------------------------------------
+clear_dialogs(){
+  for a in $("$DROVER_BIN"/fleet status 2>/dev/null | awk 'NR>1 && $1!="-"{print $1}'); do
+    scr=$("$DROVER_BIN"/fleet read "$a" 8 2>/dev/null)
+    case "$scr" in
+      *"Teach auto mode"*|*"←/→ to change usage"*) "$DROVER_BIN"/fleet keys "$a" Down Down Enter >/dev/null 2>&1; log "dialog: cleared auto-mode prompt on $a" ;;
+      # Do NOT match *"Enter to confirm"*: that is generic Claude Code chrome and also
+      # appears on "Do you trust this folder?", whose cursor sits on "No, exit" -- a bare
+      # Enter there KILLED three seats at once (measured 2026-09-16).
+      *"Looks good — save it"*)  "$DROVER_BIN"/fleet keys "$a" Enter >/dev/null 2>&1; log "dialog: confirmed save on $a" ;;
+      *"Switch to gpt"*|*"Keep current model"*)       "$DROVER_BIN"/fleet keys "$a" Down Down Enter >/dev/null 2>&1; log "dialog: kept model on $a" ;;
+    esac
+  done
+}
+
+# --- 4. budget --------------------------------------------------------------
+BROKE=""
+check_budget(){
+  local out; out=$("$DROVER_BIN"/fleet-budget 2>/dev/null)
+  BROKE=""
+  # hard off-switch: harnesses listed in state/harness-off are never dispatched to, whatever the panes say
+  for h in $(cat "$STATE/harness-off" 2>/dev/null); do BROKE="$BROKE $h"; done
+  echo "$out" | grep -q "^opencode.*OUT OF CREDITS" && BROKE="$BROKE opencode" && log "BUDGET: opencode out of credits — not dispatching to it"
+  echo "$out" | grep -q "^codex.*AT USAGE LIMIT"    && BROKE="$BROKE codex"    && log "BUDGET: codex at usage limit — not dispatching to it"
+  echo "$out" | grep -q "^claude.*AT SESSION LIMIT" && BROKE="$BROKE claude"   && log "BUDGET: claude at session limit — not dispatching to it"
+  spend_guard
+}
+
+# --- guardrail: opencode daily spend cap (2026-09-18: $952 in one day vs ~$18 the day before) ---
+# Cap in $FLEET_CAPS (opencode_daily_usd=N), re-read every tick. At or over the cap opencode joins BROKE:
+# no new opencode dispatches or reviews; running work finishes. `opencode stats` reads a very large
+# database, so the figure is cached for 30 minutes. The pause logs once when it starts and once when it lifts.
+spend_guard(){
+  local cap cache="$STATE/spend-opencode" now; now=$(date +%s)
+  cap=$(sed -n 's/^opencode_daily_usd=\([0-9.]*\).*/\1/p' "$FLEET_CAPS" 2>/dev/null | head -1)
+  [ -n "$cap" ] || return 0
+  # optional start date: no cap before active_from (YYYY-MM-DD), so a cap can be announced a day ahead
+  local from; from=$(sed -n 's/^active_from=\([0-9-]*\).*/\1/p' "$FLEET_CAPS" 2>/dev/null | head -1)
+  if [ -n "$from" ] && [[ "$(date +%F)" < "$from" ]]; then
+    [ -f "$STATE/spend-capped" ] && { rm -f "$STATE/spend-capped"; log "SPEND CAP off until $from"; }
+    return 0; fi
+  if [ ! -f "$cache" ] || [ $(( now - $(stat -f %m "$cache") )) -ge 1800 ]; then
+    local usd; usd=$(opencode stats --days 1 2>/dev/null | sed -n 's/.*Total Cost[^$]*\$\([0-9.,]*\).*/\1/p' | tr -d , | head -1)
+    [ -n "$usd" ] && printf '%s\n' "$usd" > "$cache"
+  fi
+  local spent; spent=$(cat "$cache" 2>/dev/null); [ -n "$spent" ] || return 0
+  if awk -v s="$spent" -v c="$cap" 'BEGIN{exit !(s+0 >= c+0)}'; then
+    BROKE="$BROKE opencode"
+    [ -f "$STATE/spend-capped" ] || { : > "$STATE/spend-capped"; log "SPEND CAP: opencode \$$spent in the last day >= \$$cap cap — no new opencode dispatches or reviews (raise opencode_daily_usd in $FLEET_CAPS to override)"; }
+  elif [ -f "$STATE/spend-capped" ]; then rm -f "$STATE/spend-capped"; log "SPEND CAP lifted: opencode \$$spent < \$$cap"; fi
+}
+
+# --- disk: agents' scratch copies and reviewers' worktrees are never cleaned up by their creators ------
+# (2026-09-18: 51 GB of stale review worktrees, the disk at 91%). fleet-sweep removes only stale, clean, unused copies.
+sweep_guard(){ local st="$STATE/sweep.stamp"
+  [ -f "$st" ] && [ $(( $(date +%s) - $(stat -f %m "$st") )) -lt 21600 ] && return 0
+  : > "$st"; local out; out=$("$DROVER_BIN"/fleet-sweep 2>/dev/null | tail -1); [ -n "$out" ] && log "SWEEP ${out}"; }
+
+# --- guardrail: one bean, one coder -------------------------------------------------------------
+# 2026-09-18: approved-but-unlanded beans were re-dispatched to fresh coders who re-implemented them
+# (two beans each ended up on 3 branches). A bean belongs to the first coder it is dispatched
+# to (state/owner/<bean>); it can go back to that coder only. Another seat gets it only when the owner
+# is MISSING, credit-dead, or has not touched it for 72h — every handover is logged. The lead
+# reassigns deliberately by deleting the owner file.
+owner_blocks(){ local bean="$1" seat="$2" own f="$STATE/owner/$1"
+  [ -f "$f" ] || return 1
+  own=$(cat "$f"); [ -z "$own" ] || [ "$own" = "$seat" ] && return 1
+  if [ $(( $(date +%s) - $(stat -f %m "$f") )) -ge 259200 ]; then log "OWNER EXPIRED: $bean was $own's (72h untouched) -> $seat"; return 1; fi
+  if [ -f "$STATE/credit-dead/$own" ] || ! "$DROVER_BIN"/fleet status 2>/dev/null | awk -v o="$own" '$1==o && $3!="MISSING"{f=1} END{exit !f}'; then
+    log "OWNER HANDOVER: $bean from $own (missing or out of credits) -> $seat"; return 1; fi
+  return 0; }
+# Record owners lazily from coder task files (covers hand dispatches too) and flag any bean held by two coders.
+owner_sync(){ mkdir -p "$STATE/owner" "$STATE/double"; local f s b seen=""
+  for f in "$TASKS"/*; do [ -f "$f" ] || continue; s=$(basename "$f")
+    case "$s" in *coder|*coder-[0-9]*) ;; *) continue;; esac
+    b=$(cut -f2 "$f"); [ -n "$b" ] || continue
+    [ -f "$STATE/owner/$b" ] || printf '%s\n' "$s" > "$STATE/owner/$b"
+    [ "$(cat "$STATE/owner/$b")" = "$s" ] && touch "$STATE/owner/$b"
+    case " $seen " in *" $b="*) other=$(printf '%s' "$seen" | tr ' ' '\n' | sed -n "s/^$b=//p" | head -1)
+      [ -f "$STATE/double/$b" ] || { : > "$STATE/double/$b"; echo "$other+$s $b DOUBLE DISPATCH" >> "$STATE/blocked"; log "DOUBLE DISPATCH: $b held by $other AND $s — lead decides"; };;
+    esac; seen="$seen $b=$s"
+  done; }
+harness_ok(){ case " $BROKE " in *" $(kind_of "$1") "*) return 1;; esac; return 0; }
+
+# --- reviews: pick a free reviewer on another harness; if none, queue the bean and retry each tick
+pick_reviewer(){ local ck r; ck=$(kind_of "$1")
+  # reviewers first; when every reviewer is busy an idle sre/analyst/architect reviews (never pm, never design)
+  for pat in 'reviewer(-[0-9]+)?$' '(sre|analyst|architect)$'; do
+    # A credit-dead seat accepts the review prompt, goes 'working', and reviews NOTHING —
+    # so the bean sits waiting on a verdict that will never come. The dispatch path got
+    # this guard first; the review path needs the same one. Measured 2026-09-08: a review
+    # was routed to an architect seat while it was out of usage credits.
+    r=$("$DROVER_BIN"/fleet status 2>/dev/null | awk -v ck="$ck" -v pat="$pat" 'NR>1 && $3!="MISSING" && $3!="blocked" && $1 ~ pat && $2!=ck {print $1}' | while read -r r; do [ -f "$TASKS/$r" ] && continue; harness_ok "$r" || continue; "$DROVER_BIN"/fleet read "$r" 12 2>/dev/null | grep -qiE "out of usage credits|/usage-credits|Buy more credits|keep using Grok Build|hit your usage limit|purchase more credits" && continue; echo "$r"; break; done)
+    [ -n "$r" ] && { echo "$r"; return; }
+  done; }
+route_review(){ local a=$1 bean=$2 rev; rev=$(pick_reviewer "$a")
+  if [ -n "$rev" ]; then
+    (cd "$REPO" && "$DROVER_BIN"/fleet review "$a" "$rev" "$bean" >/dev/null 2>&1) && log "ROUTED review of $bean ($a) -> $rev"
+    printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$bean" none "$REPORTS/$rev-review-$bean-by-$a.md" > "$TASKS/$rev"; rm -f "$STATE/reviews/$bean"
+  else mkdir -p "$STATE/reviews"; printf '%s\n' "$a" > "$STATE/reviews/$bean"; log "no free cross-harness reviewer for $bean — queued for retry"; fi; }
+retry_reviews(){ for f in "$STATE"/reviews/*; do [ -f "$f" ] || continue
+  if [ -f "$STATE/approved/$(basename "$f")" ]; then rm -f "$f"; log "DROPPED re-review of $(basename "$f") — already approved"; continue; fi
+  route_review "$(cat "$f")" "$(basename "$f")"; done; }
+
+# --- 1. inbox: route reviews, surface blockers -------------------------------
+# --- no-op round detector (fleet-judge / TypeSafe). Two no-op rounds in a row hold the bean for the lead
+# instead of paying for a third re-carry (2026-09-18: reports "DONE, landable — for the ninth time").
+noop_count(){ local a="$1" bean="$2" st="$3" rep="$4" p c
+  case "$a" in *coder|*coder-[0-9]*) ;; *) return 0;; esac
+  case "$rep" in *-review-*) return 0;; esac   # a coder seat that reviewed: a review is not a work round
+  case "$st" in DONE|PARTIAL) ;; *) return 0;; esac
+  [ -f "$rep" ] || return 0
+  p=$("$DROVER_BIN"/fleet-judge noop "$rep" 2>/dev/null) || return 0
+  mkdir -p "$STATE/noop" "$STATE/noop-held"
+  if awk -v p="$p" 'BEGIN{exit !(p+0 >= 0.8)}'; then
+    c=$(( $(cat "$STATE/noop/$bean" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$STATE/noop/$bean"
+    log "NO-OP round $bean by $a (p=$p, x$c)"
+    if [ "$c" -ge 2 ] && [ ! -f "$STATE/noop-held/$bean" ]; then : > "$STATE/noop-held/$bean"; echo "$a $bean NO-OP x$c — land or scrap" >> "$STATE/blocked"; log "NO-OP x$c: $bean held out of the queue — lead lands or scraps it"; fi
+  elif awk -v p="$p" 'BEGIN{exit !(p+0 < 0.5)}'; then rm -f "$STATE/noop/$bean"; fi; }
+
+# --- review verdict detector. The verdict decides where a review goes, and it was read from the announce
+# summary alone: fleet-done downgrades a coder-seat APPROVE to PARTIAL (-> a PARTIAL loop), and a DONE
+# from a coder seat that reviewed routed a review OF the review. Order: announced word, then the report's
+# own "VERDICT:" line, then fleet-judge (TypeSafe; 0 of 17 CHANGES reviews read as approve at p>=0.8).
+review_verdict(){ local st="$1" sum="$2" rep="$3" v p
+  case "$rep" in *-review-*) ;; *) return 1;; esac
+  [ "$st" = BLOCKED ] && return 1
+  case "$sum" in APPROVE*) echo "APPROVE (announced)"; return 0;; CHANGES*) echo "CHANGES (announced)"; return 0;; esac
+  [ "$st" = CHANGES ] && { echo "CHANGES (announced)"; return 0; }
+  [ -f "$rep" ] || return 1
+  v=$(grep -oiE 'verdict[*:# ]*(approve|changes)' "$rep" | tail -1 | tr a-z A-Z | grep -oE 'APPROVE|CHANGES')
+  [ -n "$v" ] && { echo "$v (VERDICT line)"; return 0; }
+  p=$("$DROVER_BIN"/fleet-judge verdict "$rep" 2>/dev/null) || return 1
+  if awk -v p="$p" 'BEGIN{exit !(p+0 >= 0.8)}'; then echo "APPROVE (fleet-judge p=$p)"
+  elif awk -v p="$p" 'BEGIN{exit !(p+0 <= 0.2)}'; then echo "CHANGES (fleet-judge p=$p)"
+  else echo "UNSURE (fleet-judge p=$p)"; fi; }
+
+# --- seat-state detector (fleet-judge seat / TypeSafe). At confidence >= 0.8 on 25 labeled panes: 5 of 5
+# firings right, 0 false; 3 of 3 dialogs. Every 10 min each seat holding a task for 20+ min is read.
+# out_of_credits: the reaper never frees a seat that reads 'working', and a dead seat often does, so its
+# task stranded -> mark credit-dead and hand the bean back. Dialogs and unsent prompts are flagged for the
+# human once per episode and NEVER answered here.
+seat_scan(){ local st="$STATE/seat-scan.stamp" now f s r cls conf ts bean rest rep coder
+  now=$(date +%s); [ -f "$st" ] && [ $(( now - $(stat -f %m "$st") )) -lt 600 ] && return 0; : > "$st"
+  mkdir -p "$STATE/seat-flag" "$STATE/credit-dead" "$STATE/reviews"
+  for f in "$TASKS"/*; do [ -f "$f" ] || continue; s=$(basename "$f")
+    IFS=$'\t' read -r ts bean rest rep < "$f"; [ -n "$bean" ] || continue
+    [ $(( now - ${ts:-now} )) -ge 1200 ] || continue
+    [ -f "$STATE/credit-dead/$s" ] && continue
+    r=$("$DROVER_BIN"/fleet read "$s" 12 2>/dev/null | "$DROVER_BIN"/fleet-judge seat - 2>/dev/null) || continue
+    cls=${r% *}; conf=${r#* }
+    awk -v c="$conf" 'BEGIN{exit !(c+0 >= 0.8)}' || { rm -f "$STATE/seat-flag/$s"; continue; }
+    case "$cls" in
+      out_of_credits)
+        : > "$STATE/credit-dead/$s"; rm -f "$f"
+        coder=$(printf '%s' "$rep" | sed -nE 's/.*-review-.*-by-([a-z0-9-]+)\.md$/\1/p')
+        if [ -n "$coder" ]; then printf '%s\n' "$coder" > "$STATE/reviews/$bean"; log "SEAT $s OUT OF CREDITS (fleet-judge $conf) mid-review of $bean — review re-queued for another seat"
+        else printf '' > "$Q/$(date +%s)-$bean"; log "SEAT $s OUT OF CREDITS (fleet-judge $conf) holding $bean — seat marked credit-dead, bean back in the queue"; fi ;;
+      blocked_on_dialog|prompt_typed_not_sent)
+        if [ "$(cat "$STATE/seat-flag/$s" 2>/dev/null)" != "$cls" ]; then echo "$cls" > "$STATE/seat-flag/$s"
+          echo "$s $bean $cls — a human looks at the pane (fleet-judge $conf)" >> "$STATE/blocked"; log "SEAT $s $cls on $bean (fleet-judge $conf) — flagged for the human, not answered"; fi ;;
+      *) rm -f "$STATE/seat-flag/$s" ;;
+    esac
+  done; }
+
+drain_inbox(){
+  for m in $(find "$INBOX" -name '*.msg' -type f 2>/dev/null | sort); do
+    IFS=$'\t' read -r ts a bean state summary report < "$m"; rm -f "$m"
+    log "INBOX $a $bean $state — ${summary:0:70}"
+    noop_count "$a" "$bean" "$state" "$report"
+    # an announcement on a bean supersedes any followup still queued for it on this agent
+    if [ -f "$STATE/followups/$a" ] && grep -q -- "^$bean	" "$STATE/followups/$a"; then
+      grep -v -- "^$bean	" "$STATE/followups/$a" > "$STATE/followups/$a.new"; mv "$STATE/followups/$a.new" "$STATE/followups/$a"; [ -s "$STATE/followups/$a" ] || rm -f "$STATE/followups/$a"
+      log "DROPPED stale followup $bean for $a (superseded by its own $state)"
+    fi
+    # a stale announcement (a bean this agent is no longer on) must not free the agent or fan out a review
+    cur=$(cut -f2 "$TASKS/$a" 2>/dev/null)
+    if [ -n "$cur" ] && [ "$cur" != "$bean" ]; then
+      # The reaper can free a seat on seeing its report a minute before its fleet-done lands; dropping that
+      # DONE lost a bean's review (2026-09-18). A late DONE still routes the review; the seat keeps its task.
+      if [ "$state" = DONE ] && [ ! -f "$STATE/reviews/$bean" ] && [ ! -f "$STATE/approved/$bean" ] && ! grep -lq -- "	$bean	" "$TASKS"/*reviewer* 2>/dev/null; then
+        mkdir -p "$STATE/reviews"; printf '%s\n' "$a" > "$STATE/reviews/$bean"; log "LATE DONE from $a for $bean (seat now on $cur) — review queued"
+      else log "STALE announce from $a for $bean (current task $cur) — ignored"; fi
+      continue; fi
+    rm -f "$TASKS/$a"                                   # agent is free again
+    if rv=$(review_verdict "$state" "$summary" "$report"); then case "$rv" in
+      APPROVE*) mkdir -p "$STATE/approved"; : > "$STATE/approved/$bean"; rm -f "$STATE/reviews/$bean"; log "APPROVED $bean by $a — $rv; held out of the queue until landed"; continue ;;
+      CHANGES*) state=CHANGES; log "REVIEW $bean by $a: $rv" ;;
+      UNSURE*)  echo "$a $bean review verdict unclear ($rv) — lead reads $report" >> "$STATE/blocked"; log "VERDICT UNSURE $bean by $a ($rv) — lead"; continue ;;
+    esac; fi
+    case "$a:$state" in
+      *:PARTIAL)  # the coder announced DONE with unchecked items -> straight back to the same coder, no reviewer spent
+        mkdir -p "$STATE/followups" "$STATE/partials"; n=$(( $(cat "$STATE/partials/$a-$bean" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STATE/partials/$a-$bean"
+        if [ "$n" -ge 3 ]; then echo "$a $bean PARTIAL x$n — loop; lead decides" >> "$STATE/blocked"; log "LOOP $bean from $a — PARTIAL x$n, not re-dispatching; lead decides"
+        else bf=$(cd "$REPO" && git ls-files .beans | grep -m1 "^.beans/$bean--" || true); printf '%s\t%s\n' "$bean" "$REPO/$bf" >> "$STATE/followups/$a"; log "PARTIAL $bean from $a (x$n) — followup queued to finish the checklist"; fi ;;
+      *:CHANGES)  # a reviewer (or a fallback seat: sre/analyst/architect) sent the work back -> the coder gets it before anything from the queue
+        rm -f "$STATE/approved/$bean"   # a later CHANGES supersedes an earlier APPROVE
+        coder=$(printf '%s' "$report" | sed -nE 's/.*-by-([a-z0-9-]+)\.md$/\1/p')
+        if [ -n "$coder" ]; then mkdir -p "$STATE/followups"; printf '%s\t%s\n' "$bean" "$report" >> "$STATE/followups/$coder"; log "FOLLOWUP queued for $coder: $bean (review $report)"
+        else case "$a" in *coder*) log "CHANGES announced by coder $a on $bean = fixes done -> routing a review"; route_review "$a" "$bean";; *) log "CHANGES on $bean from $a but no coder in report path $report — lead";; esac; fi ;;
+      *reviewer*:*|judge:*|design:*|*-pm:*|*-sre:*|*analyst*:*|*architect*:*)   # non-coders: nothing to route
+        # An APPROVE does not close the bean, so it stayed "ready" and was re-dispatched until someone
+        # landed it (2026-09-18: one bean went to a coder every few minutes to re-verify landed work).
+        case "$summary" in APPROVE*) mkdir -p "$STATE/approved"; : > "$STATE/approved/$bean"; log "APPROVED $bean by $a — held out of the queue until landed";; esac ;;
+      *:DONE)  # a coder finished -> route a review on a different harness
+        local ck rev; ck=$(kind_of "$a")
+        # one review per bean: a coder re-announcing DONE must not fan out a second reviewer
+        if grep -lq -- "	$bean	" "$TASKS"/*reviewer* 2>/dev/null; then log "SKIP review of $bean — already under review ($(grep -l -- "	$bean	" "$TASKS"/*reviewer* 2>/dev/null | xargs -n1 basename | tr "\n" " "))"; rm -f "$TASKS/$a"; continue; fi
+        route_review "$a" "$bean" ;;
+      *:BLOCKED) echo "$a $bean $summary" >> "$STATE/blocked"; log "BLOCKED needs lead: $a $bean — ${summary:0:80}" ;;
+    esac
+  done
+}
+
+# --- 2. refill free coders from the global queue ---------------------------
+# --- 0c. keep the dispatch queue non-empty ------------------------------------
+# The queue is a directory of one file per bean. Nothing refilled it, so when it
+# drained the whole fleet went idle behind a single line: "queue empty".
+# Top it up from ready beans on main — beans matching DROVER_QUEUE_KEYWORDS (the sprint theme) first,
+# then by priority — and never queue a bean that is already in a task file or a followup.
+# --- 0b. reap task files whose claim is provably dead -------------------------
+# A task file is the ONLY busy marker. It outlives its claim when the lead
+# re-routes a review, when the bean lands, or when a dispatch produced nothing.
+# Measured 2026-09-08: five seats pinned 45-530 min; the only symptom was
+# "no free cross-harness reviewer", repeating. Release ONLY on provable facts.
+reap_tasks(){
+  local STAT; STAT=$("$DROVER_BIN"/fleet status 2>/dev/null)
+  for f in "$TASKS"/*; do
+    [ -f "$f" ] || continue
+    local a bean ts age bf st holder state idle_min rep4 coder free
+    a=$(basename "$f"); bean=$(cut -f2 "$f"); ts=$(cut -f1 "$f"); age=$(( ($(date +%s) - ts) / 60 ))
+    [ -n "$bean" ] || continue
+    [ "$age" -ge 20 ] || continue
+    state=$(printf '%s' "$STAT" | awk -v a="$a" '$1==a{print $3}')
+    # NEVER reap a seat that is working. Measured 2026-09-08: grok-reviewer was
+    # released mid-review because the bean id was already completed on main from
+    # an earlier landing, while a NEW review of a corrected commit ran under the
+    # same id. A busy marker on a busy agent is correct by definition.
+    [ "$state" = working ] && continue
+    # `blocked` is waiting on a HUMAN dialog; releasing it would re-dispatch
+    # work the seat is still holding open. Leave it for the lead.
+    [ "$state" = blocked ] && continue
+    # `done` is a TRANSIENT herdr status: a seat that finishes and goes quiet
+    # settles into `idle`, and a seat whose pane died reads MISSING. Gating
+    # release on `done` alone pinned 7 seats for 145-7864m (2026-09-16).
+    free=0; case "$state" in done|idle|MISSING) free=1;; esac
+    bf=$(cd "$REPO" && git ls-files .beans | grep -m1 "^.beans/$bean--" || true)
+    if [ -n "$bf" ]; then
+      st=$(cd "$REPO" && git show "main:$bf" 2>/dev/null | awk '/^status:/{print $2; exit}')
+      case "$st" in completed|scrapped) rm -f "$f"; log "RELEASED $a — $bean is $st on main (held ${age}m)"; continue;; esac
+    fi
+    holder=$(grep -l -- "	$bean	" "$TASKS"/* 2>/dev/null | grep -v "/$a$" | head -1 || true)
+    if [ -n "$holder" ]; then rm -f "$f"; log "RELEASED $a — $bean was re-routed to $(basename "$holder") (held ${age}m)"; continue; fi
+    if [ -n "$(ls "$REPORTS"/$a-*"$bean"*.md 2>/dev/null)" ] && [ "$free" = 1 ]; then
+      rm -f "$f"; log "RELEASED $a — already reported on $bean and idle (held ${age}m)"; continue
+    fi
+    # `fleet status` says `done` mid-turn, so age is the real evidence. A reviewer
+    # silent for 45 min lost its prompt; a coder legitimately works far longer.
+    idle_min=45; case "$a" in *coder*) idle_min=90;; esac
+    [ "$state" = MISSING ] && idle_min=0   # no pane = nothing is running
+    if [ "$free" = 1 ] && [ "$age" -ge "$idle_min" ] && [ -z "$(ls "$REPORTS"/$a-*"$bean"*.md 2>/dev/null)" ]; then
+      rep4=$(cut -f4 "$f" 2>/dev/null); rm -f "$f"
+      case "$a" in *reviewer*|*analyst*|*architect*|*-sre)
+        coder=$(printf '%s' "$rep4" | sed -nE 's/.*-by-([a-z0-9-]+)\.md$/\1/p')
+        if [ -n "$coder" ]; then mkdir -p "$STATE/reviews"; printf '%s\n' "$coder" > "$STATE/reviews/$bean"; fi ;;
+      esac
+      log "RELEASED $a — ${age}m on $bean with no report; work requeued"; continue
+    fi
+  done
+}
+
+# --- 0c. keep every roster seat in its harness's yolo mode --------------------
+# herdr resumes agents after a reboot with a bare command and cannot add flags (0.9.1),
+# so every reboot drops yolo. Every 5 min, before refill, relaunch idle non-yolo seats.
+yolo_guard(){
+  local stamp="$STATE/yolo.stamp" now; now=$(date +%s)
+  [ -f "$stamp" ] && [ $((now - $(cat "$stamp"))) -lt 300 ] && return 0
+  echo "$now" > "$stamp"
+  "$DROVER_BIN"/fleet-yolo --quiet 2>&1 | grep -E 'RESTARTED|FAILED' | while read -r l; do log "YOLO ${l# }"; done
+}
+
+top_up_queue(){
+  # The human lead, 2026-09-18: "before starting new work we will need to finish work in each worktree and
+  # then merge into main and close". While state/finish-first exists no NEW bean enters the queue or a seat;
+  # fix rounds (followups) and reviews on existing work still flow.
+  [ -f "$STATE/finish-first" ] && return 0
+  [ "$(ls "$Q" 2>/dev/null | wc -l | tr -d ' ')" = 0 ] || return 0
+  local added; added=$(cd "$REPO" && beans list --json --ready 2>/dev/null | KW="${DROVER_QUEUE_KEYWORDS:-}" python3 -c '
+import json,os,sys
+try: bs=json.load(sys.stdin)
+except Exception: sys.exit(0)
+order={"critical":0,"high":1,"normal":2,None:2,"low":3,"deferred":4}
+KW=tuple(os.environ["KW"].lower().split())
+def key(b):
+    tx=(b.get("title","")+" "+b.get("body","")[:400]).lower()
+    return (0 if any(w in tx for w in KW) else 1, order.get(b.get("priority"),2))
+bs=[b for b in bs if b.get("type") not in ("epic","milestone")]   # containers have no work of their own
+bs.sort(key=key)
+print("\n".join(b["id"] for b in bs[:20]))
+')
+  [ -n "$added" ] || return 0
+  local i n; i=$(date +%s); n=0
+  for id in $added; do
+    grep -lq -- "	$id	" "$TASKS"/* 2>/dev/null && continue
+    grep -lq -- "^$id	" "$STATE"/followups/* 2>/dev/null && continue
+    [ -f "$STATE/reviews/$id" ] || [ -f "$STATE/approved/$id" ] || [ -f "$STATE/noop-held/$id" ] && continue   # awaiting a reviewer or a landing
+    touch "$Q/$i-$id"; i=$((i+1)); n=$((n+1))
+  done
+  [ "$n" = 0 ] || log "QUEUE topped up with $n ready bean(s)"
+}
+
+refill(){
+  for a in $("$DROVER_BIN"/fleet status 2>/dev/null | awk 'NR>1 && $3!="MISSING" && $3!="blocked" && $1 ~ /coder(-[0-9]+)?$/ {print $1}'); do
+    [ -f "$TASKS/$a" ] && continue                      # has an open task (by artifact, not status)
+    harness_ok "$a" || continue
+    # A seat known to be out of credits is skipped WITHOUT a pane read. Without this the
+    # tick picks it, reads the pane, rejects it and requeues — every tick, forever, making
+    # no progress and burning a read each time. The marker has a TTL so a topped-up seat
+    # rejoins on its own instead of needing me to remember it.
+    mkdir -p "$STATE/credit-dead"
+    if [ -f "$STATE/credit-dead/$a" ]; then
+      cd_age=$(( ( $(date +%s) - $(stat -f %m "$STATE/credit-dead/$a" 2>/dev/null || echo 0) ) / 60 ))
+      [ "${cd_age:-0}" -lt 30 ] && continue
+      rm -f "$STATE/credit-dead/$a"   # past the TTL: fall through and re-check the pane
+    fi
+    if [ -f "$STATE/followups/$a" ]; then                 # a fix round beats the queue
+      IFS=$'\t' read -r fb frep < "$STATE/followups/$a"; tail -n +2 "$STATE/followups/$a" > "$STATE/followups/$a.rest"; mv "$STATE/followups/$a.rest" "$STATE/followups/$a"; [ -s "$STATE/followups/$a" ] || rm -f "$STATE/followups/$a"
+      if [ -f "$STATE/approved/$fb" ]; then log "DROPPED followup $fb for $a — already approved, awaiting landing"; continue; fi
+      # A PARTIAL-sourced followup carries the bean file, not a review: there are no findings to
+      # fix. Telling the coder "the reviewer returned CHANGES" sent three beans round a 3x loop
+      # (2026-09-18) whenever the unchecked items were human-owned (apply a migration, run against
+      # a dev server). Ask for the open items instead, and BLOCKED for human-only ones.
+      case "$frep" in
+        */.beans/*) fmsg="FOLLOWUP $fb — your announcement still had unchecked checklist items in $frep (there is NO reviewer finding). Finish every unchecked item you can yourself. For an item only the human can do (apply a migration, run against a dev server or a live account), write 'HUMAN: <why>' against it in your report and announce BLOCKED, not DONE: fleet-done $a $fb BLOCKED \"human: <items>\" <your report>. Otherwise re-run build + the bean's tests and announce: fleet-done $a $fb DONE \"<what changed>\" <your report>" ;;
+        *) fmsg="FOLLOWUP $fb — the reviewer returned CHANGES. Read $frep, fix every finding it lists, re-run build + the bean's tests, then announce: fleet-done $a $fb DONE \"<what changed>\" <your report>" ;;
+      esac
+      out=$(cd "$REPO" && "$DROVER_BIN"/fleet followup "$a" "$fmsg" 2>&1 | tail -1)
+      rc=$?
+      if [ $rc -ne 0 ]; then   # a dispatch that FAILED must not mark the agent busy (it pinned 5 coders for hours)
+        printf '%s\t%s\n' "$fb" "$frep" >> "$STATE/followups/$a"; log "FOLLOWUP $fb -> $a FAILED (rc=$rc: ${out:0:80}) — requeued, agent left free"; continue
+      fi
+      "$DROVER_BIN"/fleet-track dispatch "$a" "$fb" >/dev/null 2>&1
+      log "FOLLOWUP $fb -> $a ($out)"; continue
+    fi
+    if [ -f "$STATE/finish-first" ]; then continue; fi   # finish-and-land first: no new beans
+    next=$(ls "$Q" 2>/dev/null | head -1); [ -n "$next" ] || { log "queue empty — nothing for $a"; return; }
+    bean=${next#*-}; rm -f "$Q/$next"
+    # Drop EVERY other queue entry for this bean, not just the one popped. The queue is a
+    # directory, so nothing stops the same bean being enqueued twice — a top-up and a requeue
+    # can both add it, and the lead can add it by hand. Two entries means the bean is dispatched
+    # twice, which is the one-bean-on-two-agents failure that cost three separate corrections
+    # today. Measured 2026-09-08: one bean held two queue entries at once.
+    rm -f "$Q"/*-"$bean" 2>/dev/null
+    # fail loud, not into the void: a bean that is not on main is invisible to every worktree
+    # never one bean on two agents: if any task file already holds it, drop this queue entry
+    if grep -lq -- "	$bean	" "$TASKS"/* 2>/dev/null || grep -lq -- "^$bean	" "$STATE"/followups/* 2>/dev/null; then log "SKIP $bean — already in flight or queued as a followup"; continue; fi
+    # the lead runs some beans itself (critical path, or every seat busy). One bean
+    # on two agents is the rule this breaks; the lead marks those here.
+    if [ -f "$STATE/lead-owned/$bean" ]; then log "SKIP $bean — the lead is running it"; continue; fi
+    if owner_blocks "$bean" "$a"; then log "SKIP $bean for $a — owned by $(cat "$STATE/owner/$bean"); one bean, one coder"; continue; fi
+    if [ -f "$STATE/reviews/$bean" ] || [ -f "$STATE/approved/$bean" ] || [ -f "$STATE/noop-held/$bean" ]; then log "SKIP $bean — awaiting review, landing, or held after no-op rounds; no coder re-dispatch"; continue; fi
+    bf=$(cd "$REPO" && git ls-files .beans | grep -m1 "^.beans/$bean--")
+    if [ -z "$bf" ] || ! (cd "$REPO" && git cat-file -e "main:$bf" 2>/dev/null); then
+      log "SKIP $bean — not on main (commit the bean file first); left out of the queue"; continue
+    fi
+    # only open beans are dispatched: a completed/scrapped/draft bean in the queue is a queueing error
+    st=$(cd "$REPO" && git show "main:$bf" 2>/dev/null | awk '/^status:/{print $2; exit}')
+    case "$st" in todo|in-progress) ;; *) log "SKIP $bean — status '$st' is not dispatchable"; continue;; esac
+    # A queue entry can go STALE between top-up and pop: the lead can mark a bean
+    # blocked-by another in between. Measured 2026-09-08 — a bean was gated behind
+    # another and dispatched anyway from a queue built before the gate.
+    # Re-ask at pop time; the top-up-time answer is not binding.
+    if ! (cd "$REPO" && beans list --json --ready 2>/dev/null | grep -q "\"$bean\""); then
+      log "SKIP $bean — no longer ready (blocked or status changed since it was queued); dropped"
+      continue
+    fi
+    # A seat that is out of usage credits accepts the prompt, goes 'working', and does
+    # NOTHING. Measured 2026-09-08: two beans sat 48m and 21m in credit-dead
+    # seats. Never dispatch into one — requeue the bean instead of burning it.
+    if "$DROVER_BIN"/fleet read "$a" 12 2>/dev/null | grep -qiE "out of usage credits|/usage-credits|Buy more credits|keep using Grok Build|hit your usage limit|purchase more credits"; then
+      log "SKIP $a — OUT OF USAGE CREDITS (seat is dead, does not recover); $bean requeued"
+      mkdir -p "$STATE/credit-dead"; : > "$STATE/credit-dead/$a"   # stop re-picking it every tick
+      printf '' > "$Q/$(date +%s)-$bean"; continue
+    fi
+    out=$(cd "$REPO" && "$DROVER_BIN"/fleet assign "$bean" "$a" 2>&1 | tail -1); rc=$?
+    if [ $rc -ne 0 ] || printf '%s' "$out" | grep -qiE 'error|not on main|unknown agent|syntax'; then
+      log "DISPATCH $bean -> $a FAILED (${out:0:80}) — bean requeued, agent left free"; printf '' > "$Q/$(date +%s)-$bean"; continue
+    fi
+    "$DROVER_BIN"/fleet-track dispatch "$a" "$bean" >/dev/null 2>&1
+    log "DISPATCH $bean -> $a ($out)"
+  done
+}
+
+snapshot_wip(){
+  # Agents lose uncommitted work: a coder ran `git reset --hard` in its worktree on
+  # 2026-09-08 and destroyed ~87 unstaged modifications, which git genuinely cannot recover
+  # (unstaged edits never reach the object DB, so fsck/stash/reflog all correctly find nothing).
+  # Throttled to every 20 minutes: it copies only dirty TRACKED files, ~48MB per pass.
+  local m="$STATE/last-snapshot" age=999
+  [ -f "$m" ] && age=$(( ( $(date +%s) - $(stat -f %m "$m" 2>/dev/null || echo 0) ) / 60 ))
+  [ "$age" -lt 20 ] && return 0
+  : > "$m"
+  local out; out=$("$DROVER_BIN"/fleet-snapshot 2>/dev/null | tail -1)
+  KEEP_HOURS=48 "$DROVER_BIN"/fleet-snapshot prune >/dev/null 2>&1
+  log "SNAPSHOT ${out:0:120}"
+}
+tick(){ clear_dialogs; check_budget; h=$("$DROVER_BIN"/fleet-harvest-beans 2>/dev/null | grep "^harvested"); [ -n "$h" ] && log "HARVEST ${h:11:140}"; drain_inbox; retry_reviews; reap_tasks; seat_scan; owner_sync; sweep_guard; snapshot_wip; yolo_guard; top_up_queue; refill
+  { echo "tick $(date '+%H:%M:%S')"; echo "queue: $(ls "$Q" 2>/dev/null | wc -l | tr -d ' ')"; "$DROVER_BIN"/fleet-track check 2>/dev/null | head -20; } > "$STATE/last" 2>/dev/null; }
+
+if [ "${1:-run}" = once ]; then tick; exit 0; fi
+log "fleet-watch started (tick ${TICK}s)"
+while true; do tick; sleep "$TICK"; done

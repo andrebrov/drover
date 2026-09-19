@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# fleet-claim — tell agents in other worktrees which files are already being edited.
+#
+#   fleet-claim take <agent> <bean> <path>...   claim files; refuses if another agent holds one
+#   fleet-claim check <path>...                 who holds these, if anyone
+#   fleet-claim mine <agent>                    what this agent holds
+#   fleet-claim drop <agent>                    release everything this agent holds
+#   fleet-claim hot                             files touched by more than one unlanded branch
+#
+# Agents work in separate worktrees and cannot see each other's edits. Six branches
+# edited one planner test today, and three needed the same conflict resolved
+# three times. A claim is advisory, not a lock: it exists so an agent knows to pick
+# different work, or to pair, BEFORE the conflict is written.
+set +u
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+F="$DROVER_HOME/claims.tsv"
+ROOT="${FLEET_ROOT:-${DROVER_REPO:?set DROVER_REPO (env or ~/.config/drover/config) to your project checkout}}"
+mkdir -p "$DROVER_HOME"; touch "$F"
+
+# Generated files are never claimed and never merged: the lead regenerates them at land time.
+# DROVER_GENERATED is an ERE over repo paths (e.g. 'generated\.ts$|\.snapshot\.json$'); empty = none.
+GENERATED="${DROVER_GENERATED:-}"
+
+case "${1:-check}" in
+take)
+  agent=$2; bean=$3; shift 3
+  [ -n "$agent" ] && [ -n "$bean" ] && [ $# -gt 0 ] || { echo "usage: fleet-claim take <agent> <bean> <path>..."; exit 2; }
+  conflict=0
+  for p in "$@"; do
+    if [ -n "$GENERATED" ] && [[ "$p" =~ $GENERATED ]]; then
+      echo "SKIP  $p — generated; never commit it from a branch, the lead regenerates at land time"; continue
+    fi
+    holder=$(awk -F'\t' -v p="$p" '$3==p && $1!=a {print $1" ("$2")"}' a="$agent" "$F" | head -1)
+    if [ -n "$holder" ]; then echo "HELD  $p — by $holder"; conflict=1
+    else printf '%s\t%s\t%s\t%s\n' "$agent" "$bean" "$p" "$(date -u +%FT%TZ)" >> "$F"; echo "OK    $p"; fi
+  done
+  [ "$conflict" = 1 ] && { echo "Some files are held. Pick different work, or ask the lead to pair you with the holder."; exit 1; }
+  exit 0 ;;
+check)
+  shift; for p in "$@"; do
+    h=$(awk -F'\t' -v p="$p" '$3==p {print $1" ("$2") since "$4}' "$F" | head -1)
+    printf '%-64s %s\n' "$p" "${h:-free}"; done ;;
+mine)
+  awk -F'\t' -v a="$2" '$1==a {print $3"  ("$2")"}' "$F" ;;
+drop)
+  [ -n "$2" ] || { echo "usage: fleet-claim drop <agent>"; exit 2; }
+  awk -F'\t' -v a="$2" '$1!=a' "$F" > "$F.tmp" && mv "$F.tmp" "$F"; echo "released $2" ;;
+reap)
+  # A claim held by a bean that is COMPLETED or SCRAPPED on main is stale by definition:
+  # the work is landed, nobody is editing those files, and the claim only blocks the next
+  # agent. Nothing released a claim on completion, so they accumulated forever.
+  # Measured 2026-09-08: a bean completed at 01:20 and still held a core layout file
+  # at 17:48, blocking another bean across THREE different seats.
+  # Same defect class as the stale fleet-tasks files: state that outlives the thing it describes.
+  released=0
+  : > "$F.keep"
+  while IFS=$'\t' read -r a bean path ts; do
+    [ -n "${bean:-}" ] || continue
+    bf=$(git -C "$ROOT" ls-files .beans 2>/dev/null | grep -m1 "^.beans/$bean--" || true)
+    st=""
+    [ -n "$bf" ] && st=$(git -C "$ROOT" show "main:$bf" 2>/dev/null | awk '/^status:/{print $2; exit}')
+    case "$st" in
+      completed|scrapped)
+        echo "  released $path  ($bean is $st, held by $a)"; released=$((released+1)) ;;
+      *) printf '%s\t%s\t%s\t%s\n' "$a" "$bean" "$path" "$ts" >> "$F.keep" ;;
+    esac
+  done < "$F"
+  mv "$F.keep" "$F"
+  echo "reaped $released stale claim(s); $(wc -l < "$F" | tr -d ' ') still held"
+  ;;
+hot)
+  for b in $(git -C "$ROOT" branch --list 'fleet/*' --format='%(refname:short)'); do
+    n=$(git -C "$ROOT" cherry origin/main "$b" 2>/dev/null | grep -c '^+')
+    [ "${n:-0}" -gt 0 ] && git -C "$ROOT" diff --name-only origin/main..."$b" 2>/dev/null | grep -v '^\.beans/'
+  done | sort | uniq -c | sort -rn | awk '$1>1 {printf "  %2s branches  %s\n", $1, $2}' | head -20 ;;
+*) sed -n '2,10p' "$0"; exit 2 ;;
+esac

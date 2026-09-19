@@ -1,0 +1,10 @@
+    run exit 1 = 7 red journeys at intended signatures + 7 green gates, openspec --strict 0, M1/M2/sink mutations caught and restored cmp byte-identical; backend/src untouched, handler inert, Sections
+    2-6 open; report ~/.local/share/drover/reports/opencode8-coder-bean-agc3-section1.md" ~/.local/share/drover/reports/opencode8-coder-bean-agc3-section1.md 2>&1; echo "fleet-done exit=$?"
+    reported: opencode5-coder bean-agc3-section1 DONE
+    fleet-done exit=0
+     Commit: 744f3362eb027f1683a0ca510b26d65c7f796491 on fleet/opencode8-coder-agc3-s1
+     Report: ~/.local/share/drover/reports/opencode8-coder-bean-agc3-section1.md
+     ▣  Sisyphus - Ultraworker · GLM 5.3 Fast · 50.2s
+                                                                                                                                                                                                             ~/.herdr/worktrees/myapp/fleet-
+    Sisyphus - Ultraworker · GLM 5.3 Fast Fireworks AI · max                                                                                                                                                 opencode2-reviewer
+   ~/.herdr/worktrees/myapp/fleet-opencode2-reviewer                                                                                               350.7K (33%) · $17.41  ctrl+p commands    • OpenCode 1.18.31

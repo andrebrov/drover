@@ -1,0 +1,8 @@
+• REVIEWED ~/.local/share/drover/reports/codex2-reviewer-review-bean-8114-by-opencode4-coder.md
+─ Worked for 6m 03s ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+─ Conversation recap ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Review of bean-8114 on branch fleet/opencode4 is complete. The verdict report is at ~/.local/share/drover/reports/codex2-reviewer-review-bean-8114-by-opencode4-coder.md.
+› Review task: read ~/.local/share/drover/briefs/review-codex2-reviewer-bean-x0w3.txt and follow it exactly. It reviews bean-x0w3 on branch fleet/opencode6-coder-bean-x0w3 (fall back to fleet/opencode6-coder if that ref does not exist).
+■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 19th, 2026 11:41 AM.
+› Ask Codex to do anything
+  gpt-5.6-sol xhigh fast · ~/.herdr/worktrees/myapp/fleet-codex-reviewer · Review bean-hqte commits

@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# fleet-standup-auto — persist an artifact-based fleet standup once per scheduler tick while task
+# files exist (launchd runs it hourly). It reads fleet artifacts and git refs; it never contacts
+# production, deploys, migrates, or writes the project repository.
+set -euo pipefail
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+
+TASK_DIR="$FLEET_TASKS"
+REPORT_DIR="$FLEET_REPORTS"
+REPO_DIR="${DROVER_REPO:?set DROVER_REPO (env or ~/.config/drover/config) to your project checkout}"
+RETRO_DIR="$DROVER_HOME/retro"
+
+mkdir -p "$REPORT_DIR"
+active=0
+if [ -d "$TASK_DIR" ] && find "$TASK_DIR" -maxdepth 1 -type f -print -quit 2>/dev/null | grep -q .; then
+  active=1
+fi
+if [ "$active" -eq 0 ] && [ "${FLEET_STANDUP_FORCE:-0}" != 1 ]; then
+  exit 0
+fi
+
+stamp=$(date '+%Y-%m-%d-%H%M%S')
+out="$REPORT_DIR/standup-auto-$stamp.md"
+tmp=$(mktemp "$REPORT_DIR/.standup-auto.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+
+{
+  echo "# Automated fleet standup — $(date '+%Y-%m-%d %H:%M:%S %Z')"
+  echo
+  echo "Fallback hourly artifact. Human/lead landing standups remain authoritative for decisions."
+  echo
+  echo "## Artifact tracker"
+  echo
+  echo '```text'
+  "$DROVER_BIN"/fleet-track check 2>&1 || true
+  echo '```'
+  echo
+  echo "## Task files"
+  echo
+  found=0
+  if [ -d "$TASK_DIR" ]; then
+    for task in "$TASK_DIR"/*; do
+      [ -f "$task" ] || continue
+      found=1
+      first=""
+      IFS= read -r first < "$task" || true
+      printf -- '- `%s`: %s\n' "$(basename "$task")" "${first:0:180}"
+    done
+  fi
+  if [ "$found" -eq 0 ]; then echo "- none"; fi
+  echo
+  echo "## New durable reports (last 65 minutes)"
+  echo
+  report_count=0
+  while IFS= read -r report; do
+    [ -n "$report" ] || continue
+    report_count=$((report_count + 1))
+    heading=""
+    IFS= read -r heading < "$report" || true
+    printf -- '- `%s`: %s\n' "$(basename "$report")" "${heading:0:180}"
+  done < <(find "$REPORT_DIR" -maxdepth 1 -type f -name '*.md' -mmin -65 ! -name 'standup-auto-*' -print 2>/dev/null | sort)
+  if [ "$report_count" -eq 0 ]; then echo "- none"; fi
+  echo
+  echo "## Retro cadence"
+  echo
+  latest_retro=""
+  if [ -d "$RETRO_DIR" ]; then
+    for retro in "$RETRO_DIR"/*.md; do
+      [ -f "$retro" ] || continue
+      if [ -z "$latest_retro" ] || [ "$retro" -nt "$latest_retro" ]; then
+        latest_retro="$retro"
+      fi
+    done
+  fi
+  if [ -z "$latest_retro" ]; then
+    echo "- latest retro: none"
+    echo "- status: OVERDUE — run and fill a formal retro now"
+  else
+    retro_epoch=$(stat -f '%m' "$latest_retro")
+    retro_age_minutes=$(( ($(date '+%s') - retro_epoch) / 60 ))
+    printf -- '- latest retro: `%s`\n' "$latest_retro"
+    printf -- '- age: `%s` minutes\n' "$retro_age_minutes"
+    if grep -q '^- \[ \]' "$latest_retro"; then
+      echo "- status: INVALID_UNFILLED — the generated scaffold is not a completed retro"
+    elif [ "$retro_age_minutes" -gt 720 ]; then
+      echo "- status: OVERDUE — more than 12 hours old"
+    else
+      echo "- status: current"
+    fi
+  fi
+  echo
+  echo "## Integration ref"
+  echo
+  if git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    head=$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unavailable)
+    branch=$(git -C "$REPO_DIR" branch --show-current 2>/dev/null || echo detached)
+    ahead=$(git -C "$REPO_DIR" rev-list --count origin/main..HEAD 2>/dev/null || echo unavailable)
+    dirty=$(git -C "$REPO_DIR" status --short 2>/dev/null | wc -l | tr -d ' ')
+    printf -- '- branch: `%s`\n- head: `%s`\n- commits ahead of origin/main: `%s`\n- working-tree status entries: `%s`\n' "$branch" "$head" "$ahead" "$dirty"
+  else
+    echo "- integration repository unavailable"
+  fi
+  echo
+  echo "## Deployment evidence"
+  echo
+  echo "- origin landing count: not checked by this fallback"
+  echo "- production landing count: not checked by this fallback"
+  echo "- a lead must fill both at a landing standup; this job performs no network or deployment calls"
+} > "$tmp"
+
+mv "$tmp" "$out"
+trap - EXIT
+echo "$out"

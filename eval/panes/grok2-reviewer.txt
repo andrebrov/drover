@@ -1,0 +1,6 @@
+                                                                                                                                                                                                                                                     █
+    You hit your weekly limit.
+    1 (○) Buy more credits  Purchase credits to keep using Grok Build
+    2 (○) Try Again         Resubmit the last prompt once you have usage again
+    ↑/↓ navigate · y copy                                                                                                                                                                                                          Enter:submit
+  Tab:next answer    Esc:scrollback    Shift+x:dismiss

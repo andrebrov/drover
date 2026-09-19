@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# fleet-wait [seconds] — block until an agent reports, then print and consume it.
+# This is how the lead learns work finished: pushed, not polled.
+# Exits 0 with messages, 1 on timeout with nothing.
+set -euo pipefail
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+INBOX="$FLEET_INBOX"
+mkdir -p "$INBOX"
+budget="${1:-600}"; waited=0
+while [ "$waited" -lt "$budget" ]; do
+  msgs=$(find "$INBOX" -name '*.msg' -type f 2>/dev/null | sort | head -40)
+  if [ -n "$msgs" ]; then
+    printf '%-18s %-11s %-8s %s\n' AGENT BEAN STATE SUMMARY
+    printf -- '--------------------------------------------------------------\n'
+    echo "$msgs" | while read -r m; do
+      IFS=$'\t' read -r ts a bean state summary report < "$m"
+      printf '%-18s %-11s %-8s %s\n' "$a" "$bean" "$state" "${summary:0:60}"
+      [ -n "$report" ] && echo "                                        -> $report"
+      rm -f "$m"
+    done
+    exit 0
+  fi
+  sleep 10; waited=$((waited+10))
+done
+echo "no agent reported within ${budget}s"
+exit 1

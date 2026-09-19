@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""fleet-judge - TypeSafe (jev-latest) judgments for fleet-watch. OPTIONAL. Fails open: any error (no key,
+no network, API error) exits 2 and prints nothing, and fleet-watch then behaves exactly as without it.
+  fleet-judge noop    <report.md|->  P(the round produced no new work)            AUC 0.98 (2026-09-18)
+  fleet-judge verdict <review.md|->  P(the review says: land it as it is)          AUC 0.96, verdict words removed
+  fleet-judge seat    <pane.txt|->   "<state> <confidence>" of a terminal tail     21/25 on labeled panes
+The API key is read from ~/.config/typesafe/api_key inside this process; it never appears in argv.
+Text is redacted of credential-shaped strings before it leaves the machine; pane tails and reports still
+contain paths, branch names and task titles — enable this only if sending those to api.typesafe.ai is OK."""
+import json, os, re, sys, urllib.request
+NOOP = ("This report describes a round in which the coding agent produced NO new work: it only re-carried, "
+        "re-picked, cherry-picked, rebased or re-verified commits that already existed (often already approved), "
+        "found nothing to fix, or could not act (blocked). Answer no if the round wrote new code, new tests, or "
+        "fixes that did not exist before.")
+VERDICT = "This code review concludes the work is acceptable to land as it is, with no blocking defects left."
+SEAT_Q = "What state is the coding agent in this terminal pane in, judging from its last lines?"
+SEAT = {"working": "The agent is actively running: a spinner, 'esc to interrupt', tool output streaming, or a task in progress.",
+        "idle": "The agent is waiting at an empty input prompt for a new instruction; nothing is typed and nothing is running.",
+        "out_of_credits": "The agent cannot continue because a usage limit, quota, or credit balance is exhausted.",
+        "prompt_typed_not_sent": "Text of an instruction sits in the input box after the prompt marker but was never submitted.",
+        "blocked_on_dialog": "A permission, trust, or confirmation dialog or menu is waiting for a human choice (not a credits screen)."}
+# Ops text only: strip anything shaped like a credential before it leaves the machine.
+REDACT = re.compile(r"\b(?:sk-|ghp_|gho_|github_pat_|xox[abp]-|AKIA)[A-Za-z0-9_\-]{8,}"
+                    r"|\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)=\S+")
+def text(src): return REDACT.sub("", sys.stdin.read() if src == "-" else open(src, errors="replace").read())
+def ask(state, q):
+    key = open(os.path.expanduser("~/.config/typesafe/api_key")).read().strip()
+    body = json.dumps({"state": state, "model": "jev-latest", "questions": {"q": q}}).encode()
+    req = urllib.request.Request("https://api.typesafe.ai/v1/systemone", data=body,
+                                 headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=10))["answers"]["q"]
+def main():
+    if len(sys.argv) != 3 or sys.argv[1] not in ("noop", "verdict", "seat"):
+        print(__doc__, file=sys.stderr); return 64
+    verb, src = sys.argv[1:]
+    if verb == "noop":
+        print(f"{ask({'report': text(src)[:1500]}, {'type': 'noul', 'instructions': NOOP})['noul']:.2f}")
+    elif verb == "verdict":
+        print(f"{ask({'review': text(src)[:1800]}, {'type': 'noul', 'instructions': VERDICT})['noul']:.2f}")
+    else:
+        a = ask({"terminal_tail": text(src)[-2500:]}, {"type": "choice", "instructions": SEAT_Q, "criteria": SEAT})
+        print(f"{a['choice']} {a.get('confidence', 0):.2f}")
+    return 0
+if __name__ == "__main__":
+    try: sys.exit(main())
+    except Exception: sys.exit(2)

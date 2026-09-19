@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# fleet-done — an AGENT calls this the moment it finishes. It is the push half
+# of the fleet's reporting: the lead no longer polls, it waits.
+#
+#   fleet-done <agent> <bean> <DONE|BLOCKED|CHANGES> "<one-line summary>" [report-path]
+#
+# Writes one line into $FLEET_INBOX. The lead (or fleet-watch) blocks on that
+# directory (fleet-wait) instead of reading panes or trusting `fleet status`,
+# which reports `done` while an agent is still mid-turn.
+set -euo pipefail
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+INBOX="$FLEET_INBOX"
+mkdir -p "$INBOX"
+a="${1:?agent}"; bean="${2:?bean}"; state="${3:?DONE|BLOCKED|CHANGES}"; summary="${4:-}"; report="${5:-}"
+# A coder's DONE with unchecked checklist items is not DONE: downgrade to PARTIAL so the watcher
+# sends it back to the same coder instead of spending a reviewer round on "items still open".
+case "$a" in
+  *coder|*coder-[0-9]*)
+    bf=$(ls .beans/"$bean"--*.md 2>/dev/null | head -1 || true)   # ls exits 2 on no match: without || true, set -e + pipefail killed the announcement
+    if [ "$state" = DONE ] && [ -n "$bf" ]; then
+      # grep -c PRINTS 0 and EXITS 1 when there is no match, so `|| echo 0` appended a
+      # second zero and `un` became "0\n0" -> "[: integer expression expected". Swallow
+      # the status only; never add output. (Same class as the pipefail/grep -q trap.)
+      un=$(grep -c '^- \[ \]' "$bf" 2>/dev/null || true); un="${un%%$'\n'*}"
+      if [ "${un:-0}" -gt 0 ]; then state=PARTIAL; summary="unchecked items: $un — $summary"; echo "fleet-done: $bean has $un unchecked checklist item(s) → announced as PARTIAL, not DONE" >&2; fi
+    fi ;;
+esac
+
+ts=$(date +%s)
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$a" "$bean" "$state" "$summary" "$report" \
+  > "$INBOX/$ts-$a-$bean.msg"
+echo "reported: $a $bean $state"

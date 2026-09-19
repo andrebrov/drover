@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""fleet-yolo — keep every fleet seat running with its harness's approval-bypass flag.
+
+Why this exists: herdr (0.9.1) restores agents after a reboot/server restart with a
+hard-coded bare resume command (`claude --resume <id>`, `codex resume <id>`,
+`grok --resume <id>`, `opencode --session <id>`, ...). herdr has no setting to add
+arguments to that command (checked against herdr.dev/llms-full.txt), so every
+reboot silently drops the yolo flags `fleet up` launched the seats with.
+
+What it does, per roster seat (DROVER_ROSTER, or FLEET= if set — see drover-env):
+  1. finds the seat's agent process EXACTLY, by the HERDR_PANE_ID in its environment
+  2. checks the command line for that harness's flag (same table as fleet agent_args)
+  3. if missing and the seat is not mid-turn (idle/done/blocked): Esc (cancels, never
+     approves, any pending prompt), Ctrl-C x2 to exit, then relaunches in the same pane
+     with the flag, RESUMING the seat's own session id
+  4. verifies the new process carries the flag
+A seat that is `working` is never interrupted; it is retried on the next run.
+
+  fleet-yolo            # fix every non-yolo roster seat
+  fleet-yolo --dry-run  # report only
+  fleet-yolo seat ...   # limit to these seats
+"""
+import json, os, re, subprocess, sys, time
+
+DRY = '--dry-run' in sys.argv
+QUIET = '--quiet' in sys.argv
+ONLY = [a for a in sys.argv[1:] if not a.startswith('--')]
+
+FLAG = {  # must match agent_args() in fleet
+    'claude': ['--dangerously-skip-permissions'],
+    'codex': ['--dangerously-bypass-approvals-and-sandbox'],
+    'opencode': ['--auto'],
+    'cursor': ['--yolo', '--approve-mcps', '--trust'],
+    'grok': ['--always-approve'],
+    'agy': ['--dangerously-skip-permissions'],
+}
+BIN = {  # top-level agent process for each harness
+    'claude': r'(^|/)claude( |$)', 'codex': r'/bin/codex( |$)', 'opencode': r'(^|/)opencode( |$)',
+    'cursor': r'cursor-agent( |$)', 'grok': r'(^|/)grok( |$)', 'agy': r'(^|/)agy( |$)',
+}
+EXE = {'claude': 'claude', 'codex': 'codex', 'opencode': 'opencode', 'cursor': 'cursor-agent', 'grok': 'grok', 'agy': 'agy'}
+RESUME = {  # how each harness names the session it resumed; re-emitted verbatim
+    'claude': r'(--resume) (\S+)', 'codex': r'(resume) (\S+)', 'opencode': r'(--session) (\S+)',
+    'cursor': r'(--resume) (\S+)', 'grok': r'(--resume) (\S+)', 'agy': r'(--conversation) (\S+)',
+}
+
+
+def sh(*cmd, timeout=60):
+    return subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout)
+
+
+def log(msg):
+    if not QUIET or any(k in msg for k in ('RESTARTED', 'FAILED', 'RECOVERED', 'RENAMED')):
+        print(msg, flush=True)
+
+
+def drover_env():
+    """The same config every bash script sees: source drover-env (next to this file) and read it back."""
+    env = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drover-env')
+    out = subprocess.run(['bash', '-c', '. "$0"; printf "%s\\0%s\\0%s\\0%s" "${FLEET:-$DROVER_ROSTER}" '
+                          '"$FLEET_STATE" "$FLEET_TASKS" "$DROVER_LEAD_SEATS"', env],
+                         capture_output=True, text=True, check=True).stdout.split('\0')
+    return dict(zip(('roster', 'state', 'tasks', 'leads'), out))
+
+
+CFG = drover_env()
+
+
+def roster():
+    return {s.split(':')[0]: s.split(':')[1] for s in CFG['roster'].split() if ':' in s}
+
+
+def agents():
+    out = sh('herdr', 'agent', 'list').stdout
+    return {a['name']: a for a in json.loads(out)['result']['agents'] if a.get('name')}
+
+
+def pane_processes():
+    """pane_id -> list of (pid, kind, argv-string) for agent processes with a tty."""
+    ps = sh('ps', '-axo', 'pid=,tty=,command=').stdout.splitlines()
+    res = {}
+    for line in ps:
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[1] == '??':
+            continue
+        pid, _, cmd = parts
+        cmd = cmd.strip()
+        kind = next((k for k, p in BIN.items() if re.search(p, cmd) and 'Claude.app' not in cmd and 'mcp' not in cmd.lower()), None)
+        if not kind:
+            continue
+        env = sh('ps', 'eww', '-o', 'command=', '-p', pid).stdout
+        m = re.search(r'\bHERDR_PANE_ID=(\S+)', env)
+        if m:
+            res.setdefault(m.group(1), []).append((pid, kind, cmd))
+    return res
+
+
+def is_yolo(kind, cmd):
+    return all(f in cmd for f in FLAG[kind])
+
+
+def alive(pid):
+    return sh('ps', '-p', pid, '-o', 'pid=').stdout.strip() != ''
+
+
+PENDING = os.path.join(CFG['state'], 'yolo-pending')
+
+
+def launch_in_shell(pane, kind, launch):
+    """Relaunch in the pane's shell. herdr keeps the seat name on the pane after the
+    agent exits (agent start -> agent_name_taken), so the shell is the reliable path.
+    Enter first flushes any junk on the line; printf pops the kitty keyboard mode an
+    exited TUI (opencode) can leave behind. Waits up to 60 s for the flagged process."""
+    time.sleep(1.5)
+    sh('herdr', 'pane', 'send-keys', pane, 'enter')
+    time.sleep(1.0)
+    sh('herdr', 'pane', 'send-text', pane, "printf '\\e[<u'; " + launch)
+    time.sleep(0.5)
+    sh('herdr', 'pane', 'send-keys', pane, 'enter')
+    new = []
+    for _ in range(60):
+        time.sleep(1)
+        new = [p for p in pane_processes().get(pane, []) if p[1] == kind]
+        if any(is_yolo(kind, c) for _, _, c in new):
+            break
+    return None, new
+
+
+def recover_pending(ags, procs):
+    """A seat whose agent exited during an earlier run but never came back: relaunch it."""
+    if not os.path.isdir(PENDING):
+        return 0
+    n = 0
+    for name in os.listdir(PENDING):
+        try:
+            pane, kind, launch = open(os.path.join(PENDING, name)).read().rstrip('\n').split('\t', 2)
+        except ValueError:
+            continue
+        if any(p[1] == kind for p in procs.get(pane, [])):
+            os.remove(os.path.join(PENDING, name)); continue   # already back
+        if DRY:
+            log(f'  WOULD RECOVER {name} ({pane}): {launch}'); continue
+        _, new = launch_in_shell(pane, kind, launch)
+        if any(is_yolo(kind, c) for _, _, c in new):
+            os.remove(os.path.join(PENDING, name)); n += 1
+            held = {a.get('pane_id'): a.get('name') for a in json.loads(sh('herdr', 'agent', 'list').stdout)['result']['agents']}
+            if not held.get(pane):
+                sh('herdr', 'agent', 'rename', pane, name)
+            log(f'  RECOVERED {name} ({pane})')
+        else:
+            log(f'  FAILED to recover {name} ({pane}) — pending kept for next run')
+    return n
+
+
+NAMES = os.path.join(CFG['state'], 'yolo-names.json')
+
+
+def restore_names(ros):
+    try: seen = json.load(open(NAMES))
+    except Exception: seen = {}
+    raw = json.loads(sh('herdr', 'agent', 'list').stdout)['result']['agents']
+    for a in raw:
+        if a.get('name') in ros: seen[a['pane_id']] = a['name']
+    labels = {}
+    try:
+        for w in json.loads(sh('herdr', 'workspace', 'list').stdout)['result']['workspaces']:
+            labels[w['workspace_id']] = w.get('label')
+    except Exception:
+        pass
+    live = {a.get('name') for a in raw if a.get('name')}
+    for a in raw:
+        if a.get('name') or a.get('agent') not in FLAG:
+            continue
+        pane = a['pane_id']; ws = pane.split(':')[0]
+        want = seen.get(pane) or (labels.get(ws) if labels.get(ws) in ros else None)
+        if want and want not in live and ros.get(want) == a.get('agent'):
+            if DRY:
+                log(f'  WOULD RENAME {pane} -> {want}')
+            else:
+                sh('herdr', 'agent', 'rename', pane, want); live.add(want); seen[pane] = want
+                log(f'  RENAMED {pane} -> {want}')
+    os.makedirs(os.path.dirname(NAMES), exist_ok=True)
+    json.dump(seen, open(NAMES, 'w'), indent=1)
+
+
+def restart(name, kind, pane, pid, cmd):
+    m = re.search(RESUME[kind], cmd)
+    resume = [m.group(1), m.group(2)] if m else []
+    args = FLAG[kind] + resume
+    if DRY:
+        log(f'  WOULD RESTART {name} ({kind}, {pane}) with: {" ".join(args)}')
+        return True
+    launch = ' '.join([EXE[kind], *args])
+    # (4) Record the relaunch BEFORE touching the process: if anything below fails after
+    # the old agent has exited, the next run finds the seat down and relaunches from here.
+    os.makedirs(PENDING, exist_ok=True)
+    open(os.path.join(PENDING, name), 'w').write(f'{pane}\t{kind}\t{launch}\n')
+    # (1) Escalating exit, checking between EVERY key: a key sent after the agent has
+    # exited lands in the shell as kitty-keyboard escape junk and corrupts the next line.
+    def send_until_exit(keys, via):
+        for k in keys:
+            if not alive(pid):
+                return
+            via(k)
+            for _ in range(4):
+                if not alive(pid):
+                    return
+                time.sleep(0.5)
+    send_until_exit(['esc', 'ctrl+c', 'ctrl+c'], lambda k: sh('herdr', 'agent', 'send-keys', name, k))
+    if alive(pid):
+        sh('herdr', 'pane', 'send-text', pane, '/exit'); time.sleep(0.5); sh('herdr', 'pane', 'send-keys', pane, 'enter')
+        for _ in range(16):
+            if not alive(pid):
+                break
+            time.sleep(0.5)
+    if alive(pid):
+        send_until_exit(['ctrl+d'], lambda k: sh('herdr', 'pane', 'send-keys', pane, k))
+    if alive(pid):
+        os.remove(os.path.join(PENDING, name))
+        log(f'  FAILED {name}: pid {pid} did not exit (Esc/Ctrl-C, /exit, Ctrl-D) — left untouched')
+        return False
+    r, new = launch_in_shell(pane, kind, launch)
+    ok = True
+    verified = ok and any(is_yolo(kind, c) for _, _, c in new)
+    if verified:
+        try: os.remove(os.path.join(PENDING, name))
+        except FileNotFoundError: pass
+        # A relaunched agent can come back anonymous; give the pane its seat name back.
+        held = {a.get('pane_id'): a.get('name') for a in json.loads(sh('herdr', 'agent', 'list').stdout)['result']['agents']}
+        if not held.get(pane):
+            sh('herdr', 'agent', 'rename', pane, name)
+        # A seat that holds a task must not sit silently after the restart.
+        if os.path.isfile(os.path.join(CFG['tasks'], name)):
+            time.sleep(4)
+            sh('herdr', 'agent', 'prompt', name,
+               'You were restarted in yolo mode (approvals bypassed) with your session resumed. Continue your '
+               'current task from where you left off; if a step was cancelled while waiting for approval, redo it.')
+    log(f'  {"RESTARTED" if verified else "FAILED"} {name} ({kind}, {pane}) '
+        f'{"resumed " + resume[1] if resume else "fresh session"}'
+        f'{"" if verified else " — relaunch not seen in 60 s; pending kept, next run recovers it"}')
+    return verified
+
+
+def main():
+    ros = roster()
+    restore_names(ros)
+    ags, procs = agents(), pane_processes()
+    recover_pending(ags, procs)
+    procs = pane_processes()
+    # Never restart the caller's own session, nor the lead seats (they are the ones
+    # running this; a restart would drop the orchestrator mid-operation).
+    self_pane = os.environ.get('HERDR_PANE_ID')
+    exclude = set(CFG['leads'].split()) | set(filter(None, os.environ.get('FLEET_YOLO_EXCLUDE', '').split(',')))
+    seats = [n for n in ros if (not ONLY or n in ONLY) and n not in exclude
+             and (ags.get(n) or {}).get('pane_id') != self_pane]
+    fixed = failed = 0
+    for name in seats:
+        a = ags.get(name)
+        if not a:
+            log(f'  skip {name}: not live in herdr (run: fleet up)')
+            continue
+        kind, pane, state = a.get('agent'), a.get('pane_id'), a.get('agent_status')
+        if kind not in FLAG:
+            continue
+        mine = [p for p in procs.get(pane, []) if p[1] == kind]
+        if not mine:
+            log(f'  skip {name}: no {kind} process found in pane {pane}')
+            continue
+        pid, _, cmd = mine[0]
+        if is_yolo(kind, cmd):
+            log(f'  ok   {name}: yolo')
+            continue
+        if state == 'working':
+            log(f'  wait {name}: NOT yolo but mid-turn — retry next run')
+            continue
+        if restart(name, kind, pane, pid, cmd):
+            fixed += 1
+        else:
+            failed += 1
+    log(f'fleet-yolo: {"would fix" if DRY else "fixed"} {fixed}, failed {failed}')
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == '__main__':
+    main()

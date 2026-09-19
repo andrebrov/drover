@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# fleet-budget — what each harness costs and whether it can still run.
+# Written 2026-09-07 after opencode ran out of credits mid-run and silently
+# idled 10 of 25 agents: every one reported "done" with no work and no error.
+# The failure is invisible from `fleet status`, which is the whole problem.
+set -euo pipefail
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+# Seats are classified by the KIND column of `fleet status` (the harness herdr reports), never by name:
+# a name-based match miscounts any seat whose name does not spell its harness.
+# `fleet status` exits 1 whenever a seat is MISSING; under pipefail that killed this script on its first
+# line and the watcher read "no budget problem" for every harness (found 2026-09-18). One tolerant snapshot.
+FS=$("$DROVER_BIN"/fleet status 2>/dev/null || true)
+
+echo "harness    agents  state"
+echo "--------------------------------"
+
+# opencode: the balance lives in the workspace, and the only signal an agent
+# gives is the words "Insufficient balance" printed into its pane.
+oc_agents=$(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="opencode" {n++} END{print n+0}')
+oc_broke=0
+# Only a NON-working agent counts. The balance message stays in the pane
+# scrollback after a top-up, so matching it alone reports a solved problem as
+# live — a false positive, and the exact unvalidated-instrument failure the
+# fleet is told not to ship.
+for a in $(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="opencode" {print $1}'); do
+  st=$(printf "%s\n" "$FS" | awk -v n="$a" '$1==n{print $3}')
+  [ "$st" = "working" ] && continue
+  [ "$st" = "MISSING" ] && continue
+  if "$DROVER_BIN"/fleet read "$a" 40 2>/dev/null | grep -qi "insufficient balance"; then
+    oc_broke=$((oc_broke+1))
+  fi
+done
+if [ "$oc_broke" -gt 0 ]; then
+  printf 'opencode   %-6s OUT OF CREDITS (%s agents showing it)\n' "$oc_agents" "$oc_broke"
+  echo '           -> https://opencode.ai/workspace  — top up, then `fleet up`'
+else
+  printf 'opencode   %-6s ok\n' "$oc_agents"
+fi
+
+# codex: a usage cap prints into the pane and the agent goes idle.
+cx_agents=$(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="codex" {n++} END{print n+0}')
+cx_broke=0
+for a in $(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="codex" {print $1}'); do
+  st=$(printf "%s\n" "$FS" | awk -v n="$a" '$1==n{print $3}')
+  [ "$st" = "working" ] && continue
+  [ "$st" = "MISSING" ] && continue
+  # The banner stays in the scrollback after the limit lifts. Measured 2026-09-08:
+  # a codex seat answered a prompt normally while a six-day-old banner sat above
+  # it, and this check idled four seats for nothing. A limit is only live if the
+  # banner is the LAST thing in the pane — i.e. nothing the agent produced since.
+  pane=$("$DROVER_BIN"/fleet read "$a" 40 2>/dev/null) || true
+  if printf '%s' "$pane" | grep -qiE "usage limit|rate limit|session limit|hit your session"; then
+    banner_line=$(printf '%s\n' "$pane" | grep -niE "usage limit|rate limit|session limit|hit your session" | tail -1 | cut -d: -f1)
+    # any agent output AFTER the banner means it is stale
+    after=$(printf '%s\n' "$pane" | tail -n +$((banner_line+1)) | grep -cE '^[[:space:]]*(•|✓|└|│)') || true
+    if [ "${after:-0}" -eq 0 ]; then cx_broke=$((cx_broke+1)); fi
+  fi
+done
+if [ "$cx_broke" -gt 0 ]; then
+  printf 'codex      %-6s AT USAGE LIMIT (%s agents showing it)\n' "$cx_agents" "$cx_broke"
+  echo '           -> https://chatgpt.com/codex/settings/usage'
+else
+  printf 'codex      %-6s ok\n' "$cx_agents"
+fi
+
+cl=$(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="claude" {n++} END{print n+0}')
+gk=$(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="grok" {n++} END{print n+0}')
+ag=$(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="agy" {n++} END{print n+0}')
+cl_broke=0; cl_reset=""
+for a in $(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="claude" {print $1}'); do
+  st=$(printf "%s\n" "$FS" | awk -v n="$a" '$1==n{print $3}')
+  [ "$st" = "working" ] && continue
+  [ "$st" = "MISSING" ] && continue
+  line=$("$DROVER_BIN"/fleet read "$a" 40 2>/dev/null | grep -iE "session limit|hit your session" | tail -1 || true)
+  [ -n "$line" ] || continue
+  r=$(printf '%s' "$line" | grep -oE 'resets [0-9]{1,2}(:[0-9]{2})?[ap]m' | awk '{print $2}' || true)
+  # only count a limit whose reset time is still ahead; a stale line after the reset is not a limit
+  # a limit line without a parseable future reset time is scrollback, not a limit
+  [ -n "$r" ] || continue
+  rs=$(date -j -f '%I:%M%p' "$(echo "$r" | sed -E 's/^([0-9]{1,2})([ap]m)$/\1:00\2/' | tr a-z A-Z)" +%s 2>/dev/null || echo 0)
+  [ "$rs" -gt "$(date +%s)" ] || continue
+  cl_broke=$((cl_broke+1)); cl_reset="$r"
+done
+if [ "$cl_broke" -gt 0 ]; then
+  printf 'claude     %-6s AT SESSION LIMIT (%s agents showing it; resets %s)\n' "$cl" "$cl_broke" "$cl_reset"
+  echo '           -> wait for the reset, then RESUME each seat by name (they do not resume on their own)'
+else
+  printf 'claude     %-6s subscription\n' "$cl"
+fi
+
+# Credit exhaustion is a DIFFERENT failure from a session limit and the session-limit
+# check above cannot see it: that check requires a parseable future reset time, and the
+# credit banner has none ("You're out of usage credits. Run /usage-credits ... or /model
+# to switch models."). Measured 2026-09-08: three claude seats all sat out of credits
+# while this script printed "claude 7 subscription", and two sprint beans
+# were dispatched into dead seats and produced nothing for 48 minutes.
+# A credit-dead seat NEVER recovers on its own — it needs a top-up or a /model switch.
+cr_dead=""
+for a in $(printf "%s\n" "$FS" | awk 'NR>1 && $1 != "-" {print $1}'); do
+  "$DROVER_BIN"/fleet read "$a" 40 2>/dev/null | grep -qiE "out of usage credits|/usage-credits" || continue
+  cr_dead="$cr_dead $a"
+done
+if [ -n "$cr_dead" ]; then
+  printf 'CREDITS    %-6s OUT OF USAGE CREDITS:%s\n' "$(printf '%s' "$cr_dead" | wc -w | tr -d ' ')" "$cr_dead"
+  echo '           -> these seats are DEAD and do not recover: top up, or /model to a subscription model.'
+  echo '           -> release their beans first (fleet-track clear <agent>) or the work sits unstarted.'
+fi
+printf 'grok       %-6s subscription\n' "$gk"
+printf 'agy        %-6s subscription\n' "$ag"
+
+echo
+echo "Silent-idle check — agents that finished with no work to show:"
+printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && ($3=="done"||$3=="idle"){printf "  %s\n",$1}' | head -8
+echo "  (an agent 'done' with no report and no commit is usually a spent budget,"
+echo "   not a finished task — check its pane before re-dispatching)"

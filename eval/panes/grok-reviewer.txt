@@ -1,0 +1,9 @@
+     ◆ Task completed in 40s: Typecheck backend tsc --noEmit
+    Turn failed: Request failed (402): Grok Build usage balance exhausted
+     ◆ Task completed in 6m37s: Run related then full Jest suite
+                                                                                                                                                                                                                                                     █
+    You hit your weekly limit.
+    1 (○) Buy more credits  Purchase credits to keep using Grok Build
+    2 (○) Try Again         Resubmit the last prompt once you have usage again
+    ↑/↓ navigate · y copy                                                                                                                                                                                                          Enter:submit
+  Tab:next answer    Esc:scrollback    Shift+x:dismiss

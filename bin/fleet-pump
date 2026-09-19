@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# fleet-pump — hand the next queued job to every idle agent, so agents never wait on the lead.
+#
+#   fleet-pump queue <agent> < brief.txt   queue a job (one file per job, FIFO)
+#   fleet-pump run                         give each idle agent its next queued job
+#   fleet-pump show                        what is queued, per agent
+#
+# Agents finish in minutes; the lead notices in tens of minutes. That gap was the fleet's
+# real idle time. The lead writes briefs whenever it has context; the pump delivers them.
+set +u
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+Q="$DROVER_HOME/pump"
+FLEET="$DROVER_BIN"/fleet
+
+case "${1:-run}" in
+queue)
+  a=$2; [ -n "$a" ] || { echo "usage: fleet-pump queue <agent> < brief.txt"; exit 2; }
+  mkdir -p "$Q/$a"; f="$Q/$a/$(date +%s%N).job"; cat > "$f"
+  echo "queued for $a ($(ls "$Q/$a" | wc -l | tr -d ' ') pending)" ;;
+show)
+  for d in "$Q"/*/; do [ -d "$d" ] || continue
+    n=$(ls "$d" 2>/dev/null | wc -l | tr -d ' ')
+    [ "$n" -gt 0 ] && printf '%-20s %s pending: %s\n' "$(basename "$d")" "$n" \
+      "$(head -c 60 "$(ls -1 "$d" | head -1 | sed "s|^|$d|")" 2>/dev/null | tr '\n' ' ')"; done ;;
+run)
+  sent=0
+  while read -r a st; do
+    case "$st" in idle|done) ;; *) continue ;; esac
+    d="$Q/$a"; [ -d "$d" ] || continue
+    job=$(ls -1 "$d" 2>/dev/null | head -1); [ -n "$job" ] || continue
+    if $FLEET send "$a" "$(cat "$d/$job")" >/dev/null 2>&1; then
+      rm -f "$d/$job"
+      printf '%-20s dispatched (%s left)\n' "$a" "$(ls "$d" 2>/dev/null | wc -l | tr -d ' ')"
+      sent=$((sent+1))
+    else
+      printf '%-20s SEND FAILED — job kept\n' "$a"
+    fi
+  done < <($FLEET status 2>/dev/null | awk 'NR>1 && $1!="-" && $1!="lead" {print $1, $3}')
+  echo "$sent dispatched"; exit 0 ;;
+*) sed -n '2,9p' "$0"; exit 2 ;;
+esac

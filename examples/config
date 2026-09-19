@@ -1,0 +1,36 @@
+# ~/.config/drover/config — sourced by every drover script (plain shell).
+# Write each value as ${VAR:-value} so an environment variable still wins over this file.
+
+# REQUIRED: the main checkout of the project the fleet works on. Seats get their own git worktrees
+# of it (herdr puts them under ~/.herdr/worktrees/<repo-name>/), and landings happen here.
+DROVER_REPO="${DROVER_REPO:-}"
+
+# The seats: name:harness pairs. The role is the last word of the name (coder, reviewer, pm, architect,
+# analyst, sre, judge, design). Reviews are always routed to a reviewer on a DIFFERENT harness.
+# Harnesses fleet knows how to launch: claude codex opencode cursor grok agy.
+DROVER_ROSTER="${DROVER_ROSTER:-claude-coder:claude codex-coder:codex opencode-coder:opencode claude-reviewer:claude codex-reviewer:codex opencode-reviewer:opencode}"
+
+# Seats fleet-yolo must never restart (the lead sessions that run the fleet).
+DROVER_LEAD_SEATS="${DROVER_LEAD_SEATS:-lead lead-backup}"
+
+# What a coder and a reviewer are told to run before they may say DONE / APPROVE.
+DROVER_BUILD="${DROVER_BUILD:-}"          # e.g. 'npm run build' or 'cd backend && npm run build'
+DROVER_TEST="${DROVER_TEST:-}"            # e.g. 'npx jest <file>' — how to run one test file
+
+# Fresh worktree bootstrap: dependency dirs APFS-cloned from DROVER_REPO, and untracked files copied.
+DROVER_CLONE_DIRS="${DROVER_CLONE_DIRS:-node_modules}"   # space-separated, relative to the repo root
+DROVER_COPY_FILES="${DROVER_COPY_FILES:-.env}"           # space-separated; stays on this machine
+
+# Queue top-up: ready beans whose title/body match any of these words go first (the sprint theme).
+DROVER_QUEUE_KEYWORDS="${DROVER_QUEUE_KEYWORDS:-}"
+
+# Generated files fleet-claim refuses to claim (ERE over repo paths). Empty = none.
+DROVER_GENERATED="${DROVER_GENERATED:-}"
+
+# Optional overrides (defaults shown).
+# DROVER_HOME="${DROVER_HOME:-$HOME/.local/share/drover}"       # queue, inbox, tasks, reports, state
+# DROVER_WORKTREES="${DROVER_WORKTREES:-$HOME/.herdr/worktrees/<basename of DROVER_REPO>}"
+# DROVER_BEAN_PREFIX="${DROVER_BEAN_PREFIX:-}"                   # default: read from DROVER_REPO/.beans.yml
+# DROVER_RULES="${DROVER_RULES:-$HOME/.config/drover/PEERS.md}"  # your own agent rules, replaces the shipped skill
+# DROVER_BACKUP_LEAD="${DROVER_BACKUP_LEAD:-lead-backup}"        # the seat lead-watchdog wakes
+# FLEET_TICK="${FLEET_TICK:-60}"                                 # fleet-watch tick, seconds

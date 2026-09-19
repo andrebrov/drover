@@ -1,0 +1,10 @@
+       09-19 loses nothing. Load failure fails the channel post (email-path mirror); cursor advances only after the channel accepted every message. Email receipts untouched.
+     - Evidence: failing-first 6/7 red pre-implementation → 27/27 after; mutation "advance-on-rejected-post" killed by exactly its guard test (one broken brace-unbalanced mutant disclosed and redone);
+       related suites 537/538 with the single red (a renderer snapshot) proven pre-existing by reproducing it on reverted-to-main files; npm run build and tsc --noEmit exit 0; openspec validate
+       add-action-receipts --strict valid; standalone proof via cherry-pick onto detached origin/main (ff3b8dba3): 176/176 + tsc clean.
+     - Lead follow-up (in the bean): land the two commits; read-only verify one customer's closed receipt appears in its bound channel's next digest.
+     - Report: ~/.local/share/drover/reports/opencode7-coder-bean-t6ey.md; file claims released.
+     ▣  Sisyphus - Ultraworker · GLM 5.3 Fast · 46m 12s
+                                                                                                                                                                                                             ~/.herdr/worktrees/myapp/fleet-
+    Sisyphus - Ultraworker auto · GLM 5.3 Fast Fireworks AI · max                                                                                                                                            opencode7-coder:fleet/opencode7-coder-bean-t6ey
+   ~/.herdr/worktrees/myapp/fleet-opencode7-coder                                                                                                        234.2K (22%) · $7.77  ctrl+p commands    • OpenCode 1.18.31

@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# fleet-track — judge agents by ARTIFACTS, never by pane or status.
+#
+# Why this exists (2026-09-07): `fleet status` reported `done` for an agent whose
+# pane showed "esc interrupt" — actively mid-turn. The lead re-dispatched over
+# working agents for hours on that signal. Pane scrollback is equally bad: it
+# keeps stale text, so a solved problem still reads as live, and a prompt sitting
+# unsubmitted in the composer looks identical to one that was taken.
+#
+# Only two things cannot lie: a commit on the agent's branch, and a report file
+# on disk. This tracks exactly those.
+#
+#   fleet-track dispatch <agent> <bean> [report-path]   record what was asked
+#   fleet-track check                                   what has actually landed
+#   fleet-track clear <agent>                           forget one task
+set -euo pipefail
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+TASKS="$FLEET_TASKS"
+REPORTS="$FLEET_REPORTS"
+REPO="${FLEET_REPO:-${DROVER_REPO:?set DROVER_REPO (env or ~/.config/drover/config) to your project checkout}}"
+GIT=$(command -v git)
+mkdir -p "$TASKS"
+
+sha_of() { "$GIT" -C "$REPO" rev-parse --short "fleet/$1" 2>/dev/null || echo none; }
+
+case "${1:-check}" in
+  dispatch)
+    a="$2"; bean="$3"; rp="${4:-$REPORTS/$a-$bean.md}"
+    printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$bean" "$(sha_of "$a")" "$rp" > "$TASKS/$a"
+    echo "tracking $a -> $bean (branch at $(sha_of "$a"))"
+    ;;
+  clear) rm -f "$TASKS/${2:?agent}"; echo "cleared ${2}" ;;
+  check)
+    printf '%-18s %-11s %-7s %-10s %-7s %s\n' AGENT BEAN AGE CODE-COMMITS LAST-COMMIT REPORT
+    printf -- '---------------------------------------------------------------\n'
+    for f in "$TASKS"/*; do
+      [ -f "$f" ] || continue
+      a=$(basename "$f")
+      IFS=$'\t' read -r t bean sha rp < "$f"
+      now=$(date +%s); age=$(( (now - t) / 60 ))
+      cur=$(sha_of "$a")
+      if [ "$cur" = "$sha" ]; then commits="none"; else
+        # code commits only: bean-file commits masked an idle coder once (85 min)
+        commits=$("$GIT" -C "$REPO" rev-list --count --no-merges "$sha..fleet/$a" -- . ':(exclude).beans' 2>/dev/null || echo "?")
+        [ "$commits" = "0" ] && commits="beans-only"
+      fi
+      lastc=$("$GIT" -C "$REPO" log -1 --format=%ct "fleet/$a" 2>/dev/null || echo "$now"); idle=$(( (now - lastc) / 60 ))
+      if [ -f "$rp" ]; then
+        rmin=$(( (now - $(stat -f %m "$rp" 2>/dev/null || echo "$now")) / 60 ))
+        report="yes (${rmin}m ago)"
+      else report="none"; fi
+      flag=""; case "$commits" in none|beans-only) [ "$age" -ge 15 ] && [ "$report" = "none" ] && flag="  !! no code, no report";; esac
+      printf '%-18s %-11s %-7s %-10s %-7s %s%s\n' "$a" "$bean" "${age}m" "$commits" "${idle}m" "$report" "$flag"
+    done
+    echo
+    echo "COMMITS=none and REPORT=none after ~15m means the dispatch did not take."
+    echo "Do NOT judge by 'fleet status' — it says done while an agent is mid-turn."
+    ;;
+  *) echo "usage: fleet-track dispatch <agent> <bean> [report] | check | clear <agent>"; exit 1 ;;
+esac

@@ -1,0 +1,6 @@
+# ~/.config/drover/caps — re-read by fleet-watch on every tick; no restart needed.
+# opencode spend in the last day (from `opencode stats --days 1`, cached 30 min) at or above this cap
+# stops new opencode dispatches and reviews; running work finishes. Delete the line to disable the cap.
+opencode_daily_usd=200
+# Optional: no cap before this date (YYYY-MM-DD).
+active_from=

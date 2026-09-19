@@ -1,0 +1,27 @@
+UX HUNT — find what makes the product rough to use, and propose the fix.
+
+This is NOT a bug hunt: the system can work exactly as designed and still be painful.
+
+## What you are looking for
+
+Friction a real user hits — someone who opened the product to answer one question and wants to leave having answered it.
+
+1. **A question that takes too many steps.** Something a user asks weekly that needs three pages and a mental join. Name the question, count the steps today, propose the shorter path.
+2. **A screen that shows data without saying what to do.** Where does a number sit with no next action beside it?
+3. **Absence rendered as nothing.** An empty state that does not say WHY it is empty or what would fill it. "No data" is a dead end; "no data because the sync has not run since X" is a next step.
+4. **A dead end.** A page you can reach and not leave usefully; an error with no recovery; a control that does nothing visible when clicked.
+5. **Something the user must know but is never told.** A silently disabled feature, a setting whose effect is invisible, a job that stopped and nobody said so.
+6. **Two things that should be one.** Findings belong inside the report that raised them, not on a separate page.
+
+## Rules
+
+- **Ground it in what exists.** Name the actual route, page or component. A suggestion that names no real surface is not actionable.
+- **State the user's goal, not the feature request.** "I want to know if this week's send was worth it" beats "add a chart".
+- **One concrete change per finding.** What moves, what merges, what sentence appears in the empty state. If you propose a new page, say what it replaces.
+- **Do not redesign the product.** The bar is smoother, not different.
+- **Rank by how much friction it removes**, not by how hard it is to build.
+- Read-only. Do not edit code.
+
+Prefer THREE well-grounded findings over ten thin ones. If the surface you looked at is genuinely smooth, say so and look elsewhere.
+
+Report <reports>/<your-name>-uxhunt-<date>.md: for each, the user's goal, what happens today (with the route), what should happen, and the one change that gets there.

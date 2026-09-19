@@ -1,0 +1,6 @@
+    New bean: read ~/.local/share/drover/briefs/assign-opencode8-coder-bean-2ydy.txt and follow it exactly. It assigns you bean-2ydy. Merge main first: git merge main --no-edit
+    The latest version of this model is only available hosted in China and requires explicit opt in: https://opencode.ai/workspace/wrk_XXXXXXXXXXXXXXXXXXXXXXXXXX/go
+     ▣  Sisyphus - Ultraworker · DeepSeek V4.1 Flash
+                                                                                                                                                                                                             ~/.herdr/worktrees/myapp/fleet-
+    Sisyphus - Ultraworker auto · DeepSeek V4.1 Flash OpenCode Go                                                                                                                                            opencode8-coder:fleet/opencode8-coder
+   ~/.herdr/worktrees/myapp/fleet-opencode8-coder                                                                                                                    tab agents  ctrl+p commands    • OpenCode 1.18.31

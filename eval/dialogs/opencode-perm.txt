@@ -1,0 +1,6 @@
+  ┃  Permission required
+  ┃  opencode wants to run: rm -rf node_modules/.cache
+  ┃
+  ┃  [a] allow once   [A] allow always   [d] deny
+  ┃
+  ┃  enter confirm  esc cancel

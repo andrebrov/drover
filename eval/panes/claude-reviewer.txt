@@ -1,0 +1,10 @@
+      85 +LANDABLE: NO — blocker: tests
+      86 +VERDICT: CHANGES
+  Ran 1 shell command
+⏺ REVIEWED ~/.local/share/drover/reports/claude-reviewer-review-bean-2zji-by-cursor-coder.md
+✻ Baked for 2m 2s · done 7:55 PM · 2 shells still running
+                                                                                                                                                                                                              new task? /clear to save 357.6k tokens
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Review task: read the next fleet-briefs file and follow it exactly.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 2 shells · ← for agents · ↓ to manage

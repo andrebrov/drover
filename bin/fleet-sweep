@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# fleet-sweep — reclaim agent scratchpad space.
+# Agents copy the whole repo (~400 MB) into their scratchpad per task and never
+# remove it. Measured 2026-09-08: one agent held 13 GB in ~30 copies and the
+# machine was down to 22 GiB free. Deletes only directories >= 50 MB that have
+# not been touched for MIN_AGE minutes, so live work is never removed.
+set -euo pipefail
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+# Claude Code keeps per-session scratchpads under /private/tmp/claude-<uid>/.../scratchpad.
+SCRATCH_ROOT="${DROVER_SCRATCH_ROOT:-/private/tmp/claude-$(id -u)}"
+MIN_AGE=${MIN_AGE:-120}
+DRY=${DRY:-0}
+now=$(date +%s); freed=0
+before=$(df -g / | awk 'NR==2{print $4}')
+while read -r sp; do
+  while read -r d; do
+    sz=$(du -sm "$d" 2>/dev/null | cut -f1) || continue
+    [ "${sz:-0}" -ge 50 ] || continue
+    m=$(stat -f '%m' "$d" 2>/dev/null) || continue
+    age=$(( (now - m) / 60 ))
+    [ "$age" -ge "$MIN_AGE" ] || continue
+    if [ "$DRY" = 1 ]; then echo "would remove ${sz}MB ${age}m $d"
+    else rm -rf "$d" && echo "removed ${sz}MB ${age}m $d"; fi
+    freed=$((freed + sz))
+  done < <(find "$sp" -maxdepth 1 -mindepth 1 -type d 2>/dev/null)
+done < <(find "$SCRATCH_ROOT" -maxdepth 4 -type d -name scratchpad 2>/dev/null)
+# Review worktrees under $DROVER_SCRATCH_WORKTREES: reviewers add one per review and never remove it (~1.2 GB
+# each; 2026-09-18 there were ~40). Remove only a worktree that is stale (>= 12h), clean (no modified
+# or untracked files), carries no commit that is not on a branch, and has no process inside it —
+# through `git worktree remove` without --force, so git itself refuses anything dirty.
+ROOT="${FLEET_ROOT:-${DROVER_REPO:?set DROVER_REPO (env or ~/.config/drover/config) to your project checkout}}"
+SCRATCH_WT="${DROVER_SCRATCH_WORKTREES:-$DROVER_HOME/scratch}"
+while read -r wt; do
+  [ -d "$wt" ] || continue
+  age=$(( (now - $(stat -f %m "$wt")) / 60 )); [ "$age" -ge "${WT_MIN_AGE:-720}" ] || continue
+  [ -z "$(git -C "$wt" status --porcelain 2>/dev/null | head -1)" ] || continue
+  [ -z "$(git -C "$wt" log --oneline -1 HEAD --not --branches --remotes 2>/dev/null)" ] || continue
+  [ -z "$(lsof +d "$wt" 2>/dev/null | awk 'NR>1' | head -1)" ] || continue
+  sz=$(du -sm "$wt" 2>/dev/null | cut -f1)
+  if [ "$DRY" = 1 ]; then echo "would remove worktree ${sz}MB ${age}m $wt"
+  else git -C "$ROOT" worktree remove "$wt" >/dev/null 2>&1 && echo "removed worktree ${sz}MB ${age}m $wt" && freed=$((freed + ${sz:-0})); fi
+done < <(git -C "$ROOT" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}' | grep -F "$SCRATCH_WT/" || true)
+git -C "$ROOT" worktree prune 2>/dev/null
+after=$(df -g / | awk 'NR==2{print $4}')
+echo "fleet-sweep: ~${freed}MB, free ${before}Gi -> ${after}Gi (MIN_AGE=${MIN_AGE}m, DRY=${DRY})"

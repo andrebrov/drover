@@ -1,0 +1,1016 @@
+#!/usr/bin/env bash
+# fleet — lead-managed team of coding agents inside herdr (one coder + one reviewer per harness).
+#
+#   fleet status                   roster table (exit 1 if an agent is missing/unknown)
+#   fleet up                       spawn missing roster agents — own git worktree (branch fleet/<name>), yolo mode
+#   fleet assign <bean> [coder] [scope-note]
+#                                  give a bean to the least-loaded idle coder (or the named one); ledger + prompt
+#   fleet review <coder> [reviewer] send <coder>'s branch to a reviewer on a DIFFERENT harness (least-loaded); ledger
+#   fleet finish <agent> [note]    record that the agent's current job ended (usage minutes)
+#   fleet followup <agent> "<msg>" send a fix-round / follow-up prompt AND log it as a job (use instead of send)
+#   fleet usage                    per-harness ledger: coding jobs, reviews, busy minutes + live state
+#   fleet task <name> "<prompt>"   send a prompt, wait for idle/done/blocked, print the screen
+#   fleet send <name> "<prompt>"   send a prompt and return immediately
+#   fleet read <name> [lines]      visible screen of one agent
+#   fleet wait <name> [state]      block until state (default idle/done/blocked)
+#   fleet keys <name> <key>...     answer a prompt: fleet keys codex-coder y enter
+#   fleet cancel <name>            cancel the agent's current turn (esc) — grok/opencode QUEUE messages sent mid-turn until you do this
+#   fleet blocked                  screens of every blocked agent
+#   fleet rm <name>                close the agent's workspace and remove its worktree (branch kept)
+#   fleet land <coder>             merge fleet/<coder> into main, parking/restoring the user's staged WIP around it
+#   fleet sync [name]              bring idle agents' worktrees up to main (drop stale seeds, merge, re-seed current WIP)
+#   fleet rules                    install the fleet-peers skill package for claude/codex/grok/opencode
+#   fleet stale [--kill|--report]  processes the agents left behind: orphans (pane gone), leftovers (dev/test
+#                                  procs under an idle agent), heavy (> FLEET_HEAVY_MB); --report feeds the sidebar
+#
+# Env: FLEET="name:kind ..." (default: DROVER_ROSTER) FLEET_ROOT (default: DROVER_REPO) FLEET_WORKTREES=1
+#      FLEET_SEED_WIP=1 FLEET_ADOPT=0 FLEET_OPENCODE_MODEL FLEET_CLAUDE_MODEL FLEET_AGY_MODEL FLEET_FORCE=1 (rm dirty)
+#      FLEET_BOOTSTRAP="cmd" FLEET_TIMEOUT(ms) FLEET_TAIL FLEET_STALE_MIN=10 (minutes) FLEET_HEAVY_MB=2048
+#      DROVER_CLONE_DIRS DROVER_COPY_FILES DROVER_BUILD DROVER_TEST — see examples/config
+set -euo pipefail
+
+# Tests stub transport with FLEET_HERDR. Real runs use the herdr on PATH.
+herdr() {
+  if [ -n "${FLEET_HERDR:-}" ]; then
+    "$FLEET_HERDR" "$@"
+  else
+    command herdr "$@"
+  fi
+}
+
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+FLEET_ROOT="${FLEET_ROOT:-${DROVER_REPO:-}}"
+FLEET_WS="${FLEET_WS:-fleet}"                # shared-tree mode only
+FLEET_WORKTREES="${FLEET_WORKTREES:-1}"
+# Seats always launch with their harness's approval-bypass flag. This is deliberate and must survive
+# herdr/session restarts (fleet-yolo re-applies it); an inherited environment variable must not
+# silently turn it off.
+FLEET_YOLO=1
+FLEET_SEED_WIP="${FLEET_SEED_WIP:-1}"
+FLEET_ADOPT="${FLEET_ADOPT:-0}"
+# The model is a SPAWN-TIME flag (see agent_args below), so changing a default does NOT move a pane
+# that is already up: existing agents keep whatever they were spawned with until they are removed and
+# respawned. Read the live value from `fleet models`, never from this line — and never infer a
+# seat's model from its name. Empty = the harness's own default.
+FLEET_OPENCODE_MODEL="${FLEET_OPENCODE_MODEL:-}"
+FLEET_AGY_MODEL="${FLEET_AGY_MODEL:-}"       # agy = Antigravity CLI; pin a model to keep its reviews cross-model
+FLEET_TIMEOUT="${FLEET_TIMEOUT:-900000}"     # ms to wait in `task` (15 min)
+FLEET="${FLEET:-$DROVER_ROSTER}"
+LEDGER="$FLEET_LEDGER"
+# Optional override for the agent-facing rules: when this file exists, `fleet rules` installs it as the
+# body of the fleet-peers skill instead of the shipped skills/fleet-peers/SKILL.md.
+RULES="${DROVER_RULES:-$HOME/.config/drover/PEERS.md}"
+# Reports live OUTSIDE /tmp: a reboot wiped /tmp twice, taking every fleet
+# report with it (2026-09-05 was the second time). Kept per-machine, not in
+# the repo, so they never pollute a branch.
+REPORTS=$FLEET_REPORTS
+BRIEFS=$FLEET_BRIEFS
+SKILLS_HOME="${FLEET_SKILLS:-$HOME/.config/drover/skills}"
+SKILLS_SRC="${FLEET_SKILLS_SRC:-$DROVER_SRC/skills}"
+HOSTS="claude codex grok opencode"
+
+# Strip global flags so `fleet assign --help` and `fleet land --yes` work
+# without changing existing positional call shapes.
+FLEET_HELP=0 FLEET_DRY_RUN=0 FLEET_YES=0 FLEET_SKILLS_ONLY=0
+FLEET_ARGS=()
+for _fleet_a in "$@"; do
+  case $_fleet_a in
+    --help|-h) FLEET_HELP=1 ;;
+    --dry-run) FLEET_DRY_RUN=1 ;;
+    --yes|-y) FLEET_YES=1 ;;
+    --skills) FLEET_SKILLS_ONLY=1 ;;
+    *) FLEET_ARGS+=("$_fleet_a") ;;
+  esac
+done
+if ((${#FLEET_ARGS[@]})); then set -- "${FLEET_ARGS[@]}"; else set --; fi
+
+agents() { herdr agent list | jq -c '.result.agents[]'; }
+ws_by_label() { herdr workspace list | jq -r --arg l "$1" '.result.workspaces[] | select(.label == $l) | .workspace_id' | head -1; }
+kind_of() { local s; for s in $FLEET; do [ "${s%%:*}" = "$1" ] && { printf '%s' "${s##*:}"; return; }; done; echo "unknown agent: $1" >&2; return 1; }
+
+cmd_help() {
+  case "${1:-}" in
+    assign) cat <<'H'
+fleet assign <bean> [coder] [scope]
+Give a bean to a coder. Writes a brief and prompts the agent.
+--dry-run  print agent, brief, branch, prompt; do nothing
+H
+      ;;
+    review) cat <<'H'
+fleet review <coder> [reviewer] [bean]
+Send a coder's branch to a reviewer on a different harness.
+--dry-run  print agent, brief, branch=fleet/<coder>, prompt; do nothing
+H
+      ;;
+    land) cat <<'H'
+fleet land <coder>
+Merge fleet/<coder> into main, parking/restoring the user's staged WIP.
+Requires --yes or a tty confirm. --dry-run prints the branch and does nothing.
+H
+      ;;
+    rm) cat <<'H'
+fleet rm <name>
+Close the agent's workspace and remove its worktree (branch kept).
+Requires --yes or a tty confirm. --dry-run prints the agent and does nothing.
+H
+      ;;
+    sync) cat <<'H'
+fleet sync [name]
+Bring idle agents' worktrees up to main. Writes pull-based host plugin
+manifests (claude/codex/grok/opencode) from drover's skills/.
+--dry-run  print per-host manifest diffs (nothing when unchanged) AND, unless
+           --skills, preview each requested worktree (agent, brief, branch, prompt)
+--skills   write manifests only; skip worktree merges
+H
+      ;;
+    send) cat <<'H'
+fleet send <name> "<prompt>"
+Send a prompt and return immediately. Mutating.
+--dry-run  print agent, brief, branch, prompt; do not write the ledger or prompt
+H
+      ;;
+    followup) cat <<'H'
+fleet followup <agent> "<msg>"
+Send a fix-round prompt and log it as a job. Mutating.
+--dry-run  print agent, brief, branch, prompt; do nothing
+H
+      ;;
+    up) cat <<'H'
+fleet up
+Spawn missing roster agents. Mutating.
+--dry-run  print agent list; do not spawn
+H
+      ;;
+    finish) cat <<'H'
+fleet finish <agent> [note]
+Record that the agent's current job ended. Mutating (ledger).
+--dry-run  print agent, brief, branch, prompt; do not write the ledger
+H
+      ;;
+    cancel) cat <<'H'
+fleet cancel <name>
+Cancel the agent's current turn (esc). Mutating.
+--dry-run  print agent, brief, branch, prompt; do not send keys
+H
+      ;;
+    task) cat <<'H'
+fleet task <name> "<prompt>"
+Send a prompt, wait, print the screen. Mutating.
+--dry-run  print agent, brief, branch, prompt; do nothing
+H
+      ;;
+    note) cat <<'H'
+fleet note "<text>"
+Append a lead note to the ledger. Mutating.
+--dry-run  print agent=lead, brief, branch, prompt; do not write the ledger
+H
+      ;;
+    models) cat <<'H'
+fleet models [--report]
+Show each agent's kind, state, and model. --report writes pane metadata (mutating).
+--dry-run  rejected unless --report, then print preview and write nothing
+H
+      ;;
+    keys) cat <<'H'
+fleet keys <name> <key>...
+Answer a prompt (send keys). Mutating.
+--dry-run  print agent, brief, branch, prompt; do not send keys
+H
+      ;;
+    stale) cat <<'H'
+fleet stale [--kill|--report]
+Report leftover/orphan/heavy processes. --kill sends signals; --report writes pane metadata.
+--dry-run  print agent, brief, branch, prompt; do not kill or report
+H
+      ;;
+    rules) cat <<'H'
+fleet rules
+Install pull-based fleet-peers plugin manifests for claude/codex/grok/opencode.
+--dry-run  print per-host diffs; write nothing
+H
+      ;;
+    *) sed -n '2,28p' "$0" ;;
+  esac
+}
+
+# Fail-loud dispatch: unknown agent, bean not on main, brief missing.
+# Exit 2, one line. Regression: a coder was dispatched a bean that was only staged, never committed.
+refuse_dispatch() {
+  local agent=$1 bean=$2 kind path
+  kind=$(kind_of "$agent") || exit 2
+  path=$(git -C "$FLEET_ROOT" ls-tree -r --name-only main -- .beans/ 2>/dev/null | grep -m1 -E "\.beans/${bean}--" || true)
+  if [ -z "$path" ] || ! git -C "$FLEET_ROOT" cat-file -e "main:$path" 2>/dev/null; then
+    echo "bean $bean not on main" >&2
+    exit 2
+  fi
+}
+
+require_confirm() {
+  local action=$1
+  [ "$FLEET_YES" = 1 ] && return 0
+  if [ -t 0 ]; then
+    printf '%s? [y/N] ' "$action" >&2
+    read -r ans
+    case $ans in y|Y|yes) return 0 ;; esac
+    echo "aborted" >&2
+    exit 1
+  fi
+  echo "$action requires --yes" >&2
+  exit 2
+}
+
+skills_hash_dir() {
+  (cd "$1" && find . -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}')   # shasum: sha256sum is GNU-only
+}
+
+plugin_json() {
+  local host=$1 hash=$2
+  printf '{\n  "name": "fleet-peers",\n  "version": "1.0.0",\n  "host": "%s",\n  "skills": "./skills/",\n  "skillsHash": "%s"\n}\n' "$host" "$hash"
+}
+
+host_manifest_path() {
+  printf '%s/%s/plugin.json' "$SKILLS_HOME" "$1"
+}
+
+# Package root: $SKILLS_HOME/skills/fleet-peers/SKILL.md
+# Native host layout: $SKILLS_HOME/<host>/plugin.json + sibling ./skills/
+install_skills_package() {
+  local dest=$1
+  mkdir -p "$dest"
+  cp -R "$SKILLS_SRC/." "$dest/"
+  if [ -f "$RULES" ]; then
+    mkdir -p "$dest/fleet-peers"
+    {
+      printf '%s\n' '---' 'name: fleet-peers' 'description: Fleet peer rules for herdr agents.' '---' ''
+      cat "$RULES"
+    } > "$dest/fleet-peers/SKILL.md"
+  fi
+}
+
+# Print per-host diffs of the desired package (manifest + ./skills/ tree).
+# Never mkdir dest, never write.
+preview_sync() {
+  local hash host dest dest_skills tmp pkg
+  [ -d "$SKILLS_SRC" ] || { echo "skills source missing: $SKILLS_SRC" >&2; exit 2; }
+  pkg=$(mktemp -d)
+  install_skills_package "$pkg"
+  hash=$(skills_hash_dir "$pkg")
+  for host in $HOSTS; do
+    dest=$(host_manifest_path "$host")
+    dest_skills="$(dirname "$dest")/skills"
+    tmp=$(mktemp)
+    plugin_json "$host" "$hash" > "$tmp"
+    if [ -f "$dest" ] && cmp -s "$tmp" "$dest" \
+       && [ -d "$dest_skills" ] && [ "$(skills_hash_dir "$pkg")" = "$(skills_hash_dir "$dest_skills")" ]; then
+      rm -f "$tmp"
+      continue
+    fi
+    echo "host=$host"
+    if [ -d "$(dirname "$dest")" ]; then echo "would replace $(dirname "$dest")"
+    else echo "would create $dest"; fi
+    rm -f "$tmp"
+  done
+  rm -rf "$pkg"
+}
+
+preview_skills() {
+  preview "skills" "$SKILLS_HOME" "" "install pull-based fleet-peers package for $HOSTS"
+}
+
+preview_sync_worktrees() {
+  local spec name
+  for spec in ${1:-$FLEET}; do
+    name=${spec%%:*}
+    preview "$name" "" "fleet/$name" "merge main into worktree; drop stale seeds; re-seed WIP"
+  done
+}
+
+# Pull-based install: one package root plus each host's native plugin.json
+# pointing at a real sibling ./skills/ directory. Does not splice AGENTS.md.
+# Replace each host directory wholesale so retired source files disappear.
+sync_skills() {
+  local hash host dest pkg staged
+  [ -d "$SKILLS_SRC" ] || { echo "skills source missing: $SKILLS_SRC" >&2; exit 2; }
+  pkg=$(mktemp -d)
+  install_skills_package "$pkg"
+  hash=$(skills_hash_dir "$pkg")
+  mkdir -p "$SKILLS_HOME"
+  staged=$(mktemp -d)
+  mkdir -p "$staged/skills"
+  cp -R "$pkg/." "$staged/skills/"
+  rm -rf "$SKILLS_HOME/skills"
+  mv "$staged/skills" "$SKILLS_HOME/skills"
+  rmdir "$staged" 2>/dev/null || true
+  for host in $HOSTS; do
+    dest="$SKILLS_HOME/$host"
+    staged=$(mktemp -d)
+    mkdir -p "$staged/skills"
+    cp -R "$pkg/." "$staged/skills/"
+    plugin_json "$host" "$hash" > "$staged/plugin.json"
+    rm -rf "$dest"
+    mv "$staged" "$dest"
+  done
+  rm -rf "$pkg"
+}
+
+# Fail before generating a prompt so a locked briefs dir emits one line and
+# never writes the ledger.
+ensure_brief_dir() {
+  local dest=$1 dir
+  dir=$(dirname "$dest")
+  mkdir -p "$dir" 2>/dev/null || { echo "brief file missing: $dest" >&2; exit 2; }
+  [ -w "$dir" ] || { echo "brief file missing: $dest" >&2; exit 2; }
+}
+
+# Write stdin to dest via $TMPDIR, then mv. One line on failure. No shell redirect into dest.
+write_brief() {
+  local dest=$1 tmp
+  ensure_brief_dir "$dest"
+  tmp=$(mktemp) || { echo "brief file missing: $dest" >&2; exit 2; }
+  cat > "$tmp" || { rm -f "$tmp"; echo "brief file missing: $dest" >&2; exit 2; }
+  if ! mv "$tmp" "$dest" 2>/dev/null; then
+    rm -f "$tmp"
+    echo "brief file missing: $dest" >&2
+    exit 2
+  fi
+}
+
+preview() {
+  printf 'agent=%s\nbrief=%s\nbranch=%s\nprompt=%s\n' "$1" "$2" "$3" "$4"
+}
+role_of() { printf '%s' "${1##*-}"; }
+cwd_of() { [ "$FLEET_DRY_RUN" = 1 ] && { printf '%s' "WORKTREE"; return 0; }; herdr agent get "$1" 2>/dev/null | jq -r '.result.agent.cwd // "WORKTREE"'; }
+state_of() { herdr agent get "$1" 2>/dev/null | jq -r '.result.agent.agent_status // "missing"'; }
+log() { mkdir -p "$(dirname "$LEDGER")"; printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$@" >> "$LEDGER"; }  # event agent harness role bean note
+
+agent_args() {  # kind -> native CLI args: no approval prompts (+ model pin for opencode)
+  [ "$FLEET_YOLO" = 1 ] || return 0
+  case $1 in
+    claude)   printf '%s' "--dangerously-skip-permissions${FLEET_CLAUDE_MODEL:+ --model $FLEET_CLAUDE_MODEL}" ;;
+    codex)    printf '%s' "--dangerously-bypass-approvals-and-sandbox" ;;
+    opencode) printf '%s' "--auto${FLEET_OPENCODE_MODEL:+ --model $FLEET_OPENCODE_MODEL}" ;;
+    cursor)   printf '%s' "--yolo --approve-mcps --trust" ;;
+    grok)     printf '%s' "--always-approve" ;;
+    agy)      printf '%s' "--dangerously-skip-permissions${FLEET_AGY_MODEL:+ --model $FLEET_AGY_MODEL}" ;;
+  esac
+}
+
+# Which MODEL each agent is actually running -- read from the harness's own state files,
+# never guessed. An invented label goes stale silently and reads as fact; a harness that
+# records nothing gets "?".
+model_of() {  # name kind cwd
+  local sess dir f
+  case "$2" in
+    codex)            # footer when visible, else the configured default it launched with
+      herdr agent read "$1" --source visible --lines 8 2>/dev/null | tr -d '\r' \
+        | grep -oiE 'gpt-[a-z0-9.-]+|o[0-9]-[a-z0-9.]+' | tail -1 \
+        || grep -hoE '^model *= *"[^"]+"' "$HOME/.codex/config.toml" 2>/dev/null | tail -1 | cut -d'"' -f2 || true ;;
+    opencode)         # printed in the pane's own status footer
+      herdr agent read "$1" --source visible --lines 8 2>/dev/null | tr -d '\r' \
+        | grep -oiE 'gpt-[a-z0-9.]+|o[0-9]-[a-z0-9.]+|GLM-[0-9.]+[a-z-]*|claude-[a-z0-9.-]+|qwen[0-9a-z.-]*|kimi[-a-z0-9.]*' | tail -1 || true ;;
+    claude)           # its own transcript stamps the model on every assistant message
+      dir=$HOME/.claude/projects/$(printf '%s' "$3" | sed 's/[/.]/-/g')
+      f=$(ls -t "$dir"/*.jsonl 2>/dev/null | head -1)
+      [ -n "$f" ] && grep -hoE '"model":"[^"]+"' "$f" 2>/dev/null | tail -1 | cut -d'"' -f4 || true ;;
+    grok)             # session dir = the cwd with / percent-encoded
+      sess=$(jq -r --arg c "$3" '.[] | select(.cwd == $c) | .session_id' "$HOME/.grok/active_sessions.json" 2>/dev/null | head -1)
+      [ -n "$sess" ] && grep -rhoE '"model": *"[^"]+"' "$HOME/.grok/sessions/$(printf '%s' "$3" | sed 's|/|%2F|g')/$sess" 2>/dev/null | tail -1 | cut -d'"' -f4 || true ;;
+    agy)  printf '%s' "${FLEET_AGY_MODEL:-?}" ;;   # we pass it on the command line
+  esac
+}
+cmd_models() {
+  printf '%-18s %-9s %-8s %s\n' NAME KIND STATE MODEL
+  local live; live=$(agents)
+  for spec in $FLEET; do
+    local name=${spec%%:*} kind=${spec##*:} row state cwd pane model
+    row=$(jq -c --arg n "$name" 'select(.name == $n)' <<<"$live" | head -1); [ -n "$row" ] || row='{}'
+    state=$(jq -r '.agent_status // "missing"' <<<"$row")
+    cwd=$(jq -r '.cwd // ""' <<<"$row")
+    pane=$(jq -r '.pane_id // ""' <<<"$row")
+    model=$(model_of "$name" "$kind" "$cwd" 2>/dev/null || true); [ -n "$model" ] || model='?'
+    printf '%-18s %-9s %-8s %s\n' "$name" "$kind" "$state" "$model"
+    if [ "${REPORT:-}" = 1 ] && [ -n "$pane" ]; then
+      herdr pane report-metadata "$pane" --source fleet-models --token "model=$model" >/dev/null 2>&1 || true
+    fi
+  done
+}
+cmd_status() {
+  local rc=0 live
+  live=$(agents)
+  printf '%-18s %-9s %-8s %-7s %-24s %s\n' NAME KIND STATE PANE CWD TITLE
+  for spec in $FLEET; do
+    local name=${spec%%:*} kind=${spec##*:} row
+    row=$(jq -c --arg n "$name" 'select(.name == $n)' <<<"$live")
+    if [ -z "$row" ]; then
+      printf '%-18s %-9s %-8s %-7s %-24s %s\n' "$name" "$kind" MISSING - - "(run: fleet up)"; rc=1; continue
+    fi
+    jq -r '[.name, .agent, .agent_status, .pane_id, (.cwd|split("/")|last), (.terminal_title_stripped[:60])] | @tsv' <<<"$row" \
+      | awk -F'\t' '{printf "%-18s %-9s %-8s %-7s %-24s %s\n",$1,$2,$3,$4,$5,$6}'
+    [ "$(jq -r .agent_status <<<"$row")" = unknown ] && rc=1
+  done
+  jq -r --arg roster " $FLEET " 'select((.name // "") as $n | ($n == "" or ($roster | contains(" " + $n + ":") | not)))
+      | [(.name // "-"), .agent, .agent_status, .pane_id, (.cwd|split("/")|last), "(not on roster)"] | @tsv' <<<"$live" \
+      | awk -F'\t' '{printf "%-18s %-9s %-8s %-7s %-24s %s\n",$1,$2,$3,$4,$5,$6}'
+  herdr integration status --outdated-only 2>/dev/null | sed 's/^/integration outdated: /' || true
+  return $rc
+}
+
+# ---- shared-tree mode: one workspace, a tab per agent -------------------------------------------
+fleet_workspace() {
+  local id; id=$(ws_by_label "$FLEET_WS")
+  if [ -z "$id" ]; then
+    local out; out=$(herdr workspace create --cwd "$FLEET_ROOT" --label "$FLEET_WS" --no-focus)
+    id=$(jq -r .result.workspace.workspace_id <<<"$out")
+    herdr tab rename "$(jq -r .result.tab.tab_id <<<"$out")" shell >/dev/null
+  fi
+  printf '%s' "$id"
+}
+tab_pane() {
+  local tid
+  tid=$(herdr tab list --workspace "$1" | jq -r --arg l "$2" '.result.tabs[] | select(.label == $l) | .tab_id' | head -1)
+  [ -n "$tid" ] || return 0
+  herdr pane list --workspace "$1" | jq -r --arg t "$tid" '[.result.panes[] | select(.tab_id == $t)][0].pane_id // empty'
+}
+
+# ---- worktree mode: a workspace + git worktree per agent ----------------------------------------
+seed_wip() {  # <checkout> — copy the source tree's uncommitted changes so the worktree builds like main does
+  local wt=$1 patch n; patch=$(mktemp)
+  git -C "$FLEET_ROOT" diff HEAD --binary > "$patch"
+  if [ -s "$patch" ]; then git -C "$wt" apply "$patch" 2>/dev/null || echo "warn: WIP patch did not apply cleanly in $wt" >&2; fi
+  rm -f "$patch"
+  n=$(git -C "$FLEET_ROOT" ls-files --others --exclude-standard | wc -l | tr -d ' ')
+  if [ "$n" -gt 500 ]; then echo "warn: $n untracked files in $FLEET_ROOT — not copying them" >&2; return 0; fi
+  git -C "$FLEET_ROOT" ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do
+    mkdir -p "$wt/$(dirname "$f")"; cp -R "$FLEET_ROOT/$f" "$wt/$f"; done
+}
+bootstrap_worktree() {  # <checkout> — make a fresh checkout runnable without npm install
+  local wt=$1 d f
+  # Refuse anything that is not a git work tree. A seat whose pane cwd is ~ makes the
+  # caller's `git rev-parse --show-toplevel` fail -> "", and bootstrapping "" copies
+  # node_modules, .env (secrets) and WIP into "/" (2026-09-18: only macOS's read-only
+  # system volume stopped it). Fail closed for every caller, not just worktree_pane.
+  if [ -z "$wt" ] || [ "$wt" = "/" ] || ! git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "skip bootstrap: '${wt:-<empty>}' is not a git checkout" >&2
+    return 0
+  fi
+  local mark; mark="$(git -C "$wt" rev-parse --absolute-git-dir)/drover-bootstrapped"   # inside .git: never committed
+  [ -f "$mark" ] && return 0
+  echo "bootstrapping $wt (APFS clone of dependency dirs, local files, local skills, WIP)" >&2
+  # DROVER_CLONE_DIRS: dependency trees copied from the main checkout so a fresh worktree builds without
+  # an install. cp -c = APFS clonefile: seconds, no extra disk. DROVER_COPY_FILES: untracked files the
+  # build needs (e.g. .env) — they stay on this machine, inside the seat's own worktree.
+  # shellcheck disable=SC2086
+  for d in ${DROVER_CLONE_DIRS:-node_modules}; do
+    [ -d "$FLEET_ROOT/$d" ] && [ ! -e "$wt/$d" ] && cp -Rc "$FLEET_ROOT/$d" "$wt/$d"
+  done
+  # shellcheck disable=SC2086
+  for f in ${DROVER_COPY_FILES:-.env}; do
+    [ -f "$FLEET_ROOT/$f" ] && { mkdir -p "$wt/$(dirname "$f")"; cp "$FLEET_ROOT/$f" "$wt/$f"; }
+  done
+  (cd "$FLEET_ROOT" && git ls-files --others --ignored --exclude-standard --directory | grep -E '^\.(claude|agents|cursor)/skills/' || true) \
+    | while read -r f; do [ -e "$wt/$f" ] || { mkdir -p "$wt/$(dirname "$f")"; cp -R "$FLEET_ROOT/$f" "$wt/$f"; }; done
+  [ "$FLEET_SEED_WIP" = 1 ] && seed_wip "$wt"
+  [ -z "${FLEET_BOOTSTRAP:-}" ] || (cd "$wt" && bash -c "$FLEET_BOOTSTRAP")
+  : > "$mark"
+  return 0
+}
+worktree_pane() {  # <name> -> root pane of the agent's own workspace (reused if present, else opened/created)
+  local name=$1 ws; ws=$(ws_by_label "$name")
+  if [ -z "$ws" ]; then
+    local out
+    out=$(herdr worktree open --cwd "$FLEET_ROOT" --branch "fleet/$name" --label "$name" --no-focus 2>/dev/null) \
+      || out=$(herdr worktree create --cwd "$FLEET_ROOT" --branch "fleet/$name" --label "$name" --no-focus)
+    ws=$(jq -r .result.workspace.workspace_id <<<"$out")
+  fi
+  local p; p=$(herdr pane list --workspace "$ws" | jq -c '.result.panes[0] | {pane_id, cwd}')
+  bootstrap_worktree "$(git -C "$(jq -r .cwd <<<"$p")" rev-parse --show-toplevel)"
+  jq -r .pane_id <<<"$p"
+}
+
+start_agent() {  # name kind pane — a fresh shell needs a moment before it is "available"
+  local err args; err=$(mktemp); args=$(agent_args "$2")
+  for _ in $(seq 1 30); do
+    # shellcheck disable=SC2086
+    if herdr agent start "$1" --kind "$2" --pane "$3" --timeout 120000 ${args:+-- $args} >/dev/null 2>"$err"; then rm -f "$err"; return 0; fi
+    local code; code=$(jq -r '.error.code // "error"' "$err" 2>/dev/null || echo error)
+    [ "$code" = agent_pane_busy ] || { rm -f "$err"; echo "$code"; return 1; }
+    sleep 1
+  done
+  rm -f "$err"; echo agent_pane_busy; return 1
+}
+
+cmd_up() {
+  local live ws=""
+  live=$(agents)
+  for spec in $FLEET; do
+    local name=${spec%%:*} kind=${spec##*:}
+    if jq -e --arg n "$name" 'select(.name == $n)' <<<"$live" >/dev/null; then echo "$name: already running"; continue; fi
+    if [ "$FLEET_ADOPT" = 1 ]; then
+      local orphan; orphan=$(jq -r --arg k "$kind" '[select(.agent == $k and (.name // "") == "")][0].pane_id // empty' <<<"$live" | head -1)
+      if [ -n "$orphan" ]; then herdr agent rename "$orphan" "$name" >/dev/null && echo "$name: adopted $orphan"; live=$(agents); continue; fi
+    fi
+    local pane
+    if [ "$FLEET_WORKTREES" = 1 ]; then
+      pane=$(worktree_pane "$name")
+    else
+      [ -n "$ws" ] || ws=$(fleet_workspace)
+      pane=$(tab_pane "$ws" "$name")
+      [ -n "$pane" ] || pane=$(herdr tab create --workspace "$ws" --cwd "$FLEET_ROOT" --label "$name" --no-focus | jq -r .result.root_pane.pane_id)
+    fi
+    printf '%s: starting %s in %s ... ' "$name" "$kind" "$pane"
+    local code
+    if code=$(start_agent "$name" "$kind" "$pane"); then echo ok; else echo "FAILED ($code) — check: fleet read $name"; fi
+  done
+}
+
+cmd_rm() {
+  local name=$1 ws
+  require_confirm "rm $name"
+  ws=$(ws_by_label "$name")
+  [ -n "$ws" ] || { echo "no workspace labeled $name"; return 1; }
+  if [ "$(herdr worktree list --workspace "$ws" 2>/dev/null | jq -r '[.result.worktrees[] | select(.open_workspace_id == "'"$ws"'" and .is_linked_worktree)] | length')" != 0 ]; then
+    herdr worktree remove --workspace "$ws" ${FLEET_FORCE:+--force} | jq -r '.result.type'
+    echo "branch fleet/$name kept — delete with: git -C $FLEET_ROOT branch -D fleet/$name"
+  else
+    herdr workspace close "$ws" | jq -r '.result.type'
+  fi
+}
+
+# ---- lead workflow: assign / review / usage -----------------------------------------------------
+count_events() { [ -f "$LEDGER" ] && awk -F'\t' -v e="$1" -v a="$2" '$2==e && $3==a' "$LEDGER" | wc -l | tr -d ' ' || echo 0; }
+pick_least() {  # <role> <event> [exclude-kind] -> least-loaded idle agent of that role (fallback: least-loaded)
+  local role=$1 ev=$2 xk=${3:-} best="" bestn=999999 fallback="" fbn=999999 spec name kind n st
+  for spec in $FLEET; do
+    name=${spec%%:*}; kind=${spec##*:}
+    [ "$(role_of "$name")" = "$role" ] || continue; [ "$kind" != "$xk" ] || continue
+    n=$(count_events "$ev" "$name"); st=$(state_of "$name")
+    has_open_job "$name" && continue   # already holds an unfinished assignment/review
+    [ "$n" -lt "$fbn" ] && { fallback=$name; fbn=$n; }
+    case $st in idle|done) [ "$n" -lt "$bestn" ] && { best=$name; bestn=$n; } ;; esac
+  done
+  printf '%s' "${best:-$fallback}"
+}
+has_open_job() { [ -f "$LEDGER" ] && awk -F'\t' -v a="$1" '$3==a && ($2=="assign"||$2=="review") {o=1} $3==a && $2=="finish" {o=0} END{exit !o}' "$LEDGER"; }
+last_bean() { [ -f "$LEDGER" ] && awk -F'\t' -v a="$1" '$2=="assign" && $3==a {b=$6} END{print b}' "$LEDGER" || true; }
+
+VOICE='Voice: blunt, like a senior engineer in a code review. Verdict first, evidence second. No hedging ("maybe", "possibly", "it seems", "I think"): state an unknown as a fact ("not verified: X"). No praise, no apology, no filler, no restating the task back, no announcing what you are about to do. "No" is a full answer -- if the bean, the scope or the fix is wrong, say so in one line and say what is right. Numbers and file:line, not adjectives. Blunt about the work, never about the person.'
+# A cited bean that is not on main is invisible to the agent receiving it: its worktree
+# may be dozens of commits behind, and `beans show` reports "not found" identically for
+# "never created" and "not merged here". Resolve against the shared ref at dispatch time.
+check_beans() {
+  local text=$1 ids id missing=""
+  # grep exits 1 on no match; under set -e that must not kill send/followup.
+  ids=$(printf '%s' "$text" | grep -oE "$DROVER_BEAN_RE" | sort -u || true)
+  [ -n "$ids" ] || return 0
+  local onmain; onmain=$(git -C "$FLEET_ROOT" ls-tree -r --name-only main -- .beans/ 2>/dev/null || true)
+  for id in $ids; do
+    case "$onmain" in *"/$id--"*) ;; *) missing="$missing $id" ;; esac   # no pipe: `printf | grep -q` dies of SIGPIPE under pipefail
+  done
+  [ -n "$missing" ] && { echo "bean$missing not on main" >&2; exit 2; }
+  return 0
+}
+
+coder_prompt() {  # name kind bean scope
+  cat <<P
+You are $1, the $2 CODER on a fleet team. Team lead = \`lead\` (a Claude session); the human is not watching you. Your job: bean $3.
+Work ONLY in this worktree ($(cwd_of "$1")). Your branch for THIS bean is \`fleet/$1-$3\` — one branch per BEAN, forked from current main. The lead puts you on it before you start; run \`git branch --show-current\` and confirm it before step 0. Steps:
+0. START ON CURRENT MAIN. \`git fetch origin; git merge main --no-edit\` — merge LOCAL \`main\`, not \`origin/main\`. origin can be stale when a landing has not been pushed (measured 2026-09-06: origin/main was 7 commits behind local main, and four agents truthfully reported REBASED against the wrong target). Measured 2026-09-06: 20 of 20 fleet branches contained none of main, several 400+ commits behind. A stale branch reviews code that will never ship as reviewed, and its merge DELETES work that landed after it diverged — one branch would have removed 652 lines including 399 of a test file. If the merge conflicts, resolve it now, not at landing time.
+1. \`beans show $3\` — read it fully. Follow the repository's own agent rules (CLAUDE.md / AGENTS.md or equivalent). If a pm or architect has written requirements for this bean, they are in $REPORTS — build to those, and say so if you disagree rather than quietly building something else.
+1b. BEFORE creating any new module, check whether it already exists. Two coders independently wrote the same new module for the same bean, with incompatible APIs, and only one could land. \`grep\` for the concept first.
+2. Implement the bean's unchecked items.${4:+ Scope from lead: $4}
+3. Verify, and keep the output — you will paste it. Run ${DROVER_BUILD:-the project build} and the tests you added or affected${DROVER_TEST:+ ($DROVER_TEST)}. A build that did not finish is not a passing build; wait for it. Grep compiler output for the real error shape (TypeScript errors start with a file path, not with the word error).
+3b. PROVE THE FIX FIRES. Revert your change, watch your new test fail, restore it, watch it pass. A test you have never seen fail is not a test. This is what caught a fail-open gate in the lead's own commit this week.
+4. This worktree may start with the human's pre-existing UNCOMMITTED changes, seeded so it builds like the main checkout. Do not review, modify, revert or commit them. Commit ONLY files you changed plus the bean file: \`git add <your files> .beans/<bean file>\` then \`git commit -m "<conventional message>"\` on branch fleet/$1-$3. You MAY \`git fetch\` and \`git merge main\` (step 0 requires it). Never git checkout/reset/stash the human's files, never commit to main, never push, never apply DB migrations, never start the dev server.
+5. Keep the bean checklist current with \`beans update $3 --body-replace-old '- [ ] ...' --body-replace-new '- [x] ...'\`.
+6. When done, write $REPORTS/$1-$3.md: summary, files changed, decisions, open questions, and the PASTED output of the build and the tests. A command you did not run cannot appear there.
+6b. THEN ANNOUNCE IT. Run exactly:
+      fleet-done $1 $3 DONE \"<one line: what changed and whether it is landable>\" $REPORTS/$1-$3.md
+    Use BLOCKED instead of DONE if you cannot proceed, or CHANGES if you are handing back a fix round. This is how the lead learns you finished — it does not watch your pane and it does not trust the status field, which reports \`done\` while an agent is still mid-turn. If you skip this, your work sits unnoticed.
+    End the report with exactly these three lines:
+REBASED: YES | NO — output of \`git merge-base --is-ancestor main HEAD && echo YES\` (local main, not origin/main)
+VERIFIED: BUILD <exit> TESTS <passed>/<total> — and the revert-test-restore result from 3b
+DONE $REPORTS/$1-$3.md
+REBASED: NO means the work is not finished. Go back to step 0 — do not hand a stale branch to a reviewer.
+Then reply with exactly one line: DONE $REPORTS/$1-$3.md
+If you cannot proceed without a human decision, write the question to the same file and reply with exactly: BLOCKED $REPORTS/$1-$3.md
+Do not message other agents; lead coordinates.
+$VOICE
+P
+}
+# followup/send are logged as assign events too; their note is a prompt, not the lead's scope
+last_scope() { [ -f "$LEDGER" ] && awk -F'\t' -v a="$1" '$2=="assign" && $3==a && $7 !~ /^(followup|send): / {n=$7} END{print n}' "$LEDGER" || true; }
+reviewer_prompt() {  # name kind coder bean
+  local scope; scope=$(last_scope "$3")
+  cat <<P
+You are $1, the $2 REVIEWER on a fleet team (lead = \`lead\`). Review bean $4, implemented by $3 on branch \`fleet/$3-$4\` (one branch per bean). If that ref does not exist, this bean predates the change and the branch is \`fleet/$3\` — resolve it FIRST with \`git rev-parse --verify fleet/$3-$4 || echo use fleet/$3\` and use whichever exists. You are reviewing a DIFFERENT model's work: be rigorous, concrete and unsentimental; findings must be actionable.${scope:+
+Lead scope given to the coder (judge against THIS, not the raw bean text): $scope}
+"main moved while you reviewed" is NEVER a blocker. Main advances during every review here; staleness is the
+lead's to resolve and the lead re-verifies against current main before every merge. Say LANDABLE: YES when the
+work is sound and name the base you tested. Raise a blocker only for a defect in the work, a conflict you
+actually hit while cherry-picking the NAMED commits onto a detached main, or a proof that is missing.
+Work ONLY in this worktree ($(cwd_of "$1")). Steps:
+1. \`beans show $4\` (requirements) and \`cat $REPORTS/$3-$4.md\` (the coder's report).
+2. With BR set to the branch you resolved above: \`git diff main...\$BR --stat\` then \`git diff main...\$BR\`. Judge against the bean's checklist and the repository's own agent rules (CLAUDE.md / AGENTS.md or equivalent).
+3. To build/test their code: \`git checkout --detach \$BR\` in THIS worktree (if git refuses because of local changes: \`git stash -u\` first (INCLUDE untracked — the pre-seeded WIP has tracked and untracked parts that only compile together; this worktree is yours alone) and \`git stash pop\` after returning with \`git checkout fleet/$1\`). Run ${DROVER_BUILD:-the project build} and the relevant tests${DROVER_TEST:+ ($DROVER_TEST)}.
+4. Write $REPORTS/$1-review-$4-by-$3.md: findings as CRITICAL/HIGH/MEDIUM/LOW, each with file:line, why it is wrong and the concrete fix; what you verified (commands + results, PASTED — a command you did not run cannot appear here); unchecked bean items the coder missed. End with exactly these three lines:
+BEAN: MET | UNMET — <checklist items not met, or "all">
+LANDABLE: YES | NO — <blocker: build|tests|rebase|schema|none>
+VERDICT: APPROVE | APPROVE-WITH-FOLLOWUP <new-bean-id> | CHANGES
+APPROVE = BEAN MET and LANDABLE YES and the build + related-tests output is pasted in the report.
+APPROVE-WITH-FOLLOWUP = BEAN MET, LANDABLE YES, and every remaining finding is MEDIUM or LOW, touches no bean checklist item, and is filed as the named bean. A HIGH or CRITICAL can NEVER be a follow-up.
+CHANGES = anything else. If LANDABLE is NO for a reason that is not the coder's code (rebase, catalog drift, harness timeout), say so on the LANDABLE line so the lead routes a rebase rather than a fix.
+Never assert a negative — \"no work exists\", \"this was fabricated\", \"nothing populates this\" — without pasting the command that proves it. If you cannot run it, write \"I could not verify\".
+5. THEN ANNOUNCE IT. Run exactly:
+      fleet-done $1 $4 CHANGES \"<one line: the verdict and the single most important finding>\" $REPORTS/$1-review-$4-by-$3.md
+   (use DONE in place of CHANGES when the verdict is APPROVE). The lead waits on this rather than polling your pane.
+6. Reply with exactly one line: REVIEWED $REPORTS/$1-review-$4-by-$3.md
+Do not modify code, do not commit, do not message other agents.
+$VOICE
+P
+}
+cmd_assign() {
+  local bean=$1 coder=${2:-} scope=${3:-} kind bf prev pb pbf pst
+  [ -n "$coder" ] || coder=$(pick_least coder assign)
+  refuse_dispatch "$coder" "$bean"
+  # Orphaned-review guard. Reassigning a seat that just reported on a DIFFERENT bean silently
+  # strands that work: the report exists, the bean is still open, and no reviewer was ever
+  # routed. Measured 2026-09-08 — a finished bean sat landable and unreviewed for an hour
+  # because I freed the seat before its review was routed.
+  # ONLY the newest report. Checking every historical one over-flags badly: the pm seat alone had
+  # six old reports on still-open beans, and a warning that fires every time is a warning nobody
+  # reads. The case this guards is narrow — the seat just finished X and is being handed Y.
+  for prev in $(ls -1t "$REPORTS/$coder-$DROVER_BEAN_PREFIX"*.md 2>/dev/null | head -1); do
+    [ -f "$prev" ] || continue
+    pb=$(basename "$prev" .md); pb=${pb#"$coder"-}
+    [ "$pb" = "$bean" ] && continue
+    # and only if it is recent enough to be this seat's last job, not archaeology
+    [ -n "$(find "$prev" -mmin -180 2>/dev/null)" ] || continue
+    pbf=$(cd "$FLEET_ROOT" 2>/dev/null && git ls-files .beans 2>/dev/null | grep -m1 "^.beans/$pb--") || true
+    [ -n "$pbf" ] || continue
+    pst=$(cd "$FLEET_ROOT" 2>/dev/null && git show "main:$pbf" 2>/dev/null | awk '/^status:/{print $2; exit}')
+    case "$pst" in todo|in-progress) ;; *) continue ;; esac
+    ls "$REPORTS"/*"-review-$pb-by-$coder.md" >/dev/null 2>&1 && continue
+    echo "WARNING: $coder has an UNREVIEWED report for $pb (still '$pst'). Route it before reusing the seat:" >&2
+    echo "         fleet review $coder <reviewer> $pb" >&2
+  done
+  kind=$(kind_of "$coder") || exit 2
+  # ONE BRANCH PER BEAN, forked from current main. This is the root cause of the landing
+  # conflicts, measured 2026-09-08: each agent had ONE long-lived branch accumulating every
+  # bean it ever touched — fleet/grok-coder 100 commits / 20 beans, fleet/codex-coder 163 / 16,
+  # fleet/claude-coder 71 / 18. So a tip could never be landed (it carried 15 other beans'
+  # unapproved work) and the named commits inside would not cherry-pick either, because
+  # repeatedly merging main in had rewritten their context. Three of three approved beans
+  # needed a rebase round today. Forking per bean makes the named set apply by construction.
+  # SAFETY: only switch a CLEAN tree. Never destroy uncommitted work to tidy a branch — that
+  # is exactly how ~87 unstaged edits were lost this morning.
+  local wt bbranch cur
+  wt=$(cwd_of "$coder"); bbranch="fleet/$coder-$bean"
+  if [ -d "$wt" ]; then
+    cur=$(git -C "$wt" branch --show-current 2>/dev/null)
+    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null | grep -v '^??' || true)" ]; then
+      echo "NOTE: $coder's worktree has uncommitted tracked changes — staying on '$cur'. Not switching to $bbranch; a branch switch must never discard work." >&2
+    elif [ "$cur" != "$bbranch" ]; then
+      git -C "$wt" fetch origin main --quiet 2>/dev/null || true
+      if git -C "$wt" checkout -B "$bbranch" origin/main --quiet 2>/dev/null; then
+        echo "branch: $coder -> $bbranch (forked from origin/main)" >&2
+      else
+        echo "NOTE: could not put $coder on $bbranch; it stays on '$cur'" >&2
+      fi
+    fi
+  fi
+  bf="$BRIEFS/assign-$coder-$bean.txt"
+  mkdir -p "$REPORTS"
+  ensure_brief_dir "$bf"
+  coder_prompt "$coder" "$kind" "$bean" "$scope" | write_brief "$bf"
+  log assign "$coder" "$kind" coder "$bean" "$scope"
+  # --wait is what makes the prompt actually land. Without it the dispatch
+  # returns before the agent has taken the message and the turn is silently
+  # dropped; measured 2026-09-07, six of six parallel dispatches lost.
+  # Dispatch SERIALLY for the same reason — parallel `&` loses prompts.
+  herdr agent prompt "$coder" "New bean: read $bf and follow it exactly. It assigns you $bean. Merge main first: git merge main --no-edit" --wait --until working --until done --until blocked --timeout 100000 | jq -r --arg b "$bean" '"\(.result.agent.name) <- \($b): \(.result.agent.agent_status)"'
+  # The lead's manual `fleet assign` wrote ONLY the ledger, while the watcher's
+  # auto-dispatch writes the ledger AND the task file. fleet-track and the
+  # reaper both read the TASK FILE, so a hand-assigned seat looked stale to
+  # them — which is how a bean gets dispatched to a second agent. Both dispatch
+  # paths must leave identical state. Measured 2026-09-08: a coder was hand-assigned
+  # one bean and fleet-track still reported the bean it had finished 4h earlier.
+  "$DROVER_BIN/fleet-track" dispatch "$coder" "$bean" >/dev/null 2>&1
+}
+cmd_review() {
+  # usage: fleet review <coder> [reviewer] [bean]  — bean overrides the ledger's last assign (REVIEW_BEAN_OVERRIDE)
+  local coder=$1 rev=${2:-} bean=${3:-} ck kind bf
+  ck=$(kind_of "$coder") || exit 2
+  [ -n "$bean" ] || bean=$(last_bean "$coder"); [ -n "$bean" ] || { echo "no bean assigned to $coder in the ledger"; return 1; }
+  # Refuse a SECOND reviewer on a bean already under review. fleet-watch has this guard;
+  # the lead's manual path did not, which is the same asymmetry that let `fleet assign`
+  # double-dispatch a bean this morning. Measured 2026-09-08: the watcher routed one bean
+  # to codex-reviewer and I routed it to agy-reviewer seconds later, burning one of only
+  # four live reviewer seats while thirteen were out of credits.
+  # Override with FLEET_SECOND_OPINION=1 when a second opinion is the actual intent.
+  if [ "${FLEET_SECOND_OPINION:-0}" != "1" ]; then
+    local holder tdir
+    local tdir="$FLEET_TASKS"
+    # `|| true`: grep exits 1 on no-match and 2 when a glob matched no file, and under
+    # `set -e` either one kills the function BEFORE it can print — the guard then fails
+    # silently, which is worse than not having it. Third grep-exit-status trap today.
+    holder=$(grep -l -- "	$bean	" "$tdir"/*reviewer* "$tdir"/*analyst* "$tdir"/*architect* 2>/dev/null | head -1 || true)
+    if [ -n "$holder" ]; then
+      holder=$(basename "$holder")
+      [ "$holder" = "${rev:-}" ] || {
+        echo "REFUSED: $bean is already under review by $holder. Re-routing would burn a second reviewer seat." >&2
+        echo "         Set FLEET_SECOND_OPINION=1 if a second opinion is genuinely what you want." >&2
+        return 1
+      }
+    fi
+  fi
+  [ -n "$rev" ] || rev=$(pick_least reviewer review "$ck")
+  refuse_dispatch "$rev" "$bean"
+  kind=$(kind_of "$rev") || exit 2
+  [ "$kind" != "$ck" ] || { echo "refusing: $rev runs the same harness ($ck) as $coder"; return 1; }
+  bf="$BRIEFS/review-$rev-$bean.txt"
+  ensure_brief_dir "$bf"
+  reviewer_prompt "$rev" "$kind" "$coder" "$bean" | write_brief "$bf"
+  log review "$rev" "$kind" reviewer "$bean" "coder=$coder"
+  # Long multi-line prompts silently fail to reach an agent; short ones land.
+  # Write the brief to a file and send a one-line pointer. Measured 2026-09-06:
+  # three of four review dispatches were lost this way before the change.
+  herdr agent prompt "$rev" "Review task: read $bf and follow it exactly. It reviews $bean on branch fleet/$coder-$bean (fall back to fleet/$coder if that ref does not exist)." | jq -r --arg b "$bean" --arg c "$coder" '"\(.result.agent.name) <- review \($b) (by \($c)): \(.result.agent.agent_status)"'
+}
+cmd_finish() {
+  local kind
+  kind=$(kind_of "$1") || exit 2
+  log finish "$1" "$kind" "$(role_of "$1")" "$(last_bean "$1")" "${2:-}"
+  echo "recorded finish for $1"
+}
+cmd_usage() {
+  local livef; livef=$(mktemp); agents > "$livef"
+  python3 -W ignore - "$LEDGER" "$FLEET" "$livef" <<'PY'
+import sys,json,datetime as dt,collections
+ledger,roster,livef=sys.argv[1],sys.argv[2].split(),sys.argv[3]
+state={a.get('name'):a['agent_status'] for a in map(json.loads,filter(None,open(livef).read().splitlines()))}
+kind={s.split(':')[0]:s.split(':')[1] for s in roster}
+rows=[]
+try: rows=[l.rstrip('\n').split('\t') for l in open(ledger) if l.strip()]
+except FileNotFoundError: pass
+P=lambda t: dt.datetime.strptime(t,'%Y-%m-%dT%H:%M:%SZ')
+now=dt.datetime.utcnow()
+per=collections.defaultdict(lambda: dict(assign=0,review=0,busy=0.0,open=[]))
+opened={}
+for ts,ev,agent,h,role,bean,note in rows:
+    if ev in ('assign','review'):
+        per[h][ev]+=1; opened[agent]=(P(ts),bean)
+    elif ev=='finish' and agent in opened:
+        t0,b=opened.pop(agent); per[h]['busy']+=(P(ts)-t0).total_seconds()/60
+for agent,(t0,b) in opened.items():
+    h=kind.get(agent,'?'); per[h]['busy']+=(now-t0).total_seconds()/60; per[h]['open'].append(f"{agent}:{b}")
+print(f"{'HARNESS':9} {'CODING':>6} {'REVIEWS':>7} {'BUSY_MIN':>8}  OPEN JOBS | LIVE STATES")
+for h in ['claude','codex','cursor','opencode','grok','agy']:
+    d=per[h]; st=' '.join(f"{n}={state.get(n,'missing')}" for n in kind if kind[n]==h)
+    print(f"{h:9} {d['assign']:6} {d['review']:7} {d['busy']:8.0f}  {' '.join(d['open']) or '-'} | {st}")
+PY
+  rm -f "$livef"
+}
+cmd_rules() {
+  sync_skills
+  echo "installed pull-based manifests under $SKILLS_HOME/{claude,codex,grok,opencode}/plugin.json"
+}
+
+cmd_land() {  # <coder> — merge fleet/<coder> into main even though main's index carries the user's staged WIP
+  local br="fleet/$1" tmp
+  require_confirm "land $1"
+  tmp=$(mktemp)
+  git -C "$FLEET_ROOT" diff --cached --name-only > "$tmp.paths"
+  while read -r f; do git -C "$FLEET_ROOT" ls-files -s -- "$f"; done < "$tmp.paths" > "$tmp"   # mode sha stage path
+  [ -s "$tmp.paths" ] && git -C "$FLEET_ROOT" reset -q -- $(cat "$tmp.paths")
+  if git -C "$FLEET_ROOT" merge --no-ff -q "$br" -m "merge: $br — $(git -C "$FLEET_ROOT" log -1 --format=%s "$br" | cut -c1-70)
+
+Reviewed cross-harness by the fleet; lead-verified." 2>"$tmp.err"; then echo "merged: $(git -C "$FLEET_ROOT" log -1 --format=%h)"; else echo "MERGE FAILED:"; head -5 "$tmp.err"; git -C "$FLEET_ROOT" merge --abort 2>/dev/null; fi
+  while read -r mode sha stage path; do git -C "$FLEET_ROOT" update-index --add --cacheinfo "$mode,$sha,$path"; done < "$tmp"   # exact staged blobs back
+  echo "staged entries restored: $(git -C "$FLEET_ROOT" diff --cached --name-only | wc -l | tr -d ' ')"; rm -f "$tmp" "$tmp.paths" "$tmp.err"
+}
+
+sync_worktree() {  # <name> — bring an idle agent's worktree up to main without touching the user's tree
+  local wt; wt=$(herdr agent get "$1" | jq -r '.result.agent.cwd'); wt=$(git -C "$wt" rev-parse --show-toplevel)
+  local st; st=$(state_of "$1"); case $st in idle|done) ;; *) echo "$1: skipped (state=$st)"; return 0;; esac
+  local base; base=$(git -C "$wt" merge-base HEAD main)
+  # 1) seeded copies of files that main has since changed: drop the local copy (main's version supersedes the seed)
+  comm -12 <(git -C "$wt" diff --name-only | sort) <(git -C "$FLEET_ROOT" diff --name-only "$base" main | sort) \
+    | while read -r f; do git -C "$wt" checkout -q -- "$f"; done
+  # 2) seeded untracked files that main now tracks
+  comm -12 <(git -C "$wt" ls-files --others --exclude-standard | sort) <(git -C "$FLEET_ROOT" ls-tree -r --name-only main | sort) \
+    | while read -r f; do rm -f "$wt/$f"; done
+  # 3) merge
+  local err; err=$(mktemp)
+  if git -C "$wt" merge -q --no-edit main 2>"$err"; then rm -f "$err"; else echo "$1: MERGE FAILED"; head -3 "$err"; rm -f "$err"; git -C "$wt" merge --abort 2>/dev/null; return 1; fi
+  # 4) re-seed the user's current uncommitted WIP for paths not already dirty here
+  [ "$FLEET_SEED_WIP" = 1 ] && { local patch inc; patch=$(mktemp); git -C "$FLEET_ROOT" diff HEAD --binary > "$patch"
+    inc=$(comm -23 <(git -C "$FLEET_ROOT" diff --name-only HEAD | sort) <(git -C "$wt" status --short | awk '{print $2}' | sort) | sed 's/^/--include=/' | tr '\n' ' ')
+    [ -n "$inc" ] && git -C "$wt" apply $inc "$patch" 2>/dev/null || true; rm -f "$patch"
+    # refresh STALE seeds: a seeded file the human has since edited in main (the agent is idle, so its own work is committed)
+    git -C "$FLEET_ROOT" diff --name-only HEAD | while read -r f; do [ -f "$FLEET_ROOT/$f" ] && [ -f "$wt/$f" ] && ! cmp -s "$FLEET_ROOT/$f" "$wt/$f" && { cp "$FLEET_ROOT/$f" "$wt/$f"; echo "  refreshed stale seed: $f" >&2; }; done
+    git -C "$FLEET_ROOT" ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do [ -e "$wt/$f" ] || { mkdir -p "$wt/$(dirname "$f")"; cp -R "$FLEET_ROOT/$f" "$wt/$f"; }; done; }
+  echo "$1: $(git -C "$wt" log -1 --format=%h) (main=$(git -C "$FLEET_ROOT" log -1 --format=%h)) dirty=$(git -C "$wt" status --short | grep -vc '^??') untracked=$(git -C "$wt" status --short | grep -c '^??')"
+}
+cmd_sync() {
+  sync_skills
+  [ "$FLEET_SKILLS_ONLY" = 1 ] && return 0
+  local spec; for spec in ${1:-$FLEET}; do sync_worktree "${spec%%:*}"; done
+}
+
+cmd_task() {
+  local name=$1 prompt=$2 out rc=0
+  kind_of "$name" >/dev/null || exit 2
+  check_beans "$prompt"
+  out=$(herdr agent prompt "$name" "$prompt" --wait --timeout "$FLEET_TIMEOUT" 2>&1) || rc=$?
+  echo "== $name -> $(jq -r '.result.agent.agent_status // .error.code // "?"' <<<"$out" 2>/dev/null || echo "?")"
+  herdr agent read "$name" --source visible --lines "${FLEET_TAIL:-40}"
+  return $rc
+}
+
+cmd_stale() {
+  # Processes the agents leave behind. A pane's live processes are the descendants of its shell
+  # (herdr pane process-info). ORPHAN: agent tooling reparented to launchd (ppid 1), its pane is
+  # gone. LEFTOVER: a dev/test process still running under a pane whose agent is idle/done/blocked,
+  # older than FLEET_STALE_MIN. HEAVY: anything under a pane above FLEET_HEAVY_MB (report only).
+  # 2026-09-02: 168 node procs (47 GB) + 16 tessl MCP servers (2 GB each) put a 128 GB box at
+  # 183 MB free every day for a week; the kernel watchdog eventually panicked it.
+  local mode=${1:-} shells="" ps_out live
+  live=$(herdr agent list 2>/dev/null) || { echo "herdr not running" >&2; return 1; }
+  while IFS=$'\t' read -r pane name state; do
+    local sp; sp=$(herdr pane process-info --pane "$pane" 2>/dev/null | jq -r '.result.process_info.shell_pid // empty' || true)
+    shells+="$pane"$'\t'"$name"$'\t'"$state"$'\t'"$sp"$'\n'
+  done < <(jq -r '.result.agents[] | [.pane_id, (.name // .pane_id), .agent_status] | @tsv' <<<"$live")
+  ps_out=$(mktemp); ps -axo pid=,ppid=,etime=,rss=,args= > "$ps_out"
+  STALE_MIN=${FLEET_STALE_MIN:-10} HEAVY_MB=${FLEET_HEAVY_MB:-2048} MODE=$mode SHELLS=$shells python3 - "$ps_out" <<'PY'
+import os, re, sys, signal, subprocess, collections
+STALE_MIN = float(os.environ["STALE_MIN"]); HEAVY_MB = int(os.environ["HEAVY_MB"]); MODE = os.environ["MODE"]
+shells = [l.split("\t") for l in os.environ["SHELLS"].splitlines() if l.strip()]
+procs = {}
+for line in open(sys.argv[1]):
+    f = line.split(None, 4)
+    if len(f) < 4: continue
+    procs[int(f[0])] = (int(f[1]), f[2], int(f[3]) // 1024, f[4].rstrip("\n") if len(f) > 4 else "")
+def minutes(et):  # ps etime: [[dd-]hh:]mm:ss
+    d = 0
+    if "-" in et: d, et = et.split("-", 1); d = int(d)
+    p = [int(x) for x in et.split(":")]
+    while len(p) < 3: p.insert(0, 0)
+    return d * 1440 + p[0] * 60 + p[1] + p[2] / 60
+kids = collections.defaultdict(list)
+for pid, (ppid, *_) in procs.items(): kids[ppid].append(pid)
+def desc(pid):
+    out, st = [], list(kids[pid])
+    while st:
+        p = st.pop(); out.append(p); st += kids[p]
+    return out
+MCP  = re.compile(r"tessl mcp|codegraph|mcp-server|-mcp\b|mcp[-_]|server-(github|sequential)")
+DEV  = re.compile(r"\bjest\b|playwright|\bvite\b|\btsx\b|next dev|npm (run|test|exec)|node .*\b(server|dev|watch)\b")
+TOOL = re.compile(r"\.herdr/worktrees/|\.omo/|" + MCP.pattern + "|" + DEV.pattern)
+rows, seen, kill = [], set(), []
+per_pane = {}
+# mcp-hub (launchd) owns the shared MCP children on purpose: never an orphan, never a leftover
+for p, (ppid, et, rss, args) in procs.items():
+    if "mcp-hub/hub.mjs" in args: seen.update([p] + desc(p))
+for pane, name, state, sp in shells:
+    stale = heavy = 0
+    for p in (desc(int(sp)) if sp else []):
+        seen.add(p); ppid, et, rss, args = procs[p]; age = minutes(et)
+        if rss > HEAVY_MB:
+            rows.append(("heavy", name, p, age, rss, args)); heavy += 1
+        if state in ("idle", "done", "blocked") and DEV.search(args) and not MCP.search(args) and age > STALE_MIN:
+            rows.append(("leftover", name, p, age, rss, args)); kill.append(p); stale += 1
+    per_pane[pane] = ", ".join(s for s in ((f"{stale} stale" if stale else ""), (f"{heavy} heavy" if heavy else "")) if s)
+for p, (ppid, et, rss, args) in procs.items():
+    # age gate: codex double-forks tool commands, so a fresh ppid-1 process may be a live job
+    if ppid == 1 and p not in seen and TOOL.search(args) and minutes(et) > STALE_MIN:
+        for q in [p] + desc(p):
+            rows.append(("orphan", "-", q, minutes(procs[q][1]), procs[q][2], procs[q][3])); kill.append(q)
+orphans = sum(1 for r in rows if r[0] == "orphan")
+print("%-8s %-18s %7s %7s %8s  %s" % ("CLASS", "AGENT", "PID", "AGE", "RSS", "CMD"))
+for cls, name, p, age, rss, args in sorted(rows, key=lambda r: (r[0], r[1], -r[3])):
+    print("%-8s %-18s %7d %6.0fm %6dMB  %s" % (cls, name, p, age, rss, args[:90]))
+if not rows: print("(nothing stale)")
+if MODE == "--kill":
+    for p in dict.fromkeys(kill):
+        try: os.kill(p, signal.SIGTERM); print("killed", p)
+        except ProcessLookupError: pass
+if MODE == "--report":
+    quiet = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for pane, label in per_pane.items():
+        subprocess.run(["herdr", "pane", "report-metadata", pane, "--source", "fleet-stale", "--token", f"stale={label}"], **quiet)
+    if orphans:
+        subprocess.run(["herdr", "notification", "show", f"fleet: {orphans} orphan process(es) from dead agents",
+                        "--body", "fleet stale --kill reaps them", "--sound", "none"], **quiet)
+PY
+  rm -f "$ps_out"
+}
+
+# Action registry: mutating verbs must have a preview. --dry-run never reaches
+# directory creation, ledger writes, file writes, signals, worktrees, keys, or prompts.
+has_preview() {
+  case $1 in
+    assign|review|land|rm|sync|send|followup|up|finish|cancel|task|note|keys|stale|rules) return 0 ;;
+    models) [ "${2:-}" = --report ];;
+    *) return 1 ;;
+  esac
+}
+
+preview_assign() {
+  local bean=$1 coder=${2:-} scope=${3:-} kind bf
+  [ -n "$coder" ] || coder=$(pick_least coder assign)
+  refuse_dispatch "$coder" "$bean"
+  kind=$(kind_of "$coder") || exit 2
+  bf="$BRIEFS/assign-$coder-$bean.txt"
+  preview "$coder" "$bf" "fleet/$coder-$bean" "$(coder_prompt "$coder" "$kind" "$bean" "$scope")"
+}
+preview_review() {
+  local coder=$1 rev=${2:-} bean=${3:-} ck kind bf
+  ck=$(kind_of "$coder") || exit 2
+  [ -n "$bean" ] || bean=$(last_bean "$coder"); [ -n "$bean" ] || { echo "no bean assigned to $coder in the ledger" >&2; exit 1; }
+  [ -n "$rev" ] || rev=$(pick_least reviewer review "$ck")
+  refuse_dispatch "$rev" "$bean"
+  kind=$(kind_of "$rev") || exit 2
+  bf="$BRIEFS/review-$rev-$bean.txt"
+  preview "$rev" "$bf" "fleet/$coder-$bean" "$(reviewer_prompt "$rev" "$kind" "$coder" "$bean")"
+}
+
+if [ "$FLEET_HELP" = 1 ]; then cmd_help "${1:-}"; exit 0; fi
+
+case "${1:-}" in
+  ""|status|read|wait|keys|cancel|blocked|models|usage|stale|finish|note) ;;
+  *) : "${FLEET_ROOT:?set DROVER_REPO (env or ~/.config/drover/config) to your project checkout}" ;;
+esac
+
+if [ "$FLEET_DRY_RUN" = 1 ]; then
+  if ! has_preview "${1:-}" "${2:-}"; then
+    echo "${1:-} does not support --dry-run" >&2
+    exit 2
+  fi
+  case "${1:-}" in
+    assign)   preview_assign "$2" "${3:-}" "${4:-}" ;;
+    review)   preview_review "$2" "${3:-}" "${4:-}" ;;
+    land)     preview "$2" "" "fleet/$2" "merge fleet/$2 into main" ;;
+    rm)       preview "$2" "" "fleet/$2" "rm workspace" ;;
+    sync)
+      preview_skills
+      preview_sync
+      if [ "$FLEET_SKILLS_ONLY" != 1 ]; then
+        preview_sync_worktrees "${2:-}"
+      fi
+      ;;
+    rules)
+      preview_skills
+      preview_sync
+      ;;
+    send)     preview "$2" "" "fleet/$2" "$3" ;;
+    followup) preview "$2" "" "fleet/$2" "$3" ;;
+    up)       preview "roster" "" "" "spawn missing roster agents" ;;
+    finish)   preview "$2" "" "fleet/$2" "finish ${3:-}" ;;
+    cancel)   preview "$2" "" "fleet/$2" "send esc" ;;
+    task)     preview "$2" "" "fleet/$2" "$3" ;;
+    note)     preview "lead" "" "" "$2" ;;
+    keys)     preview "$2" "" "fleet/$2" "send-keys $*" ;;
+    stale)    preview "" "" "" "stale ${2:-report}" ;;
+    models)   preview "" "" "" "models --report" ;;
+  esac
+  exit 0
+fi
+
+case "${1:-}" in
+  stale)   cmd_stale "${2:-}" ;;
+  status)  cmd_status ;;
+  models)  [ "${2:-}" = --report ] && REPORT=1; cmd_models ;;
+  up)      cmd_up ;;
+  assign)  cmd_assign "$2" "${3:-}" "${4:-}" ;;
+  review)  cmd_review "$2" "${3:-}" "${4:-}" ;;
+  finish)  cmd_finish "$2" "${3:-}" ;;
+  note)    log note lead claude lead - "$2"; echo "noted" ;;
+  followup)
+    kind=$(kind_of "$2") || exit 2
+    check_beans "${3:-}"
+    r=$(role_of "$2"); ev=assign; [ "$r" = reviewer ] && ev=review
+    log "$ev" "$2" "$kind" "$r" "$(last_bean "$2")" "followup: ${3:0:80}"
+    herdr agent prompt "$2" "$3" --wait --until working --until done --until blocked | jq -r '"\(.result.agent.name): \(.result.agent.agent_status)"'
+    ;;
+  usage)   cmd_usage ;;
+  rules)   cmd_rules ;;
+  rm)      cmd_rm "$2" ;;
+  land)    cmd_land "$2" ;;
+  sync)    cmd_sync "${2:-}" ;;
+  task)    cmd_task "$2" "$3" ;;
+  send)
+    kind=$(kind_of "$2") || exit 2
+    check_beans "${3:-}"
+    bean=$(printf '%s' "${3:-}" | grep -oE "$DROVER_BEAN_RE" | head -1 || true)
+    log assign "$2" "$kind" "$(role_of "$2")" "${bean:--}" "send: ${3:0:60}"
+    herdr agent prompt "$2" "$3" --wait --until working --until done --until blocked | jq -r '"\(.result.agent.name): \(.result.agent.agent_status)"'
+    ;;
+  read)    herdr agent read "$2" --source visible --lines "${3:-60}" ;;
+  wait)    if [ -n "${3:-}" ]; then herdr agent wait "$2" --until "$3"; else herdr agent wait "$2"; fi ;;
+  keys)    n=$2; shift 2; herdr agent send-keys "$n" "$@" ;;
+  cancel)  herdr agent send-keys "$2" esc | jq -r '"\($2): \(.result.type // .error.code)"' --arg 2 "$2" ;;
+  blocked) agents | jq -r 'select(.agent_status == "blocked") | (.name // .pane_id)' | while read -r a; do
+             echo "===== $a"; herdr agent read "$a" --source visible --lines 25; done ;;
+  *) sed -n '2,21p' "$0"; exit 2 ;;
+esac

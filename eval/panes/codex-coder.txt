@@ -1,0 +1,7 @@
+■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 19th, 2026 11:41 AM.
+› New bean: read ~/.local/share/drover/briefs/assign-codex-coder-bean-6hyo.txt and follow it exactly. It assigns you bean-6hyo. Merge main first: git merge main --no-edit
+■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 19th, 2026 11:41 AM.
+› New bean: read ~/.local/share/drover/briefs/assign-codex-coder-bean-6hyo.txt and follow it exactly. It assigns you bean-6hyo. Merge main first: git merge main --no-edit
+■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 19th, 2026 11:41 AM.
+› Ask Codex to do anything
+  gpt-5.6-sol high fast · ~/.herdr/worktrees/myapp/fleet-codex-coder · Handle bean-43ab bean

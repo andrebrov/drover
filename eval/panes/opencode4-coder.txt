@@ -1,0 +1,10 @@
+    reported: opencode4-coder bean-0obu DONE                                                                                                                                                              Config                            
+                                                                                                                                                                                                              config invalid - run doctor       
+                                                                                                                                                                                                               ../../../../.omo/omo....          
+     DONE ~/.local/share/drover/reports/opencode4-coder-bean-0obu.md                                                                                                                                                        
+                                                                                                                                                                                                              └───────────────────────────────────┘
+     ▣  Sisyphus - Ultraworker · GLM 5.3 Fast · 5m 28s
+                                                                                                                                                                                                             ~/.herdr/worktrees/myapp/fleet-opencode4-
+                                                                                                                                                                                                             coder:fleet/opencode4-
+    Sisyphus - Ultraworker auto · GLM 5.3 Fast Fireworks AI · max                                                                                                                                            coder-bean-0obu
+   ~/.herdr/worktrees/myapp/fleet-opencode4-coder                                                                                             380.8K (36%) · $285.21  ctrl+p commands    • OpenCode 1.18.31

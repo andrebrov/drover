@@ -1,0 +1,10 @@
+    Commits 6bf38faf0 (merge) + 04ace96a1 (bean)." "~/.local/share/drover/reports/opencode2-coder-bean-d4na.md" 2>&1 | tail -2
+    YES
+    reported: opencode2-coder bean-d4na DONE
+     + Thought: 553ms
+     DONE ~/.local/share/drover/reports/opencode2-coder-bean-d4na.md
+     ▣  Sisyphus - Ultraworker · GLM 5.3 Fast · 12m 51s
+                                                                                                                                                                                                             ~/.herdr/worktrees/myapp/fleet-
+                                                                                                                                                                                                             opencode2-coder:fleet/opencode2-coder-
+    Sisyphus - Ultraworker auto · GLM 5.3 Fast Fireworks AI · max                                                                                                                                            bean-d4na
+   ~/.herdr/worktrees/myapp/fleet-opencode2-coder                                                                                                  433.4K (41%) · $29.13  ctrl+p commands    • OpenCode 1.18.31

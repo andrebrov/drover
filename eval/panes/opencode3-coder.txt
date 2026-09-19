@@ -1,0 +1,10 @@
+    e8ob-build.log
+    e8ob-build2.log
+    e8ob-build3.log
+     + Thought: 743ms
+     DONE ~/.local/share/drover/reports/opencode3-coder-bean-e8ob.md
+     ▣  Sisyphus - Ultraworker · GLM 5.3 Fast · 12m 9s
+                                                                                                                                                                                                             ~/src/myapp/.herdr-
+                                                                                                                                                                                                             worktrees/fmu3-opencode-fix:fleet/
+    Sisyphus - Ultraworker auto · GLM 5.3 Fast Fireworks AI · max                                                                                                                                            opencode7-fmu3
+   ~/src/myapp/.herdr-worktrees/fmu3-opencode-fix                                                                                 352.7K (34%) · $19.46  ctrl+p commands    • OpenCode 1.18.31

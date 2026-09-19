@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# fleet-hunt [bugs|ux|both] — send every idle non-coder role hunting.
+#   bugs  defects a user would feel   (default)
+#   ux    friction that makes the product rough to use
+#   perf  slowness, with a before-number that someone else can re-run
+#   both  round-robin the idle roles across all three
+# The human lead, 2026-09-07: "when sre/architect/pm/code-reviewers are not working it
+# would be great to send them for bug hunting." Coders are excluded on purpose:
+# they hold beans and a bean is better work than a hunt.
+# The hunt briefs are $FLEET_BRIEFS/{bug,ux,perf}-hunt.txt (install.sh seeds them from examples/briefs).
+set -euo pipefail
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+BRIEFS="$FLEET_BRIEFS"
+REPORTS="$FLEET_REPORTS"
+DATE=$(date +%Y%m%d)
+MODE="${1:-bugs}"
+sent=0
+i=0
+# idle/done only: a MISSING seat has no pane to prompt, and `blocked` is waiting on a human
+for a in $("$DROVER_BIN"/fleet status 2>/dev/null | awk 'NR>1 && $1!="-" && ($3=="idle" || $3=="done") {print $1}'); do
+  case "$a" in
+    *coder*|lead) continue ;;                      # coders hold beans
+    *reviewer*|*sre*|*pm*|*architect*|*analyst*|judge|design) ;;
+    *) continue ;;
+  esac
+  case "$MODE" in
+    ux)   kind=ux ;;
+    perf) kind=perf ;;
+    both) case $((i % 3)) in 0) kind=bugs ;; 1) kind=ux ;; *) kind=perf ;; esac ;;
+    *)    kind=bugs ;;
+  esac
+  i=$((i+1))
+  if [ "$kind" = perf ]; then
+    msg="No bean assigned — go PERFORMANCE hunting. Read $BRIEFS/perf-hunt.txt and follow it. Report to $REPORTS/$a-perfhunt-$DATE.md. MEASURE FIRST: every finding needs a before-number and the exact command that produced it. A finding without a measurement is a guess."
+  elif [ "$kind" = ux ]; then
+    msg="No bean assigned — go UX hunting. Read $BRIEFS/ux-hunt.txt and follow it. Report to $REPORTS/$a-uxhunt-$DATE.md. Name the real route or component; a suggestion that names no surface is not actionable."
+  else
+    msg="No bean assigned — go bug hunting. Read $BRIEFS/bug-hunt.txt and follow it. Report to $REPORTS/$a-bughunt-$DATE.md. PROVE every finding with file:line, the trigger and the wrong output; an honest empty hunt beats a manufactured finding."
+  fi
+  # Serial, and --wait: a parallel dispatch silently drops the prompt.
+  herdr agent prompt "$a" "$msg" --wait --until working --until done --timeout 100000 >/dev/null 2>&1
+  sent=$((sent+1))
+done
+echo "sent $sent idle non-coder agents hunting ($MODE)"

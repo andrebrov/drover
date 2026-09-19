@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.drover.lead-watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BIN@/lead-watchdog</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>@BIN@:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>@LOGS@/lead-watchdog.out</string>
+  <key>StandardErrorPath</key>
+  <string>@LOGS@/lead-watchdog.err</string>
+</dict>
+</plist>

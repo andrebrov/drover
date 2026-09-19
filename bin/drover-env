@@ -1,0 +1,43 @@
+# drover-env — sourced by every drover script. Not executable on its own.
+#
+# One config file, plain shell. Write values as ${VAR:-value} so the environment wins:
+#   DROVER_REPO="${DROVER_REPO:-$HOME/src/myproject}"
+# Every path below can be overridden the same way.
+DROVER_CONFIG="${DROVER_CONFIG:-$HOME/.config/drover/config}"
+# shellcheck disable=SC1090
+[ -f "$DROVER_CONFIG" ] && . "$DROVER_CONFIG"
+
+# The directory these scripts are installed in (install.sh symlinks them into ~/.local/bin), and the
+# drover checkout they came from (for skills/ and docs/). Scripts call each other through
+# $DROVER_BIN, never through PATH: launchd's PATH is short, and `fleet` is also the name of an IDE CLI.
+_drover_self="${BASH_SOURCE[0]}"
+DROVER_BIN="$(cd "$(dirname "$_drover_self")" && pwd)"
+while [ -L "$_drover_self" ]; do
+  _drover_t=$(readlink "$_drover_self")
+  case $_drover_t in /*) _drover_self=$_drover_t ;; *) _drover_self=$(dirname "$_drover_self")/$_drover_t ;; esac
+done
+DROVER_SRC="${DROVER_SRC:-$(cd "$(dirname "$_drover_self")/.." && pwd)}"
+unset _drover_self _drover_t
+
+DROVER_HOME="${DROVER_HOME:-$HOME/.local/share/drover}"
+FLEET_QUEUE="${FLEET_QUEUE:-$DROVER_HOME/queue}"        # global FIFO: one empty file per bean, <epoch>-<bean>
+FLEET_INBOX="${FLEET_INBOX:-$DROVER_HOME/inbox}"        # fleet-done writes one .msg per announcement
+FLEET_TASKS="${FLEET_TASKS:-$DROVER_HOME/tasks}"        # one file per busy seat — the ONLY busy marker
+FLEET_BRIEFS="${FLEET_BRIEFS:-$DROVER_HOME/briefs}"     # prompts are written here; agents get a one-line pointer
+FLEET_REPORTS="${FLEET_REPORTS:-$DROVER_HOME/reports}"  # agents' reports and reviews
+FLEET_STATE="${FLEET_STATE:-$DROVER_HOME/watch/state}"  # fleet-watch state (owner/, approved/, followups/, ...)
+FLEET_LEDGER="${FLEET_LEDGER:-$DROVER_HOME/ledger.tsv}" # dispatch event log
+FLEET_CAPS="${FLEET_CAPS:-$HOME/.config/drover/caps}"   # spend caps, re-read every tick
+
+# The seats: name:harness pairs. The role is the name's last dash-separated word (coder, reviewer,
+# pm, architect, analyst, sre, ...). A reviewer is always picked on a different harness from the coder.
+DROVER_ROSTER="${DROVER_ROSTER:-claude-coder:claude codex-coder:codex opencode-coder:opencode claude-reviewer:claude codex-reviewer:codex opencode-reviewer:opencode}"
+DROVER_LEAD_SEATS="${DROVER_LEAD_SEATS:-lead lead-backup}"   # never restarted by fleet-yolo
+
+# Where herdr puts each seat's worktree, and the beans id prefix (read from the repo's .beans.yml).
+DROVER_WORKTREES="${DROVER_WORKTREES:-$HOME/.herdr/worktrees/$(basename "${DROVER_REPO:-repo}")}"
+if [ -z "${DROVER_BEAN_PREFIX:-}" ] && [ -f "${DROVER_REPO:-/nonexistent}/.beans.yml" ]; then
+  DROVER_BEAN_PREFIX=$(sed -n 's/^[[:space:]]*prefix:[[:space:]]*//p' "$DROVER_REPO/.beans.yml" | head -1 | tr -d "\"'")
+fi
+DROVER_BEAN_PREFIX="${DROVER_BEAN_PREFIX:-bean-}"
+DROVER_BEAN_RE="${DROVER_BEAN_RE:-${DROVER_BEAN_PREFIX}[a-z0-9]{4}}"

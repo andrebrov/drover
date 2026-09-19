@@ -1,0 +1,10 @@
+╭─────────────────────────────────────────────────────────╮
+ >_ OpenAI Codex (v0.154.0)                              
+ model:       gpt-5.6-sol high   fast   /model to change 
+ directory:   ~                                          
+ permissions: YOLO mode                                  
+╰─────────────────────────────────────────────────────────╯
+  Tip: Run /review to get a code review of your current changes.
+⚠ 1 MCP startup issue · ctrl + t for details
+› Ask Codex to do anything
+  gpt-5.6-sol high fast · ~

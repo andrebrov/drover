@@ -1,0 +1,31 @@
+BUG HUNT — you have no assigned bean, so hunt. Find something real that is broken in code already on main, and prove it.
+
+This is not a code review. It is a search for defects a user would feel.
+
+## What counts as a find
+
+A defect where the SYSTEM DOES SOMETHING WRONG, not where the style is poor. The classes that kept turning out real in the fleet this came from, in rough order of how often:
+
+1. **Absence reported as a value.** A zero where the truth is "unknown"; a blank where the truth is "could not compute"; "not connected" where it is connected.
+2. **A swallowed failure counted as success.** A `catch` that logs and continues while the caller records the run as succeeded (one job counted 40 swallowed query failures inside "105 refreshed").
+3. **Data crossing a boundary it must not.** One tenant's or one user's data readable by another; an id resolved to a shared account.
+4. **A gate that passes when evidence is missing.** `x !== true`, `Number.isFinite(n) && n > 1`, an unreadable count treated as safe. Fail-open guards read as safe and are not.
+5. **A test that cannot fail.** A partial module mock that kills the suite at link time, a fixture that passes two ways, an assertion on a value the test itself sets.
+6. **A number with no basis.** A percentage whose comparison window is never stated, or a figure computed from a source that cannot support it.
+
+## Rules
+
+- **PROVE IT.** A finding needs the file:line, the input that triggers it, and the wrong output. "This looks fragile" is not a finding.
+- **Never assert a negative without the command that proves it.** Not "nothing populates this" — paste the query or the grep.
+- Prefer ONE proven defect over five suspicions. A wrong finding costs more than a missed one, because someone spends a round disproving it.
+- Do not fix it. Report it. The lead files the bean and routes a coder.
+- Read-only against production and live third-party accounts.
+
+## Where to look, by role
+
+- **sre**: production logs. Rank by how many real users each issue touched.
+- **architect**: boundaries. Where two modules disagree about who owns a fact; where a write names columns that do not exist; where a state machine has an unreachable or inescapable state.
+- **pm**: the user's view. Where the UI states something the data does not support, or hides something the user needs to act on.
+- **reviewers**: landed code in the area you last reviewed — you already have the context, and defects cluster where work was recent.
+
+Write <reports>/<your-name>-bughunt-<date>.md (the exact path is in your prompt): one section per finding, each with file:line, the trigger, the wrong output, and how you proved it. If you found nothing you can prove, say so — an honest empty hunt is a real result.
