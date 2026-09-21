@@ -609,3 +609,15 @@ An approved bean is done being edited — it only awaits landing — so it must 
 Count only working (coder task files) + in-review. Raising the cap would have been the wrong fix: it
 treats the symptom (dispatch starved) by allowing MORE concurrent editing, the exact thing the cap is
 there to bound. The right fix removes the structural miscount and keeps the cap at 2 on real work.
+
+### No synthetic wall-clock timeout in a gate — kill on log-silence (2026-09-21)
+
+A gate that runs `( cmd ) & sleep N; kill` guesses how long the work should take. Under load the guess
+is wrong and it SIGKILLs healthy-but-slow work, reporting it as a failure. On the origin fleet a cold
+build behind a fixed cap was killed and surfaced as "typecheck failed" on good beans — the flagged
+beans' logs were **0 bytes** (killed before any output), the tell that it was the timer, not a real
+error. Fix: a **progress watchdog** — run the gate to natural completion, read its log, and kill only
+after `DROVER_GATE_STALL` seconds with NO new output (a genuine hang). The gate command must emit
+progress (jest prints PASS/FAIL per suite) so the log grows while it works. `fleet-land-bean`'s
+`run_gate` and `fleet-verify-main`'s suite runner both use this; a stall returns 124 and is flagged
+distinctly from a real failure. **Metric (fails if >0):** flagged lands whose gate log is 0 bytes.

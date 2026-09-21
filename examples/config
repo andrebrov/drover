@@ -27,6 +27,12 @@ DROVER_TEST_CHANGED="${DROVER_TEST_CHANGED:-}"  # per-bean tests for the changed
 DROVER_TEST_ALL="${DROVER_TEST_ALL:-}"          # cumulative push gate (full suite on a clean worktree at main
                                                 # HEAD, with DROVER_BUILD), e.g. 'cd backend && npx jest --forceExit'
 DROVER_CODE_PATHS="${DROVER_CODE_PATHS:-}"      # fleet-completed-audit: ERE of code paths (empty = any non-bean file)
+# Gate watchdog: a gate is killed only after this many seconds with NO new output (a genuine hang),
+# never on total elapsed time — so a slow-but-progressing suite under load is not guillotined.
+DROVER_GATE_STALL="${DROVER_GATE_STALL:-300}"
+# Warm an incremental build cache in the cumulative gate: space-separated repo-relative files copied
+# into the clean worktree so a "cold" build starts warm (e.g. 'backend/.tsbuildinfo'). Empty = none.
+DROVER_BUILD_CACHE="${DROVER_BUILD_CACHE:-}"
 
 # Fresh worktree bootstrap: dependency dirs APFS-cloned from DROVER_REPO, and untracked files copied.
 DROVER_CLONE_DIRS="${DROVER_CLONE_DIRS:-node_modules}"   # space-separated, relative to the repo root

@@ -32,6 +32,11 @@ trap cleanup EXIT
 for d in ${DROVER_CLONE_DIRS:-node_modules}; do
   [ -e "$wt/$d" ] || { mkdir -p "$(dirname "$wt/$d")" 2>/dev/null; ln -s "$REPO/$d" "$wt/$d" 2>/dev/null; }
 done
+# warm an incremental build cache: copy DROVER_BUILD_CACHE paths in so a "cold" gate build starts warm
+# (e.g. tsc --incremental's .tsbuildinfo). A stale cache only recompiles the changed files — never wrong.
+for c in ${DROVER_BUILD_CACHE:-}; do
+  [ -f "$REPO/$c" ] && { mkdir -p "$(dirname "$wt/$c")" 2>/dev/null; cp "$REPO/$c" "$wt/$c" 2>/dev/null; }
+done
 
 echo "verify: build+test on $ref @ ${tip:0:9} (clean worktree)"
 if [ -n "$BUILD" ]; then
@@ -39,12 +44,19 @@ if [ -n "$BUILD" ]; then
   if [ $? -ne 0 ]; then echo "verify: BUILD FAILED — $LOGDIR/build.log"; tail -12 "$LOGDIR/build.log"; exit 1; fi
 fi
 if [ -n "$TEST_ALL" ]; then
-  # hard cap so a hung suite cannot wedge the caller
+  # progress watchdog, not a wall-clock cap: run the suite to completion; kill ONLY after DROVER_GATE_STALL
+  # seconds with NO new output (a genuine hang). A slow-but-progressing suite under load survives.
   ( cd "$wt" && sh -c "$TEST_ALL" ) >"$LOGDIR/test.log" 2>&1 &
-  tp=$!; ( sleep "${DROVER_VERIFY_TIMEOUT:-900}"; kill -9 "$tp" 2>/dev/null ) & tw=$!
-  wait "$tp" 2>/dev/null; trc=$?; kill "$tw" 2>/dev/null
+  tp=$!; last=-1; quiet=0; stall="${DROVER_GATE_STALL:-300}"
+  while kill -0 "$tp" 2>/dev/null; do
+    sleep 10
+    sz=$(wc -c < "$LOGDIR/test.log" 2>/dev/null); sz=${sz:-0}
+    if [ "$sz" != "$last" ]; then last=$sz; quiet=0; else quiet=$((quiet+10)); fi
+    [ "$quiet" -ge "$stall" ] && { kill -9 "$tp" 2>/dev/null; break; }
+  done
+  wait "$tp" 2>/dev/null; trc=$?
   tail -8 "$LOGDIR/test.log"
-  if [ "$trc" -ne 0 ]; then echo "verify: TESTS FAILED (rc=$trc) — $LOGDIR/test.log — DO NOT PUSH"; exit 1; fi
+  if [ "$trc" -ne 0 ]; then echo "verify: TESTS FAILED/STALLED (rc=$trc) — $LOGDIR/test.log — DO NOT PUSH"; exit 1; fi
 fi
 echo "verify: GREEN — $ref @ ${tip:0:9} is safe to push"
 exit 0

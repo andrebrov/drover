@@ -84,19 +84,32 @@ for d in ${DROVER_CLONE_DIRS:-node_modules}; do
 done
 
 changed_args=""
-run_gate(){  # $1=cmd  $2=log-tag  $3=timeout-seconds ; runs in $wt with $CHANGED exported. A hung gate
-             # must never wedge the caller, so it runs backgrounded under a hard kill.
-  ( cd "$wt" && CHANGED="$changed_args" sh -c "$1" ) >"$STATE/land-$bean-$2.log" 2>&1 &
-  local p=$!; ( sleep "$3"; kill -9 "$p" 2>/dev/null ) & local w=$!
-  wait "$p" 2>/dev/null; local rc=$?; kill "$w" 2>/dev/null; return $rc
+run_gate(){  # $1=cmd  $2=log-tag  $3=stall-seconds ; runs in $wt with $CHANGED exported. Reads the LOG:
+             # kills ONLY after $3s with NO new output (a genuine hang), never on total elapsed time. A
+             # synthetic wall-clock cap SIGKILLs slow-but-healthy gates under load and false-fails good
+             # beans (2026-09-21). The gate command must emit progress (jest prints PASS/FAIL per suite).
+  local logf="$STATE/land-$bean-$2.log"
+  ( cd "$wt" && CHANGED="$changed_args" sh -c "$1" ) >"$logf" 2>&1 &
+  local p=$! last=-1 quiet=0 sz
+  while kill -0 "$p" 2>/dev/null; do
+    sleep 10
+    sz=$(wc -c < "$logf" 2>/dev/null); sz=${sz:-0}
+    if [ "$sz" != "$last" ]; then last=$sz; quiet=0; else quiet=$((quiet+10)); fi
+    [ "$quiet" -ge "$3" ] && { kill -9 "$p" 2>/dev/null; wait "$p" 2>/dev/null; return 124; }
+  done
+  wait "$p" 2>/dev/null; return $?
 }
 
 if [ -n "${DROVER_TYPECHECK:-}" ]; then
-  run_gate "$DROVER_TYPECHECK" tc "${DROVER_TYPECHECK_TIMEOUT:-400}" || { cleanup; flag "typecheck failed on cherry-pick — manual land ($STATE/land-$bean-tc.log)"; exit 1; }
+  run_gate "$DROVER_TYPECHECK" tc "${DROVER_GATE_STALL:-300}"; grc=$?
+  [ "$grc" -eq 124 ] && { cleanup; flag "typecheck STALLED — no output ${DROVER_GATE_STALL:-300}s (hung, not a clock) — manual land ($STATE/land-$bean-tc.log)"; exit 1; }
+  [ "$grc" -eq 0 ]   || { cleanup; flag "typecheck failed on cherry-pick — manual land ($STATE/land-$bean-tc.log)"; exit 1; }
 fi
 if [ -n "${DROVER_TEST_CHANGED:-}" ]; then
   changed_args=$(printf '%s\n' "$diffnames" | tr '\n' ' ')
-  run_gate "$DROVER_TEST_CHANGED" test "${DROVER_TEST_TIMEOUT:-420}" || { cleanup; flag "related tests failed on cherry-pick — manual land ($STATE/land-$bean-test.log)"; exit 1; }
+  run_gate "$DROVER_TEST_CHANGED" test "${DROVER_GATE_STALL:-300}"; grc=$?
+  [ "$grc" -eq 124 ] && { cleanup; flag "related tests STALLED — no output ${DROVER_GATE_STALL:-300}s (hung, not a clock) — manual land ($STATE/land-$bean-test.log)"; exit 1; }
+  [ "$grc" -eq 0 ]   || { cleanup; flag "related tests failed on cherry-pick — manual land ($STATE/land-$bean-test.log)"; exit 1; }
 fi
 
 if [ "${FLEET_LAND_DRY:-0}" = 1 ]; then
