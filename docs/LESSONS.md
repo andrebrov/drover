@@ -595,3 +595,17 @@ Two smaller ones from building the gates:
   flagged for manual fix but kept its `approved` marker. That made it a zombie: the dispatcher skipped it
   (approved) and the lander skipped it (flagged), so it sat forever in the skip-list while coders starved.
   Whatever marks work as failed must also clear whatever marks it as ready.
+
+### The epic train cap must count active work, not approved-awaiting-land (2026-09-21)
+
+The epic cap (≤N in-flight beans per parent epic) was counting **approved-but-unlanded** beans as
+"in flight." When landing lagged, this deadlocked dispatch: two epics sat at cap 2 with **2 approved +
+0 working each** — zero coders on them — and every new bean of those epics was SKIPped. The whole
+fleet idled behind `epic … at train cap` while coders sat free and the queue kept refilling with beans
+that could never dispatch. The symptom read as "agents not working"; the cause was a miscount.
+
+The cap exists to limit *concurrent editing* of one epic on shared files (the merge-conflict lottery).
+An approved bean is done being edited — it only awaits landing — so it must not consume a cap slot.
+Count only working (coder task files) + in-review. Raising the cap would have been the wrong fix: it
+treats the symptom (dispatch starved) by allowing MORE concurrent editing, the exact thing the cap is
+there to bound. The right fix removes the structural miscount and keeps the cap at 2 on real work.

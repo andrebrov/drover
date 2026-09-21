@@ -583,16 +583,19 @@ wip_count(){
 
 # --- Epic "train" cap -----------------------------------------------------------------------
 # A roadmap is a dependency chain; spraying one epic across many parallel beans on shared files turns it
-# into a merge-conflict lottery. Cap in-flight beans PER PARENT EPIC so an epic advances as a sequenced
-# train, not a fan-out. Beans with no parent are governed only by the global WIP cap. Tunable:
+# into a merge-conflict lottery. Cap ACTIVELY-WORKED beans PER PARENT EPIC so an epic advances as a
+# sequenced train, not a fan-out. Beans with no parent are governed only by the global WIP cap. Tunable:
 # state/epic-cap. epic_of reads the bean file's `parent:` field.
 epic_cap(){ local c; c=$(cat "$STATE/epic-cap" 2>/dev/null); echo "${c:-2}"; }
 epic_of(){ grep -h '^parent:' "$REPO/.beans/$1--"*.md 2>/dev/null | head -1 | awk '{print $2}'; }
 epic_inflight(){
+  # count only beans being actively coded or reviewed — NOT approved-awaiting-land. The cap prevents
+  # concurrent EDITING of one epic on shared files; an approved bean is done being edited and only awaits
+  # landing, so counting it let a landing backlog DEADLOCK dispatch (an epic pinned at cap with approved
+  # beans and zero coders on it, every new bean SKIPped — measured 2026-09-21).
   local epic="$1" b; [ -n "$epic" ] || { echo 0; return; }
   {
     [ -d "$STATE/reviews" ] && ls "$STATE/reviews" 2>/dev/null | grep -v '^\.'
-    if [ -d "$STATE/approved" ]; then for f in "$STATE/approved"/*; do [ -e "$f" ] || continue; b="${f##*/}"; case "$b" in .*) continue;; esac; [ -f "$STATE/needs-land/$b" ] && continue; echo "$b"; done; fi
     grep -hoE "$DROVER_BEAN_RE" "$TASKS"/* 2>/dev/null
   } | sort -u | while read -r b; do [ -n "$b" ] || continue; [ "$(epic_of "$b")" = "$epic" ] && echo x; done | grep -c x
 }
