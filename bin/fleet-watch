@@ -26,7 +26,7 @@ set -uo pipefail
 . "$(dirname "$0")/drover-env"
 TICK="${FLEET_TICK:-60}"
 Q="$FLEET_QUEUE"; INBOX="$FLEET_INBOX"; STATE="$FLEET_STATE"; LOG="$(dirname "$STATE")/watch.log"
-TASKS="$FLEET_TASKS"; REPORTS="$FLEET_REPORTS"
+TASKS="$FLEET_TASKS"; REPORTS="$FLEET_REPORTS"; LEDGER="$FLEET_LEDGER"
 REPO="${DROVER_REPO:-}"
 
 FLEET_HELP=0 FLEET_DRY_RUN=0
@@ -184,6 +184,32 @@ owner_sync(){ mkdir -p "$STATE/owner" "$STATE/double"; local f s b seen=""
     case " $seen " in *" $b="*) other=$(printf '%s' "$seen" | tr ' ' '\n' | sed -n "s/^$b=//p" | head -1)
       [ -f "$STATE/double/$b" ] || { : > "$STATE/double/$b"; echo "$other+$s $b DOUBLE DISPATCH" >> "$STATE/blocked"; log "DOUBLE DISPATCH: $b held by $other AND $s — lead decides"; };;
     esac; seen="$seen $b=$s"
+  done
+  # Release lead-owned markers older than 24h. Orphaned from a prior lead session they SKIP dispatch
+  # forever ("the lead is running it") and idle the whole fleet (measured: 7.8-day-old markers starved
+  # dispatch until released by hand).
+  local lof loage
+  for lof in "$STATE"/lead-owned/*; do [ -f "$lof" ] || continue
+    loage=$(( ($(date +%s) - $(stat -f %m "$lof" 2>/dev/null || echo 0)) / 3600 ))
+    [ "$loage" -ge 24 ] && { rm -f "$lof"; log "LEAD-OWNED TTL: released $(basename "$lof") (${loage}h old, orphaned)"; }
+  done
+  # Auto-release STALE owner markers — owner seat NOT working, marker >30min old — so the bean can
+  # re-dispatch instead of sitting owned forever. NEVER touch a bean in the land/review pipeline.
+  # Bounded to 12 branch checks/tick to stay cheap.
+  local wk; wk=$("$DROVER_BIN"/fleet status 2>/dev/null | awk '$3=="working"{printf " %s ",$1}')
+  local of ob oo obr on oag chk=0
+  for of in "$STATE"/owner/*; do
+    [ -f "$of" ] || continue; [ "$chk" -ge 12 ] && break
+    oag=$(( ($(date +%s) - $(stat -f %m "$of" 2>/dev/null || echo 0)) / 60 )); [ "$oag" -lt 30 ] && continue
+    ob=$(basename "$of"); oo=$(cat "$of" 2>/dev/null | tr -d '[:space:]'); [ -n "$oo" ] || continue
+    case "$wk" in *" $oo "*) continue;; esac   # owner is mid-task — never yank an active bean
+    { [ -f "$STATE/approved/$ob" ] || [ -f "$STATE/reviews/$ob" ]; } && continue
+    chk=$((chk+1)); obr="fleet/${oo}-${ob}"; on=0
+    git -C "$REPO" show-ref -q "refs/heads/$obr" && on=$(git -C "$REPO" rev-list --count --no-merges "main..$obr" 2>/dev/null)
+    # empty branch => release at 30m (coder took it, produced nothing). NON-empty but idle + not in the
+    # pipeline => release at 45m (recovery-set markers on real branches once starved dispatch to empty).
+    if [ "${on:-0}" -eq 0 ]; then rm -f "$of"; log "STALE-OWNER: released $ob (owner $oo idle, empty branch, ${oag}m old)"
+    elif [ "$oag" -ge 45 ]; then rm -f "$of"; log "STALE-OWNER: released $ob (owner $oo idle, not in land/review pipeline, ${oag}m old)"; fi
   done; }
 harness_ok(){ case " $BROKE " in *" $(kind_of "$1") "*) return 1;; esac; return 0; }
 
@@ -390,6 +416,22 @@ top_up_queue(){
   # fix rounds (followups) and reviews on existing work still flow.
   [ -f "$STATE/finish-first" ] && return 0
   [ "$(ls "$Q" 2>/dev/null | wc -l | tr -d ' ')" = 0 ] || return 0
+  # Fleet base invariant: $DROVER_REPO must be on main. `beans list --ready` reads the WORKING TREE,
+  # but the dispatch guard reads `main:`. A drifted base enqueues beans already completed on main;
+  # refill skips them all and every coder idles behind a misleading "queue empty". Fail closed.
+  local base; base=$(cd "$REPO" && git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  if [ "$base" != main ]; then
+    log "REPO OFF MAIN (on '$base') — NOT topping up from a drifted base (would enqueue completed beans). Restore \$DROVER_REPO to main."
+    return 0
+  fi
+  # WIP CAP backpressure: at/over the integration backlog cap, enqueue NO new beans (followups + landing
+  # still flow). This is what stops the open-loop dispatch pump — see the WIP cap section below.
+  local _wip _cap; _wip=$(wip_count); _cap=$(wip_cap)
+  if [ "$_wip" -ge "$_cap" ]; then
+    [ -f "$STATE/.wip-capped" ] || { : > "$STATE/.wip-capped"; log "WIP CAP: integration backlog $_wip (approved-unlanded + in-review + working) >= $_cap — pausing NEW dispatch until landing drains it"; }
+    return 0
+  fi
+  [ -f "$STATE/.wip-capped" ] && { rm -f "$STATE/.wip-capped"; log "WIP CAP lifted: backlog $_wip < $_cap — resuming dispatch"; }
   local added; added=$(cd "$REPO" && beans list --json --ready 2>/dev/null | KW="${DROVER_QUEUE_KEYWORDS:-}" python3 -c '
 import json,os,sys
 try: bs=json.load(sys.stdin)
@@ -448,6 +490,8 @@ refill(){
       log "FOLLOWUP $fb -> $a ($out)"; continue
     fi
     if [ -f "$STATE/finish-first" ]; then continue; fi   # finish-and-land first: no new beans
+    # WIP CAP: no NEW bean dispatch while the integration backlog is full (followups above still flow).
+    if [ "$(wip_count)" -ge "$(wip_cap)" ]; then continue; fi
     next=$(ls "$Q" 2>/dev/null | head -1); [ -n "$next" ] || { log "queue empty — nothing for $a"; return; }
     bean=${next#*-}; rm -f "$Q/$next"
     # Drop EVERY other queue entry for this bean, not just the one popped. The queue is a
@@ -487,6 +531,12 @@ refill(){
       mkdir -p "$STATE/credit-dead"; : > "$STATE/credit-dead/$a"   # stop re-picking it every tick
       printf '' > "$Q/$(date +%s)-$bean"; continue
     fi
+    # EPIC TRAIN CAP: keep a roadmap epic to <=N beans in flight (dropped from the queue, not requeued
+    # — top_up re-adds it when the epic has room; requeuing would churn every tick).
+    _epic=$(epic_of "$bean")
+    if [ -n "$_epic" ] && [ "$(epic_inflight "$_epic")" -ge "$(epic_cap)" ]; then
+      log "SKIP $bean — epic $_epic at train cap ($(epic_cap) in flight); deferred until it drains"; continue
+    fi
     out=$(cd "$REPO" && "$DROVER_BIN"/fleet assign "$bean" "$a" 2>&1 | tail -1); rc=$?
     if [ $rc -ne 0 ] || printf '%s' "$out" | grep -qiE 'error|not on main|unknown agent|syntax'; then
       log "DISPATCH $bean -> $a FAILED (${out:0:80}) — bean requeued, agent left free"; printf '' > "$Q/$(date +%s)-$bean"; continue
@@ -509,7 +559,138 @@ snapshot_wip(){
   KEEP_HOURS=48 "$DROVER_BIN"/fleet-snapshot prune >/dev/null 2>&1
   log "SNAPSHOT ${out:0:120}"
 }
-tick(){ clear_dialogs; check_budget; h=$("$DROVER_BIN"/fleet-harvest-beans 2>/dev/null | grep "^harvested"); [ -n "$h" ] && log "HARVEST ${h:11:140}"; drain_inbox; retry_reviews; reap_tasks; seat_scan; owner_sync; sweep_guard; snapshot_wip; yolo_guard; top_up_queue; refill
+
+# --- WIP cap / backpressure -----------------------------------------------------------------
+# Without this, fleet-watch is an open-loop dispatch pump: measured over 2 days one fleet issued
+# 12,240 DISPATCH vs 195 land attempts (~60:1) — the 700+ branches were INVENTORY, not progress.
+# Throttle NEW dispatch to the INTEGRATION backlog. WIP = work that is done-ish but not on main:
+# approved-awaiting-land (minus stuck/needs-land) + in-review + coders mid-bean. When WIP >= cap, stop
+# starting NEW beans; followups (fixes to in-flight work) and landing still flow. Tunable: state/wip-cap.
+wip_cap(){ local c; c=$(cat "$STATE/wip-cap" 2>/dev/null); echo "${c:-6}"; }
+wip_count(){
+  local ap=0 rv=0 wk=0 f b
+  if [ -d "$STATE/approved" ]; then
+    for f in "$STATE/approved"/*; do
+      [ -e "$f" ] || continue; b="${f##*/}"; case "$b" in .*) continue;; esac
+      [ -f "$STATE/needs-land/$b" ] && continue
+      ap=$((ap+1))
+    done
+  fi
+  if [ -d "$STATE/reviews" ]; then for f in "$STATE/reviews"/*; do [ -e "$f" ] && rv=$((rv+1)); done; fi
+  if [ -d "$TASKS" ]; then for f in "$TASKS"/*; do [ -e "$f" ] || continue; case "${f##*/}" in *coder|*coder-[0-9]*) wk=$((wk+1));; esac; done; fi
+  echo $((ap+rv+wk))
+}
+
+# --- Epic "train" cap -----------------------------------------------------------------------
+# A roadmap is a dependency chain; spraying one epic across many parallel beans on shared files turns it
+# into a merge-conflict lottery. Cap in-flight beans PER PARENT EPIC so an epic advances as a sequenced
+# train, not a fan-out. Beans with no parent are governed only by the global WIP cap. Tunable:
+# state/epic-cap. epic_of reads the bean file's `parent:` field.
+epic_cap(){ local c; c=$(cat "$STATE/epic-cap" 2>/dev/null); echo "${c:-2}"; }
+epic_of(){ grep -h '^parent:' "$REPO/.beans/$1--"*.md 2>/dev/null | head -1 | awk '{print $2}'; }
+epic_inflight(){
+  local epic="$1" b; [ -n "$epic" ] || { echo 0; return; }
+  {
+    [ -d "$STATE/reviews" ] && ls "$STATE/reviews" 2>/dev/null | grep -v '^\.'
+    if [ -d "$STATE/approved" ]; then for f in "$STATE/approved"/*; do [ -e "$f" ] || continue; b="${f##*/}"; case "$b" in .*) continue;; esac; [ -f "$STATE/needs-land/$b" ] && continue; echo "$b"; done; fi
+    grep -hoE "$DROVER_BEAN_RE" "$TASKS"/* 2>/dev/null
+  } | sort -u | while read -r b; do [ -n "$b" ] || continue; [ "$(epic_of "$b")" = "$epic" ] && echo x; done | grep -c x
+}
+
+inventory_alert(){
+  # Alert on INVENTORY growth, not idle agents. Cheap: one rev-list of local main vs origin (undeployed
+  # commits), throttled 30m — the signal to run fleet-push. Also warns hourly on integrity drift (beans
+  # marked completed on main whose code isn't landed). Read-only.
+  local m="$STATE/last-invcheck" age=999
+  [ -f "$m" ] && age=$(( ( $(date +%s) - $(stat -f %m "$m" 2>/dev/null || echo 0) ) / 60 ))
+  [ "$age" -lt 30 ] && return 0
+  : > "$m"
+  local ahead cap; ahead=$(cd "$REPO" && git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)
+  cap=$(cat "$STATE/inventory-warn" 2>/dev/null); cap="${cap:-15}"
+  [ "${ahead:-0}" -ge "$cap" ] && log "INVENTORY WARN: local main $ahead commit(s) ahead of origin (undeployed) >= $cap — verify+push via fleet-push"
+  local cm="$STATE/last-completed-audit" cage=999
+  [ -f "$cm" ] && cage=$(( ( $(date +%s) - $(stat -f %m "$cm" 2>/dev/null || echo 0) ) / 60 ))
+  if [ "$cage" -ge 60 ]; then
+    : > "$cm"
+    local fc; fc=$("$DROVER_BIN"/fleet-completed-audit --count 2>/dev/null || echo 0)
+    ( "$DROVER_BIN"/fleet-completed-audit >/dev/null 2>&1 ) &   # refresh the cache off the tick
+    [ "${fc:-0}" -gt 0 ] && log "INTEGRITY WARN: $fc bean(s) 'completed' on main but code NOT landed — run fleet-completed-audit; reconcile (re-land or reopen)"
+  fi
+}
+
+heal_repo(){
+  # A reviewer/agent git op sometimes drifts $DROVER_REPO off main (a checkout in the SHARED checkout
+  # instead of the agent's own worktree), which idles the whole fleet: dispatch and auto_land both
+  # require main. Restore main ourselves when the tree carries cleanly; leave a real conflict for a
+  # human. Pin --git-dir/--work-tree so a stray core.worktree can't redirect the switch.
+  local base; base=$(git --git-dir="$REPO/.git" --work-tree="$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  [ "$base" = main ] && return 0
+  if git --git-dir="$REPO/.git" --work-tree="$REPO" switch main >/dev/null 2>&1; then
+    log "AUTO-HEALED \$DROVER_REPO from '$base' back to main"
+  else
+    log "REPO OFF MAIN (on '$base') — switch to main blocked (conflict/untracked); dispatch+land paused. Restore \$DROVER_REPO."
+  fi
+}
+
+# --- auto-land + auto-push (OPT-IN: DROVER_AUTOLAND=1) --------------------------------------
+# By default landing stays with the lead (drover's original stance). Set DROVER_AUTOLAND=1 and the
+# watcher lands APPROVED beans to LOCAL main via fleet-land-bean (isolated worktree, gated, ff-only,
+# never pushes), then pushes the green batch after the cumulative gate. Needs the gate commands:
+# DROVER_TYPECHECK/DROVER_TEST_CHANGED for the per-bean gate, DROVER_BUILD/DROVER_TEST_ALL for the push.
+auto_land(){
+  [ -f "$STATE/land-paused" ] && return 0     # set when the cumulative gate went red — stop stacking
+  [ -f "$STATE/finish-first" ] && return 0
+  [ "$(cd "$REPO" && git rev-parse --abbrev-ref HEAD 2>/dev/null)" = main ] || return 0
+  # BOUNDED: exactly ONE fleet-land-bean per tick under a lock (stale-reclaimed) so two never overlap
+  # and thrash the box. Newest approved first.
+  local LK="$STATE/.land-lock"
+  if ! mkdir "$LK" 2>/dev/null; then
+    local age=$(( $(date +%s) - $(stat -f %m "$LK" 2>/dev/null || echo 0) ))
+    [ "$age" -gt 1500 ] && { rmdir "$LK" 2>/dev/null; mkdir "$LK" 2>/dev/null || return 0; } || return 0
+  fi
+  local b bean=""
+  for b in $(ls -t "$STATE/approved" 2>/dev/null | grep -v '^\.'); do
+    [ -f "$STATE/needs-land/$b" ] && continue
+    bean="$b"; break
+  done
+  # BACKGROUND the land so a slow/hung fleet-land-bean can NEVER block the tick. The subshell releases
+  # the lock; if it hangs, the stale-reclaim frees it and the gate timeouts self-terminate.
+  if [ -n "$bean" ]; then
+    ( out=$("$DROVER_BIN"/fleet-land-bean "$bean" 2>&1 | tail -1); [ -n "$out" ] && log "AUTO-LAND $out"; rmdir "$LK" 2>/dev/null ) &
+  else
+    rmdir "$LK" 2>/dev/null
+  fi
+}
+auto_push(){
+  # Push local main to origin after a land. SAFE because the DEPLOY-BOUNDARY full-suite gate
+  # (fleet-verify-main) runs on a clean worktree first; on a cumulative RED we do NOT push and PAUSE
+  # landing so the red base can't cascade. Never force. Backgrounded under a push-lock.
+  [ -f "$STATE/land-paused" ] && return 0
+  [ "$(cd "$REPO" && git rev-parse --abbrev-ref HEAD 2>/dev/null)" = main ] || return 0
+  [ -d "$STATE/.land-lock" ] && return 0          # a land is mid-flight — let it finish first
+  local ahead; ahead=$(cd "$REPO" && git rev-list --count origin/main..HEAD 2>/dev/null)
+  [ "${ahead:-0}" -gt 0 ] || return 0
+  local PK="$STATE/.push-lock"
+  if ! mkdir "$PK" 2>/dev/null; then
+    local age=$(( $(date +%s) - $(stat -f %m "$PK" 2>/dev/null || echo 0) ))
+    [ "$age" -gt 600 ] && { rmdir "$PK" 2>/dev/null; mkdir "$PK" 2>/dev/null || return 0; } || return 0
+  fi
+  ( cd "$REPO"
+    if "$DROVER_BIN"/fleet-verify-main main >"$STATE/auto-push-verify.log" 2>&1; then
+      out=$(git push origin main 2>&1 | tail -4)
+      if printf '%s' "$out" | grep -q "main -> main"; then
+        printf '%s\tPUSHED\t%s\n' "$(date -u +%FT%TZ)" "$ahead" >> "$LEDGER" 2>/dev/null
+        log "AUTO-PUSH: $ahead commit(s) -> origin (full-suite green)"
+      else log "AUTO-PUSH held ($ahead ahead): $(printf '%s' "$out" | grep -iE 'refused|FAILED|rejected|non-fast' | head -1 | cut -c1-80)"; fi
+    else
+      : > "$STATE/land-paused"
+      log "AUTO-PUSH BLOCKED: cumulative full-suite RED ($ahead ahead) — landing PAUSED for triage ($STATE/auto-push-verify.log; rm state/land-paused after fix)"
+    fi
+    rmdir "$PK" 2>/dev/null ) &
+}
+
+tick(){ clear_dialogs; heal_repo; check_budget; h=$("$DROVER_BIN"/fleet-harvest-beans 2>/dev/null | grep "^harvested"); [ -n "$h" ] && log "HARVEST ${h:11:140}"; drain_inbox; retry_reviews; reap_tasks; seat_scan; owner_sync; sweep_guard; snapshot_wip; inventory_alert; yolo_guard; top_up_queue; refill
+  [ "${DROVER_AUTOLAND:-0}" = 1 ] && { auto_land; auto_push; }
   { echo "tick $(date '+%H:%M:%S')"; echo "queue: $(ls "$Q" 2>/dev/null | wc -l | tr -d ' ')"; "$DROVER_BIN"/fleet-track check 2>/dev/null | head -20; } > "$STATE/last" 2>/dev/null; }
 
 if [ "${1:-run}" = once ]; then tick; exit 0; fi

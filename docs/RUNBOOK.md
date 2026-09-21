@@ -68,7 +68,25 @@ spends no turns — until that prompt arrives.**
 6. Push. Then verify the deployment that push started reached success — "pushed" is not "shipped". A rollback
    means reading the new instances' startup logs.
 
+## Automated landing (opt-in: `DROVER_AUTOLAND=1`)
+The six manual steps above are exactly what `fleet-land-bean` + `fleet-verify-main` + `fleet-push` do, and
+`fleet-watch` runs them once per tick when `DROVER_AUTOLAND=1`:
+- `fleet-land-bean <bean>` cherry-picks the bean's own branch in an ISOLATED scratch worktree (never the shared
+  checkout), takes theirs on bean-file conflicts, refuses any code conflict (→ `state/needs-land/<bean>` for a
+  human), runs the per-bean gate (`DROVER_TYPECHECK`, `DROVER_TEST_CHANGED`), and fast-forwards LOCAL main.
+  It never pushes and never resolves a code conflict — same rules as by hand.
+- `fleet-verify-main` is the cumulative gate the manual steps lack a name for: full `DROVER_BUILD` +
+  `DROVER_TEST_ALL` on a CLEAN worktree at main HEAD, so a batch of isolation-green beans can't ship a
+  combined red. `fleet-push` runs it and pushes only on green; a red sets `state/land-paused` (landing stops
+  until you `rm` it after the fix).
+- A bean that can't land clean flags itself under `state/needs-land/<bean>`; clear the flag after you fix it.
+- The deletion gate (step 4) is NOT yet in the script — keep running it by hand on anything the audit flags.
+- Migrations are still never applied automatically. Autoland lands and pushes code; the migration steps stay yours.
+
 ## Cadence
+- Read the board with `fleet-scoreboard`: landed/pushed today, approved-awaiting-land, in-review, and
+  `fleet-completed-audit`'s count of beans `completed` on main whose code isn't landed. Low landed while
+  inventory climbs = the bottleneck is integration, not capacity.
 - Standup by artifact at every landing and at least hourly: landings on origin AND in production, in review,
   coding, what is blocked on the human. Write it to `<reports>/standup-<HHMM>.md`. `fleet-standup-auto` writes an
   hourly fallback while tasks exist; it is a floor, not a standup.

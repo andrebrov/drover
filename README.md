@@ -56,13 +56,18 @@ minute; and each of those failures now has a guard (a spend cap, a no-op detecto
    |        |   CHANGES -> followup to the coder, ahead of anything in the queue --+
    |        |   APPROVE -> state/approved/<bean>: held out of the queue           |
    |        v                                                                     |
-   |   LEAD lands: cherry-pick, build, deletion gate, merge, ancestry check,      |
-   |               push, deployment check                                         |
+   |   LAND  the lead — or, with DROVER_AUTOLAND=1, fleet-land-bean:              |
+   |        cherry-pick the bean's own branch into an ISOLATED worktree,          |
+   |        gate (typecheck + related tests), fast-forward LOCAL main. Then       |
+   |        fleet-verify-main (full build+suite on a clean tree) -> push origin.  |
    +--------------------------------------------------------------- coder <------+
 ```
 
-Landing stays with the human lead. That is a rule, not a gap: the lead is the only party that re-verifies
-against current main, runs migrations, and pushes.
+By default landing stays with the human lead — the only party that re-verifies against current main, runs
+migrations, and pushes. Set `DROVER_AUTOLAND=1` and the watcher does it: `fleet-land-bean` lands each
+approved bean to LOCAL main behind a fast per-bean gate, and `fleet-verify-main` runs the full suite on a
+clean worktree before `fleet-push` sends the green batch to origin. A cumulative red pauses landing
+(`state/land-paused`) so one bad merge can't cascade. Migrations are still never applied automatically.
 
 ## What one watcher tick does
 
@@ -83,11 +88,17 @@ against current main, runs migrations, and pushes.
    silent past 45 min for a reviewer / 90 min for a coder). A `working` or `blocked` seat is never reaped.
 7. **Seat scan** (optional, TypeSafe) — every 10 minutes, read seats that have held a task for 20+ minutes.
 8. **Owner sync** — record which coder owns each bean; flag any bean held by two coders.
-9. **Sweep** (every 6 h), **WIP snapshot** (every 20 min), **yolo guard** (every 5 min).
-10. **Top up the queue** from `beans list --ready` when it is empty (sprint keywords first, then priority).
+9. **Sweep** (every 6 h), **WIP snapshot** (every 20 min), **inventory alert** (every 30 min: undeployed
+   commits and integrity drift), **yolo guard** (every 5 min). **heal_repo** at the top of every tick
+   restores `$DROVER_REPO` to main if an agent op drifted it off (otherwise the whole fleet idles).
+10. **Top up the queue** from `beans list --ready` when it is empty (sprint keywords first, then priority) —
+    unless the WIP cap is reached (see Guardrails): backpressure stops starting NEW beans while the
+    integration backlog is full.
 11. **Refill** every free coder: a followup beats the queue; then the next queued bean, after re-checking it
-    is on main, still ready, not owned by another coder, not awaiting review or landing, and that the seat is
-    not credit-dead.
+    is on main, still ready, not owned by another coder, not awaiting review or landing, within the epic
+    train cap, and that the seat is not credit-dead.
+12. **Land + push** (only with `DROVER_AUTOLAND=1`) — one approved bean per tick to LOCAL main via
+    `fleet-land-bean`, then the cumulative gate + push via `fleet-verify-main`; a red pauses landing.
 
 `state/last` holds a one-screen summary of the latest tick; `watch/watch.log` has every decision with a
 one-word tag (ROUTED, DISPATCH, FOLLOWUP, PARTIAL, SKIP, STALE, BUDGET, APPROVED, NO-OP, SEAT, …).
@@ -96,6 +107,12 @@ one-word tag (ROUTED, DISPATCH, FOLLOWUP, PARTIAL, SKIP, STALE, BUDGET, APPROVED
 
 | Guard | What it stops | Where |
 |---|---|---|
+| WIP cap / backpressure | Without it, the watcher is an open-loop dispatch pump: measured over 2 days, 12,240 dispatches vs 195 land attempts (~60:1) — 700+ branches that were inventory, not progress. At or over the cap (`state/wip-cap`, default 6), NO new beans start; followups and landing still flow, so the backlog drains before more work piles on. | `wip_count`, `top_up_queue`, `refill` |
+| Epic train cap | Spraying one epic across many parallel beans on shared files is a merge-conflict lottery. Cap in-flight beans per parent epic (`state/epic-cap`, default 2) so a roadmap advances as a sequenced train. | `epic_inflight`, `refill` |
+| Merge-queue land gate | A per-bean land gates each bean against the main it forks from; the cumulative main can still break when the batch combines. `fleet-verify-main` runs the full build+suite on a CLEAN worktree at main HEAD before any push; a red pauses landing (`state/land-paused`). | `fleet-land-bean`, `fleet-verify-main`, `fleet-push` |
+| Integration integrity | A reset/revert can leave a bean marked `completed` on main while its code is gone. `fleet-completed-audit` finds beans completed-on-main whose branch still has unlanded code; the watcher warns hourly. | `fleet-completed-audit`, `inventory_alert` |
+| Repo-off-main heal | An agent git op in the shared checkout can drift `$DROVER_REPO` off main, which idles the whole fleet (dispatch and land both require main). `heal_repo` switches it back when the tree carries cleanly; a real conflict is left for a human. | `heal_repo` |
+| Stale-owner release | An owner marker on an idle seat's empty branch (or a recovery-set marker on a real branch not in the pipeline) would block re-dispatch forever. Released at 30/45 min; lead-owned markers expire at 24 h. | `owner_sync` |
 | Spend cap | `opencode_daily_usd` in `~/.config/drover/caps`, re-read every tick. At or over the cap: no new opencode dispatches or reviews; running work finishes. Optional `active_from` date. | `fleet-watch` `spend_guard` |
 | Credit-dead seats | A seat out of credits accepts a prompt, shows `working`, and does nothing. Both dispatch and review paths read the pane first; a 30-minute marker stops re-reading a dead seat every tick. | `fleet-watch`, `fleet-budget` |
 | One bean, one coder | A bean belongs to its first coder. Another coder gets it only if the owner is missing, credit-dead or silent for 72 h — logged. Two coders on one bean is flagged for the lead. | `owner_blocks`, `owner_sync` |
@@ -171,6 +188,11 @@ scripts call each other by absolute path, so only your interactive shell is affe
 |---|---|
 | `fleet` | Roster, spawn (`up`), `assign`, `review`, `followup`, `land`, `sync`, `rules`, `models`, `usage`, `stale`, and pane helpers (`read`, `keys`, `wait`, `cancel`, `blocked`). `fleet --help`, and `--dry-run` on every mutating verb. |
 | `fleet-watch` | The loop. `run`, `once`, `enqueue <bean>`, `queue`. |
+| `fleet-land-bean` | Land ONE approved bean to LOCAL main: cherry-pick its own branch in an isolated worktree, gate, ff-only. Never pushes. Used by auto-land; run by hand too. |
+| `fleet-verify-main` | The cumulative merge-queue gate: full build+suite on a clean detached worktree at a ref. Exit 0 = safe to push. |
+| `fleet-push` | The only sanctioned push: runs `fleet-verify-main`, pushes local main to origin only if green. Never force. |
+| `fleet-scoreboard` | What shipped vs what's stuck: landed/pushed today, approved-awaiting-land, in-review, integrity drift. The metric that isn't utilization. |
+| `fleet-completed-audit` | List beans `completed` on main whose code isn't actually landed. `--count` for the cached number. |
 | `fleet-done` | What an agent runs when it finishes. The only way the fleet learns about it. |
 | `fleet-wait` | Block until an agent announces (for a lead working without the watcher). |
 | `fleet-track` | Judge seats by artifacts: commits since dispatch and report presence. |
@@ -198,8 +220,12 @@ values as `${VAR:-value}` so an environment variable still wins. See [`examples/
 |---|---|---|
 | `DROVER_REPO` | — (required) | Main checkout of the project. Landings and bean checks happen here. |
 | `DROVER_ROSTER` | 3 coders + 3 reviewers on claude/codex/opencode | `name:harness` pairs. Role = last word of the name. |
-| `DROVER_BUILD`, `DROVER_TEST` | empty | Build and single-test commands quoted into coder and reviewer briefs. |
-| `DROVER_CLONE_DIRS` | `node_modules` | Dirs APFS-cloned into a fresh worktree. |
+| `DROVER_BUILD`, `DROVER_TEST` | empty | Build and single-test commands quoted into coder and reviewer briefs. `DROVER_BUILD` is also the build half of the cumulative push gate. |
+| `DROVER_AUTOLAND` | `0` | `1` lets the watcher land approved beans and push green batches. Off = landing stays with the lead. |
+| `DROVER_TYPECHECK`, `DROVER_TEST_CHANGED` | empty | Per-bean land gate: a fast typecheck, and tests for the changed files (`$CHANGED`). Empty = that gate is skipped. |
+| `DROVER_TEST_ALL` | empty | Full suite for the cumulative push gate (`fleet-verify-main`). Empty + empty `DROVER_BUILD` = the gate refuses to green-light a push. |
+| `DROVER_CODE_PATHS` | empty (any non-bean file) | `fleet-completed-audit`: ERE of paths that count as code. |
+| `DROVER_CLONE_DIRS` | `node_modules` | Dirs APFS-cloned into a fresh worktree; also symlinked into land/verify scratch worktrees. |
 | `DROVER_COPY_FILES` | `.env` | Untracked files copied into a fresh worktree. |
 | `DROVER_QUEUE_KEYWORDS` | empty | Ready beans matching these words are queued first. |
 | `DROVER_GENERATED` | empty | ERE of generated paths `fleet-claim` refuses to claim. |
@@ -229,7 +255,8 @@ hours, why a test that needs no input from the system is documentation. The agen
 - **Built for one person's fleet.** Roles are inferred from seat names, harness quirks (dialog texts, credit
   banners, resume flags) are the ones that fleet met, and the prompts assume the target repo has its own agent
   rules (CLAUDE.md / AGENTS.md). Expect to read the scripts.
-- **Landing is manual on purpose.** drover routes work to "approved"; a human lead lands it.
+- **Landing is manual by default.** drover routes work to "approved"; a human lead lands it. `DROVER_AUTOLAND=1`
+  automates landing + push behind the gates above, but it never applies migrations and it pauses on a red suite.
 - **Seats run with approval prompts bypassed.** That is the only way agents run unattended; it is also why
   worktrees, snapshots, and the never-push / never-migrate rules exist. Run it on a machine and a repository
   where that is acceptable.

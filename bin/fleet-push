@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# fleet-push — the ONLY sanctioned way to push local main. Runs the cumulative merge-queue gate
+# (fleet-verify-main: build+test on a clean worktree at main HEAD) and pushes to origin ONLY if green.
+# Never force. Whatever your push triggers (CI, a deploy) follows the push. Skip the gate with
+# FLEET_PUSH_FORCE=1 only for a known-green tree the gate can't reach (e.g. an infra-only change).
+set -u
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+REPO="${DROVER_REPO:?set DROVER_REPO}"; LEDGER="$FLEET_LEDGER"; mkdir -p "$(dirname "$LEDGER")"
+[ "$(git -C "$REPO" rev-parse --abbrev-ref HEAD)" = main ] || { echo "fleet-push: \$DROVER_REPO not on main"; exit 1; }
+ahead=$(git -C "$REPO" rev-list --count origin/main..HEAD 2>/dev/null)
+[ "${ahead:-0}" -gt 0 ] || { echo "fleet-push: nothing to push (0 ahead of origin)"; exit 0; }
+echo "fleet-push: $ahead commit(s) ahead of origin/main"
+if [ "${FLEET_PUSH_FORCE:-0}" != 1 ]; then
+  "$DROVER_BIN"/fleet-verify-main main || { echo "fleet-push: cumulative gate RED — not pushing"; exit 1; }
+else
+  echo "fleet-push: FLEET_PUSH_FORCE=1 — skipping cumulative gate"
+fi
+if git -C "$REPO" push origin main; then
+  printf '%s\tPUSHED\t%s\n' "$(date -u +%FT%TZ)" "$ahead" >> "$LEDGER" 2>/dev/null
+  echo "fleet-push: pushed $ahead commit(s)"
+else
+  echo "fleet-push: push failed (hook or remote)"; exit 1
+fi

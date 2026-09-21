@@ -17,6 +17,17 @@ DROVER_LEAD_SEATS="${DROVER_LEAD_SEATS:-lead lead-backup}"
 DROVER_BUILD="${DROVER_BUILD:-}"          # e.g. 'npm run build' or 'cd backend && npm run build'
 DROVER_TEST="${DROVER_TEST:-}"            # e.g. 'npx jest <file>' — how to run one test file
 
+# Automated landing (OPT-IN). Default 0: landing stays with the lead. Set to 1 and fleet-watch lands
+# APPROVED beans to LOCAL main (fleet-land-bean: isolated worktree, gated, ff-only, never pushes), then
+# pushes the green batch (fleet-push / fleet-verify-main). The gates below drive it; empty = skip a gate.
+DROVER_AUTOLAND="${DROVER_AUTOLAND:-0}"
+DROVER_TYPECHECK="${DROVER_TYPECHECK:-}"        # per-bean fast gate, e.g. 'npx tsc --noEmit'  (empty = skip)
+DROVER_TEST_CHANGED="${DROVER_TEST_CHANGED:-}"  # per-bean tests for the changed files; $CHANGED = the paths,
+                                                # e.g. 'npx jest --findRelatedTests $CHANGED --passWithNoTests --silent'
+DROVER_TEST_ALL="${DROVER_TEST_ALL:-}"          # cumulative push gate (full suite on a clean worktree at main
+                                                # HEAD, with DROVER_BUILD), e.g. 'cd backend && npx jest --forceExit'
+DROVER_CODE_PATHS="${DROVER_CODE_PATHS:-}"      # fleet-completed-audit: ERE of code paths (empty = any non-bean file)
+
 # Fresh worktree bootstrap: dependency dirs APFS-cloned from DROVER_REPO, and untracked files copied.
 DROVER_CLONE_DIRS="${DROVER_CLONE_DIRS:-node_modules}"   # space-separated, relative to the repo root
 DROVER_COPY_FILES="${DROVER_COPY_FILES:-.env}"           # space-separated; stays on this machine

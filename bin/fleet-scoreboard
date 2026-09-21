@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# fleet-scoreboard — the metric that matters: roadmap increments LANDED and PUSHED, and the
+# INVENTORY not yet integrated — NOT dispatch/utilization (vanity: a busy fleet with a red or
+# unpushed main shipped nothing). Reads the landing ledger (fleet-land-bean / fleet-push) + git +
+# fleet state. Read-only.
+set -u
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+REPO="${DROVER_REPO:?set DROVER_REPO}"; STATE="$FLEET_STATE"; LEDGER="$FLEET_LEDGER"
+mkdir -p "$(dirname "$LEDGER")"; [ -f "$LEDGER" ] || : > "$LEDGER"   # exists -> grep -c prints a single count
+today=$(date -u +%F)
+# no `|| echo 0`: with the file present grep -c already prints exactly one integer (grep -c exits 1 on
+# zero matches, so `|| echo 0` would append a SECOND 0).
+landed=$(grep -c "^${today}T.*	LANDED	" "$LEDGER"); landed=${landed:-0}
+flagged=$(grep -c "^${today}T.*	FLAGGED	" "$LEDGER"); flagged=${flagged:-0}
+pushes=$(grep -c "^${today}T.*	PUSHED	" "$LEDGER"); pushes=${pushes:-0}
+deployed=$(awk -F'\t' -v d="$today" '$1 ~ ("^" d "T") && $2=="PUSHED"{n+=$3} END{print n+0}' "$LEDGER")
+succ="n/a"; tot=$((landed+flagged)); [ "$tot" -gt 0 ] && succ="$(( landed*100/tot ))%"
+ahead=$(git -C "$REPO" rev-list --count origin/main..HEAD 2>/dev/null); ahead=${ahead:-?}
+brahead=0
+for b in $(git -C "$REPO" for-each-ref --format='%(refname:short)' 'refs/heads/fleet/*' 2>/dev/null); do
+  [ "$(git -C "$REPO" rev-list --count origin/main.."$b" 2>/dev/null)" -gt 0 ] 2>/dev/null && brahead=$((brahead+1))
+done
+approved=0
+if [ -d "$STATE/approved" ]; then
+  for f in "$STATE/approved"/*; do [ -e "$f" ] || continue; case "${f##*/}" in .*) continue;; esac; [ -f "$STATE/needs-land/${f##*/}" ] || approved=$((approved+1)); done
+fi
+needsland=$(ls "$STATE/needs-land" 2>/dev/null | grep -c .); needsland=${needsland:-0}
+reviews=$(ls "$STATE/reviews" 2>/dev/null | grep -vc '^\.'); reviews=${reviews:-0}
+
+echo "FLEET SCOREBOARD — $today (UTC)"
+echo "  SHIPPED today   landed->local main: $landed   pushed(deploys): $pushes   commits deployed: $deployed"
+echo "  integration     success rate: $succ   (landed $landed / flagged $flagged)"
+echo "  INVENTORY now   local main unpushed: $ahead   approved awaiting-land: $approved   in-review: $reviews"
+echo "                  flagged (needs manual fix): $needsland   fleet branches ahead of origin: $brahead"
+fc=$("$DROVER_BIN"/fleet-completed-audit --count 2>/dev/null); fc=${fc:-?}
+echo "  INTEGRITY       beans 'completed' on main but code NOT landed: $fc   (run fleet-completed-audit for the list)"
+echo "  Read: low landed/pushed while inventory climbs => bottleneck is INTEGRATION, not capacity."

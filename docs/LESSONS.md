@@ -555,3 +555,43 @@ Each of these is a comment next to the code in `bin/fleet-watch`; collected here
 - **Memory** (2026-09-02): 168 node processes (47 GB) plus 16 MCP servers at ~2 GB each put a 128 GB machine at
   183 MB free every day for a week until the kernel watchdog panicked it. `fleet stale` finds orphans (pane gone),
   leftovers (dev/test processes under an idle agent) and heavy processes.
+
+## Backpressure and the merge queue (2026-09-21)
+
+The fleet spent two days busy and shipped almost nothing. The roadmap did not move; the time went to
+worktree sync and conflict repair. The cause was structural, and three lessons came out of the fix.
+
+- **A dispatch loop with no brake is an inventory machine, not a delivery machine.** Measured over two
+  days from the ledger: **12,240 dispatches against 195 land attempts (~60:1)**. The 700+ open branches
+  were not progress — they were unintegrated inventory that went stale against a moving main and collided
+  with each other. The fix is backpressure: cap NEW dispatch to the *integration backlog* (approved-but-
+  unlanded + in-review + coders mid-bean), not to free seats. When the backlog is at cap, start no new
+  beans; let followups and landing drain it first. Utilization is a vanity metric — a fully-busy fleet
+  with a red or unpushed main shipped zero. Measure landed and pushed (`fleet-scoreboard`), not dispatch.
+
+- **Isolation-green is not combined-green.** A per-bean land gates each bean against the main it forked
+  from; it cannot see what a *sibling* bean landed in between. A batch of individually-green beans broke
+  when their trees combined. A merge queue needs a second gate the per-bean gate cannot be: the full
+  build + suite on a CLEAN worktree at main's *current* HEAD, run before anything reaches origin. A red
+  there pauses landing so the bad base can't cascade into more lands. `fleet-verify-main` is that gate;
+  it runs on a clean detached worktree precisely so untracked debris in the shared checkout can neither
+  hide a failure nor false-fail it.
+
+- **`completed` must mean landed, and nothing was checking.** The fleet only marks a bean completed on a
+  successful land — but a later reset, revert, or failed cumulative land removes the code from main and
+  leaves the bean `completed`. Nothing reconciled bean status when code left main. `fleet-completed-audit`
+  makes the equivalence a continuous check: a bean completed-on-main whose branch still carries unlanded
+  code is drift, surfaced hourly, reconciled by re-landing or reopening. A status field that can silently
+  disagree with the tree is not a source of truth until something audits it against the tree.
+
+Two smaller ones from building the gates:
+
+- **A gate's timeout must exceed the COLD case, not the warm one.** A 150 s typecheck timeout killed a
+  cold full-project typecheck in a fresh worktree (no warm cache) and reported "typecheck failed" on
+  perfectly good fixes — an empty log is the tell. Size every gate timeout to the worst case it will
+  actually meet, then verify by watching it run once cold.
+
+- **A flagged item must leave the "ready" set, or it clogs the queue.** When a bean failed to land it was
+  flagged for manual fix but kept its `approved` marker. That made it a zombie: the dispatcher skipped it
+  (approved) and the lander skipped it (flagged), so it sat forever in the skip-list while coders starved.
+  Whatever marks work as failed must also clear whatever marks it as ready.

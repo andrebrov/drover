@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# fleet-completed-audit — catches beans marked `completed` on main whose CODE is not actually landed.
+#
+# This drift is NOT premature completion: the fleet only marks a bean completed on a successful land
+# (fleet-land-bean). It comes from a later reset/revert/failed cumulative land that removes the code
+# from main but leaves the bean `completed`. Nothing else reconciles bean status when code leaves
+# main; this does. Read-only — it never changes bean status (reconcile is a separate, human action).
+#
+# Signal: a bean is `completed` on origin/main AND some fleet branch for it has git-cherry '+' commits
+# (not in origin/main by patch-id) that touch real code. "Code" = any tracked file outside .beans/,
+# or the paths matching DROVER_CODE_PATHS (an ERE) when you set it. Writes the list + a cached count.
+#
+#   fleet-completed-audit           print the falsely-completed list + count, refresh the cache
+#   fleet-completed-audit --count   print just the cached count (cheap; for the scoreboard)
+set -u
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+REPO="${DROVER_REPO:?set DROVER_REPO}"; STATE="$FLEET_STATE"; mkdir -p "$STATE"
+CACHE="$STATE/completed-audit"
+CODE_RE="${DROVER_CODE_PATHS:-}"
+if [ "${1:-}" = --count ]; then sed -n '1p' "$CACHE" 2>/dev/null; exit 0; fi
+cd "$REPO" || exit 1
+out=$(mktemp)
+git ls-tree -r --name-only origin/main -- .beans 2>/dev/null | while read -r bf; do
+  bean=$(printf '%s' "$bf" | grep -oE "$DROVER_BEAN_RE" | head -1); [ -n "$bean" ] || continue
+  [ "$(git show "origin/main:$bf" 2>/dev/null | sed -n 's/^status: //p' | head -1)" = completed ] || continue
+  for b in $(git for-each-ref --format='%(refname:short)' "refs/heads/fleet/*-$bean" 2>/dev/null); do
+    hit=$(git cherry origin/main "$b" 2>/dev/null | awk '/^\+/{print $2}' | while read -r c; do
+      files=$(git show --name-only --format= "$c" 2>/dev/null)
+      if [ -n "$CODE_RE" ]; then
+        printf '%s\n' "$files" | grep -qE "$CODE_RE" && { echo x; break; }
+      else
+        # any changed path that is not a bean file and not blank = code not landed
+        printf '%s\n' "$files" | grep -qvE '^(\.beans/|$)' && { echo x; break; }
+      fi
+    done)
+    [ -n "$hit" ] && { echo "$bean :: $b"; break; }
+  done
+done | sort -u > "$out"
+n=$(grep -c . "$out")
+{ echo "$n"; date -u +%FT%TZ; cat "$out"; } > "$CACHE"
+echo "falsely-completed (completed on main, code not landed): $n"
+cat "$out"
+rm -f "$out"

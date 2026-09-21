@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# fleet-land-bean <bean> — land ONE approved bean to LOCAL main by cherry-picking the bean's own
+# branch (fleet/<coder>-<bean>), NOT the bare fleet/<coder>. Fail-safe: cherry-picks in an ISOLATED
+# scratch worktree; real main is fast-forwarded ONLY if the cherry-pick is clean AND the gates pass.
+# NEVER pushes (deploy stays a human step or fleet-push). Anything that conflicts or fails is left for
+# manual landing under state/needs-land. Local commit only.
+#
+# git isolation: MAIN() acts on the repo checkout (branch main); WT() acts on the scratch worktree's
+# OWN HEAD. NEVER pass --git-dir with -C <worktree> — it overrides the worktree and hits main.
+#
+# Gates (all optional; set in ~/.config/drover/config; empty = skipped):
+#   DROVER_TYPECHECK     fast per-bean typecheck, run at the worktree root     (e.g. 'npx tsc --noEmit')
+#   DROVER_TEST_CHANGED  per-bean tests for the changed files, with $CHANGED = the space-separated
+#                        paths                (e.g. 'npx jest --findRelatedTests $CHANGED --passWithNoTests')
+# The FULL cumulative suite runs at the push boundary (fleet-verify-main), not here — so lands stay
+# fast and a coder never starves behind a serial full-suite.
+set -u
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+REPO="${DROVER_REPO:?set DROVER_REPO}"; STATE="$FLEET_STATE"; LEDGER="$FLEET_LEDGER"
+MAIN(){ git -C "$REPO" "$@"; }
+bean="${1:-}"; [ -n "$bean" ] || { echo "usage: fleet-land-bean <bean>"; exit 2; }
+mkdir -p "$STATE/needs-land" "$(dirname "$LEDGER")"
+ledger(){ printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$1" "$bean" >> "$LEDGER" 2>/dev/null; }
+# clear the approved marker on flag: a flagged bean is NOT cleanly-approved-to-land — it needs a
+# fix/rebase. Leaving approved set makes it an APPROVED-ZOMBIE that top_up skips (approved) AND
+# auto_land skips (needs-land) forever, clogging the queue and starving coders.
+flag(){ echo "$1" > "$STATE/needs-land/$bean"; rm -f "$STATE/approved/$bean"; ledger FLAGGED; echo "SKIP $bean — $1"; }
+
+[ "$(MAIN rev-parse --abbrev-ref HEAD 2>/dev/null)" = main ] || { flag "repo not on main"; exit 1; }
+
+# resolve the bean's branch: prefer the owner's, else the unique one
+owner=$(cat "$STATE/owner/$bean" 2>/dev/null | tr -d '[:space:]')
+br=""
+if [ -n "$owner" ] && MAIN show-ref -q "refs/heads/fleet/${owner}-${bean}"; then
+  br="fleet/${owner}-${bean}"
+else
+  matches=$(MAIN for-each-ref --format='%(refname:short)' "refs/heads/fleet/*-${bean}" 2>/dev/null)
+  cnt=$(printf '%s\n' "$matches" | grep -c .)
+  if [ "$cnt" -eq 1 ]; then br="$matches"
+  elif [ "$cnt" -gt 1 ]; then flag "ambiguous branch ($cnt matches) — set owner marker"; exit 1; fi
+fi
+[ -n "$br" ] || { flag "no fleet branch for $bean"; exit 1; }
+
+# the bean's own commits = main..br. Cherry-pick only NON-merge work commits (branches that merged main
+# carry merge commits that just re-bring main, already on main). Refuse a stale/huge branch.
+picks=$(MAIN rev-list --reverse --no-merges "main..$br" 2>/dev/null)
+if [ -z "$picks" ]; then
+  flag "nothing ahead of main on $br (already landed?)"
+  MAIN update-ref -d "refs/heads/$br" 2>/dev/null; rm -f "$STATE/approved/$bean"
+  ( cd "$REPO" && beans update "$bean" -s completed >/dev/null 2>&1 )
+  echo "note: $bean had no new commits — cleared approved marker"; exit 0
+fi
+n_picks=$(printf '%s\n' "$picks" | grep -c .)
+[ "$n_picks" -gt 40 ] && { flag "$n_picks commits ahead — stale branch, land manually"; exit 1; }
+
+# ISOLATED scratch worktree at current main; cherry-pick there. WT() = the worktree's own HEAD.
+wt="$STATE/land-wt/$bean.$$"
+rm -rf "$wt"; mkdir -p "$(dirname "$wt")"
+MAIN worktree add -q --detach "$wt" main || { flag "worktree add failed"; exit 1; }
+WT(){ git -C "$wt" "$@"; }
+cleanup(){ WT cherry-pick --abort 2>/dev/null; MAIN worktree remove --force "$wt" 2>/dev/null; rm -rf "$wt"; }
+
+for c in $picks; do   # SHAs are single tokens — word-splitting is safe here
+  if ! WT cherry-pick -x "$c" 2>/dev/null; then
+    # a conflict only in bean files is safe to take --theirs; a conflict in any other file is a manual land
+    nonbean=0
+    while IFS= read -r f; do [ -n "$f" ] || continue; case "$f" in .beans/*) ;; *) nonbean=$((nonbean+1));; esac; done < <(WT diff --name-only --diff-filter=U)
+    any=$(WT diff --name-only --diff-filter=U | grep -c .)
+    if [ "$any" -gt 0 ] && [ "$nonbean" -eq 0 ]; then
+      while IFS= read -r f; do [ -n "$f" ] || continue; WT checkout --theirs -- "$f" 2>/dev/null; WT add -- "$f"; done < <(WT diff --name-only --diff-filter=U)
+      WT cherry-pick --continue --no-edit >/dev/null 2>&1 || { cleanup; flag "cherry-pick $c stuck after bean resolve"; exit 1; }
+    else
+      cleanup; flag "content conflict on ${c:0:9} — manual land"; exit 1
+    fi
+  fi
+done
+tip=$(WT rev-parse HEAD)
+diffnames=$(WT diff --name-only main "$tip")
+
+# a fresh worktree has no deps; symlink the repo's installed ones so a typecheck/test resolves imports
+for d in ${DROVER_CLONE_DIRS:-node_modules}; do
+  [ -e "$wt/$d" ] || { mkdir -p "$(dirname "$wt/$d")" 2>/dev/null; ln -s "$REPO/$d" "$wt/$d" 2>/dev/null; }
+done
+
+changed_args=""
+run_gate(){  # $1=cmd  $2=log-tag  $3=timeout-seconds ; runs in $wt with $CHANGED exported. A hung gate
+             # must never wedge the caller, so it runs backgrounded under a hard kill.
+  ( cd "$wt" && CHANGED="$changed_args" sh -c "$1" ) >"$STATE/land-$bean-$2.log" 2>&1 &
+  local p=$!; ( sleep "$3"; kill -9 "$p" 2>/dev/null ) & local w=$!
+  wait "$p" 2>/dev/null; local rc=$?; kill "$w" 2>/dev/null; return $rc
+}
+
+if [ -n "${DROVER_TYPECHECK:-}" ]; then
+  run_gate "$DROVER_TYPECHECK" tc "${DROVER_TYPECHECK_TIMEOUT:-400}" || { cleanup; flag "typecheck failed on cherry-pick — manual land ($STATE/land-$bean-tc.log)"; exit 1; }
+fi
+if [ -n "${DROVER_TEST_CHANGED:-}" ]; then
+  changed_args=$(printf '%s\n' "$diffnames" | tr '\n' ' ')
+  run_gate "$DROVER_TEST_CHANGED" test "${DROVER_TEST_TIMEOUT:-420}" || { cleanup; flag "related tests failed on cherry-pick — manual land ($STATE/land-$bean-test.log)"; exit 1; }
+fi
+
+if [ "${FLEET_LAND_DRY:-0}" = 1 ]; then
+  cleanup; echo "DRY $bean via $br ($n_picks commit) — clean cherry-pick, gates OK; would ff main to ${tip:0:9} (no write)"; exit 0
+fi
+# advance LOCAL main by fast-forward only (never a merge, never a push). Serial caller avoids races.
+if ! MAIN merge --ff-only "$tip" 2>"$STATE/land-$bean-ff.log"; then cleanup; flag "main moved; ff-only failed — retry"; exit 1; fi
+cleanup; rm -f "$STATE/needs-land/$bean"
+( cd "$REPO" && beans update "$bean" -s completed >/dev/null 2>&1 )
+rm -f "$STATE/approved/$bean" "$STATE/owner/$bean"
+ledger LANDED
+echo "LANDED $bean via $br ($n_picks commit) -> local main $(MAIN rev-parse --short HEAD); NOT pushed"
