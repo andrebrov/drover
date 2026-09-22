@@ -676,18 +676,23 @@ auto_push(){
   local PK="$STATE/.push-lock"
   if ! mkdir "$PK" 2>/dev/null; then
     local age=$(( $(date +%s) - $(stat -f %m "$PK" 2>/dev/null || echo 0) ))
-    [ "$age" -gt 600 ] && { rmdir "$PK" 2>/dev/null; mkdir "$PK" 2>/dev/null || return 0; } || return 0
+    [ "$age" -gt 1800 ] && { rmdir "$PK" 2>/dev/null; mkdir "$PK" 2>/dev/null || return 0; } || return 0  # >30m: a full-suite verify at load runs 12m+; 600s stole the push-lock mid-verify and forced a redundant second gate
   fi
   ( cd "$REPO"
-    if "$DROVER_BIN"/fleet-verify-main main >"$STATE/auto-push-verify.log" 2>&1; then
+    "$DROVER_BIN"/fleet-verify-main main >"$STATE/auto-push-verify.log" 2>&1; vrc=$?
+    if [ "$vrc" -eq 0 ]; then
       out=$(git push origin main 2>&1 | tail -4)
       if printf '%s' "$out" | grep -q "main -> main"; then
         printf '%s\tPUSHED\t%s\n' "$(date -u +%FT%TZ)" "$ahead" >> "$LEDGER" 2>/dev/null
         log "AUTO-PUSH: $ahead commit(s) -> origin (full-suite green)"
       else log "AUTO-PUSH held ($ahead ahead): $(printf '%s' "$out" | grep -iE 'refused|FAILED|rejected|non-fast' | head -1 | cut -c1-80)"; fi
+    elif [ "$vrc" -eq 3 ]; then
+      # exit 3 = the gate's single-flight lock: another verify is already running. This is BUSY, not
+      # RED — defer to the next tick, do NOT pause landing. Mis-reading it as RED froze the whole fleet.
+      log "AUTO-PUSH deferred ($ahead ahead): another gate is running (verify busy) — retry next tick, NOT a RED"
     else
       : > "$STATE/land-paused"
-      log "AUTO-PUSH BLOCKED: cumulative full-suite RED ($ahead ahead) — landing PAUSED for triage ($STATE/auto-push-verify.log; rm state/land-paused after fix)"
+      log "AUTO-PUSH BLOCKED: cumulative full-suite RED (rc=$vrc, $ahead ahead) — landing PAUSED for triage ($STATE/auto-push-verify.log; rm state/land-paused after fix)"
     fi
     rmdir "$PK" 2>/dev/null ) &
 }

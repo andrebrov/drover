@@ -651,3 +651,16 @@ Also fixed the watchdog's own log-open race: the poll did `wc -c < test.log` bef
 suite's redirect had created the file, printing a spurious "no such file" each poll. Pre-create the
 log (`: > test.log`) before launching. **Metric (fails if >0):** concurrent live instances of any one
 gate script (`pgrep -f fleet-verify-main | wc -l` > 1, same for `fleet-land-bean`).
+
+**And the lock introduced a regression in its caller — a new exit code needs new handling.** After the
+lock shipped, `auto_push` began PAUSING landing spuriously. Its logic was `if fleet-verify-main main;
+then push; else pause-and-flag-RED`. The lock makes the gate exit **3** ("another verify is running")
+— which is *busy*, not *red* — and the `else` swallowed it into the RED path, so a second `auto_push`
+that merely collided with a still-running verify paused the whole fleet. Two compounding causes: the
+push-lock's stale-steal was **600 s**, shorter than a full-suite verify at load (12 min+), so a second
+`auto_push` stole the push-lock while the first verify was legitimately still running, then ran its own
+verify and hit the lock. Fixes: `auto_push` now switches on the exit code — `0` push, **`3` defer (never
+pause)**, other = real RED → pause; and the push-lock steal is raised above a full-suite runtime. **The
+general rule: when you add a lock that introduces a new non-zero exit, audit every caller that treats
+"non-zero" as one thing.** Detection is not correction — the lock detected the collision correctly and
+the caller mis-corrected it into an outage.
