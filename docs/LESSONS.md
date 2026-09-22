@@ -621,3 +621,33 @@ after `DROVER_GATE_STALL` seconds with NO new output (a genuine hang). The gate 
 progress (jest prints PASS/FAIL per suite) so the log grows while it works. `fleet-land-bean`'s
 `run_gate` and `fleet-verify-main`'s suite runner both use this; a stall returns 124 and is flagged
 distinctly from a real failure. **Metric (fails if >0):** flagged lands whose gate log is 0 bytes.
+
+### Every heavy gate must be single-flight, or identical gates stack and melt the box (2026-09-21)
+
+The gate scripts had no "already running" guard. Nothing stops a second `fleet-verify-main` (or a
+second `fleet-land-bean` of the same bean) from starting while the first still runs, and each one is a
+full build + test suite. On the origin fleet this stacked into **four concurrent cumulative verifies +
+two concurrent lands of one bean**, driving load to **279** on a machine that is healthy under 10. At
+that load a single watcher tick that spawns subprocesses ran for 15 minutes without finishing — the
+heartbeat froze and read as "the fleet is dead." Worse, the stuck land held the land lock, so
+`auto_push` deferred behind it and the deploy never happened (28 commits stacked on local main, none
+pushed). Reaping processes only bought seconds; the fleet legitimately refilled the load.
+
+Two structural causes, two fixes:
+
+- **No single-flight guard.** Each gate now acquires a lock (`mkdir` + steal a stale lock whose PID is
+  dead) before the expensive work; if another gate holds it, the new one SKIPs — the item stays ready
+  and is retried next tick — instead of piling on. Land and verify use **separate** locks on purpose:
+  one land + one verify may coexist (2 heavy gates, tolerable), but a *shared* lock would starve the
+  deploy whenever landing runs every tick. This is the "serialize the heavy gates, keep the seats"
+  choice: cap concurrent gates, not concurrent coders.
+- **A genuinely-broken item, cleared of its quarantine, retry-storms.** A bean whose cherry-pick fails
+  is flagged to `needs-land`. Clearing that flag by hand (e.g. after a melt corrupted a batch of gate
+  runs) makes the lander re-pick it every tick; with no land lock, the slow-and-failing land stacked
+  copies of itself. Re-quarantine an item that fails for a real reason (conflict / red test); only
+  clear the flag for items whose failure was the infrastructure, not the code.
+
+Also fixed the watchdog's own log-open race: the poll did `wc -c < test.log` before the backgrounded
+suite's redirect had created the file, printing a spurious "no such file" each poll. Pre-create the
+log (`: > test.log`) before launching. **Metric (fails if >0):** concurrent live instances of any one
+gate script (`pgrep -f fleet-verify-main | wc -l` > 1, same for `fleet-land-bean`).

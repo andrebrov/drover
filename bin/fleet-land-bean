@@ -20,6 +20,18 @@ set -u
 REPO="${DROVER_REPO:?set DROVER_REPO}"; STATE="$FLEET_STATE"; LEDGER="$FLEET_LEDGER"
 MAIN(){ git -C "$REPO" "$@"; }
 bean="${1:-}"; [ -n "$bean" ] || { echo "usage: fleet-land-bean <bean>"; exit 2; }
+# Single-flight guard: only ONE land runs at a time. Two concurrent lands of the same bean (a retry
+# storm when a genuinely-broken bean keeps being re-picked) can melt the box and hold the land lock,
+# starving the deploy. Skip (bean stays approved, retried next tick — do NOT flag: a busy gate is not
+# a land failure) if a land is already running; steal a stale lock whose owner has died. Separate lock
+# from fleet-verify-main's so a land and a verify can coexist (2 heavy gates max, never a pile-up).
+LLOCK="$FLEET_STATE/.land-bean-lock"; mkdir -p "$FLEET_STATE"
+if ! mkdir "$LLOCK" 2>/dev/null; then
+  lop=$(cat "$LLOCK/pid" 2>/dev/null)
+  if [ -n "$lop" ] && kill -0 "$lop" 2>/dev/null; then echo "land: another land running (pid $lop) — skip $bean this tick"; exit 3; fi
+  rm -rf "$LLOCK"; mkdir "$LLOCK" 2>/dev/null || { echo "land: cannot acquire land lock — skip $bean"; exit 3; }
+fi
+echo $$ > "$LLOCK/pid"; trap 'rm -rf "$LLOCK"' EXIT
 mkdir -p "$STATE/needs-land" "$(dirname "$LEDGER")"
 ledger(){ printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$1" "$bean" >> "$LEDGER" 2>/dev/null; }
 # clear the approved marker on flag: a flagged bean is NOT cleanly-approved-to-land — it needs a

@@ -23,11 +23,22 @@ tip=$(git -C "$REPO" rev-parse "$ref" 2>/dev/null) || { echo "verify: bad ref '$
 if [ -z "$BUILD" ] && [ -z "$TEST_ALL" ]; then
   echo "verify: neither DROVER_BUILD nor DROVER_TEST_ALL is set — cannot verify; refusing to green-light a push"; exit 3
 fi
+# Single-flight guard: two identical cumulative gates only thrash — a pile-up of concurrent gate
+# verifies can melt the box (load spike) and wedge the watcher tick. Refuse to start if another gate
+# is alive; steal a stale lock whose owner has died. Separate lock from fleet-land-bean's so a land
+# and a verify can still coexist (2 heavy gates max, never a pile-up of 4+).
+LOCK="$FLEET_STATE/verify-wt/.gate-lock"; mkdir -p "$(dirname "$LOCK")"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  op=$(cat "$LOCK/pid" 2>/dev/null)
+  if [ -n "$op" ] && kill -0 "$op" 2>/dev/null; then echo "verify: another gate is running (pid $op) — skipping duplicate"; exit 3; fi
+  rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null || { echo "verify: cannot acquire gate lock"; exit 3; }
+fi
+echo $$ > "$LOCK/pid"
 wt="$FLEET_STATE/verify-wt/$$"
+cleanup(){ git -C "$REPO" worktree remove --force "$wt" 2>/dev/null; rm -rf "$wt" "$LOCK"; }
+trap cleanup EXIT
 rm -rf "$wt"; mkdir -p "$(dirname "$wt")"
 git -C "$REPO" worktree add -q --detach "$wt" "$tip" || { echo "verify: worktree add failed"; exit 1; }
-cleanup(){ git -C "$REPO" worktree remove --force "$wt" 2>/dev/null; rm -rf "$wt"; }
-trap cleanup EXIT
 # a fresh worktree has no deps; symlink the repo's installed ones (DROVER_CLONE_DIRS, relative paths)
 for d in ${DROVER_CLONE_DIRS:-node_modules}; do
   [ -e "$wt/$d" ] || { mkdir -p "$(dirname "$wt/$d")" 2>/dev/null; ln -s "$REPO/$d" "$wt/$d" 2>/dev/null; }
@@ -46,6 +57,7 @@ fi
 if [ -n "$TEST_ALL" ]; then
   # progress watchdog, not a wall-clock cap: run the suite to completion; kill ONLY after DROVER_GATE_STALL
   # seconds with NO new output (a genuine hang). A slow-but-progressing suite under load survives.
+  : > "$LOGDIR/test.log"   # pre-create so the watchdog's `wc -c < test.log` never opens a missing file
   ( cd "$wt" && sh -c "$TEST_ALL" ) >"$LOGDIR/test.log" 2>&1 &
   tp=$!; last=-1; quiet=0; stall="${DROVER_GATE_STALL:-300}"
   while kill -0 "$tp" 2>/dev/null; do
