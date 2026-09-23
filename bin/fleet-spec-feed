@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""fleet-spec-feed — keep the fleet supplied from the plan so it never runs dry.
+
+Why: a proposal bean closes when the proposal is WRITTEN; nothing files the build. On 2026-09-22 one
+fleet had 173 of 182 OpenSpec changes with open tasks and NO live bean, so the dispatcher logged
+"queue empty" while the backlog sat in openspec/changes/. fleet-watch calls this when a free seat
+asked the queue for work and got none. Each call files at most ONE bean, in this order:
+
+  1. "Decompose epic <id>" for an open epic with NO live child — a requirement nothing is working
+     toward (never decomposed, or all children done and nobody checked the goal).
+  2. "Implement OpenSpec `<change>`" (verify-then-build) for the most relevant orphan change.
+
+Orphan = openspec/changes/<ch>/tasks.md has unchecked tasks AND no live (non-completed/scrapped) bean
+mentions <ch> AND no bean the feeder filed before (any status) names <ch> — a feed bean that closed
+with tasks still open was a verify/supersede verdict, not an invitation to refile.
+
+Env: DROVER_SPEC_FEED_CAP       open feeder-filed beans at once (default 6)
+     DROVER_SPEC_FEED_KEYWORDS  space-separated words; changes whose id contains one rank first (default none)
+
+  fleet-spec-feed            file one bean (if under the cap) and commit it on main
+  fleet-spec-feed --dry-run  print the stuck epics, ranked orphans and what would be filed; change nothing
+"""
+import glob, json, os, re, subprocess, sys
+
+
+def drover_env():
+    """The same config every bash script sees: source drover-env (next to this file) and read it back."""
+    env = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drover-env')
+    out = subprocess.run(['bash', '-c', '. "$0"; printf "%s" "${DROVER_REPO:-}"', env],
+                         capture_output=True, text=True, check=True).stdout
+    return {'repo': out}
+
+
+REPO = drover_env()['repo']
+if not REPO:
+    sys.exit('fleet-spec-feed: set DROVER_REPO (env or ~/.config/drover/config)')
+CAP = int(os.environ.get('DROVER_SPEC_FEED_CAP', '6'))
+KW = tuple(os.environ.get('DROVER_SPEC_FEED_KEYWORDS', '').lower().split())
+TAG = 'spec-feed'
+DRY = '--dry-run' in sys.argv
+
+
+def sh(*a):
+    try:
+        return subprocess.run(a, cwd=REPO, capture_output=True, text=True)
+    except FileNotFoundError as e:   # no beans CLI on PATH: same as an unreadable board
+        return subprocess.CompletedProcess(a, 127, '', str(e))
+
+
+def query(q):
+    r = sh('beans', 'query', '--json', q)
+    try:
+        return json.loads(r.stdout or '{}').get('beans', []) if r.returncode == 0 else [], r
+    except ValueError:
+        return [], r
+
+
+# `beans list --json` carries neither body nor tags — matching on it saw only titles and called covered
+# changes orphans (the first dry-run picked a change 4 live beans already covered).
+beans, q = query('{ beans { id title status body tags } }')
+if not beans:
+    # An unreadable board looks like "everything is an orphan"; feeding from it would duplicate covered
+    # work. Conflict markers in ONE bean file fail the whole CLI (2026-09-22) — so refuse, loudly.
+    print('spec-feed: beans board unreadable or empty — refusing to feed:', (q.stderr or '').strip()[:160])
+    sys.exit(1)
+live = [b for b in beans if b['status'] not in ('completed', 'scrapped')]
+live_text = [b['title'] + ' ' + (b.get('body') or '') for b in live]
+fed = [b for b in beans if TAG in (b.get('tags') or [])]
+# Cap only what the feeder itself filed. Children a decompose bean files carry the tag too, and many of
+# them share one epic's train cap — counting them froze the feeder at "19/6" while seats idled behind a
+# single capped epic (2026-09-22). Spreading across epics is the point.
+fed_open = [b for b in fed if b['status'] not in ('completed', 'scrapped')
+            and (b['title'].startswith('Implement OpenSpec `') or b['title'].startswith('Decompose epic '))]
+fed_changes = {m.group(1) for b in fed for m in [re.search(r'`([a-z0-9-]+)`', b['title'])] if m}
+
+rows = []
+for tf in glob.glob(os.path.join(REPO, 'openspec/changes/*/tasks.md')):
+    ch = tf.split('/')[-2]
+    if ch == 'archive' or ch in fed_changes:
+        continue
+    t = open(tf, errors='ignore').read()
+    op = len(re.findall(r'^\s*- \[ \]', t, re.M))
+    if op == 0 or any(ch in x for x in live_text):
+        continue
+    dn = len(re.findall(r'^\s*- \[[xX]\]', t, re.M))
+    ts = int(sh('git', 'log', '-1', '--format=%ct', '--', f'openspec/changes/{ch}').stdout.strip() or 0)
+    rows.append((0 if any(k in ch for k in KW) else 1, -ts, ch, op, dn))   # keywords, then most recent
+rows.sort()
+
+fed_epics = {m.group(1) for b in fed for m in [re.search(r'^Decompose epic (\S+?):', b['title'])] if m}
+eq, _ = query('{ beans(filter:{type:["epic"], excludeStatus:["completed","scrapped"]}) '
+              '{ id title priority children { status } } }')
+PR = {'critical': 0, 'high': 1, None: 2, 'normal': 2, 'low': 3, 'deferred': 4}
+epics = sorted([e for e in eq if e['id'] not in fed_epics
+                and not any(c['status'] not in ('completed', 'scrapped') for c in e.get('children') or [])],
+               key=lambda e: PR.get(e.get('priority'), 2))
+
+print(f'stuck epics: {len(epics)}  orphan changes: {len(rows)}  open feed beans: {len(fed_open)}/{CAP}')
+if DRY:
+    for e in epics[:12]:
+        print(f'  EPIC {e.get("priority") or "-":8} {e["id"]} ({len(e.get("children") or [])} done kids) {e["title"][:70]}')
+    for r in rows[:12]:
+        print(f'  {r[3]:3d} open/{r[4]:3d} done  {r[2]}')
+if (not rows and not epics) or len(fed_open) >= CAP:
+    sys.exit(0)
+
+if epics:
+    e = epics[0]; eid = e['id']
+    title = f'Decompose epic {eid}: {e["title"][:70]}'
+    body = f"""Filed by fleet-spec-feed: epic `{eid}` is open but has NO live child bean, so nothing is working toward it. Do NOT implement product code in this bean.
+
+1. Read the epic (`beans show {eid}`) and its completed children. If the epic's goal is already delivered on main, prove it (file:line, test names, or a read-only query) and announce `BLOCKED "LEAD DECISION: close epic {eid} — delivered: <evidence>"`. Stop.
+2. Otherwise find the OpenSpec change(s) that cover the remaining goal (`openspec/changes/*`). If none exists, write one (`openspec validate <id> --strict` must pass). Keep each change at or under ~20 tasks; split larger ones.
+3. File implementation beans as CHILDREN of the epic (`beans create "..." -t feature --parent {eid} -s todo --tag {TAG}`), one per change or task group, each naming its change id and carrying the house rules (TDD, verify every scenario, build + related tests + strict validate before DONE, commit code AND the bean file).
+4. If a decision only a human can make blocks decomposition, state it as one line `HUMAN: <decision>` and announce BLOCKED.
+Done = the epic has live, dispatchable children (or a close verdict). Commit the bean files and any proposal files."""
+    args = ['-p', e.get('priority') or 'normal', '--parent', eid]
+    msg = f'to decompose stuck epic {eid}'
+else:
+    _, _, ch, op, dn = rows[0]
+    title = f'Implement OpenSpec `{ch}` ({op} open / {dn} done tasks)'
+    body = f"""Filed by fleet-spec-feed: OpenSpec change `openspec/changes/{ch}/` has {op} unchecked tasks and no live bean covers it.
+
+## 1. Verify before building (mandatory)
+For EACH unchecked task, check whether main already implements it: read the code, run the test the
+scenario names. Tick a task only with evidence (file:line or test name) recorded under a
+`## Verification` section of this bean. A ticked box without evidence is a defect.
+
+## 2. Superseded or obsolete?
+If a later change replaced this one, or the feature was removed: announce
+`BLOCKED "LEAD DECISION: archive {ch} — superseded by <change/commit>"` and stop. Do not archive it yourself.
+
+## 3. Size
+If more than ~15 tasks remain after step 1: implement the FIRST task group only, and file each
+remaining group as a child bean (`beans create "<change> group N: <name>" -t task --parent <this bean> -s todo`
+with the group's task list and these same house rules). The fleet dispatches the children.
+
+## 4. Implement
+Re-read each requirement's scenarios before each task; verify each after; never batch-tick. TDD.
+Build + related tests + `openspec validate {ch} --strict` green before DONE. Every commit builds alone.
+Rebase onto main before announcing. Commit code AND this bean file.
+"""
+    args, msg = [], f'for orphan change {ch}'
+
+if DRY:
+    print(f'WOULD FILE: {title}')
+    sys.exit(0)
+r = sh('beans', 'create', title, '-t', 'feature', '-s', 'todo', *args, '--tag', TAG, '-d', body, '--json')
+if r.returncode != 0:
+    print('spec-feed: beans create failed:', r.stderr.strip()[:200]); sys.exit(1)
+d = json.loads(r.stdout); bid = (d.get('bean') or d)['id']
+# The board follows main: a bean not committed there is invisible to every worktree and to dispatch.
+files = glob.glob(os.path.join(REPO, f'.beans/{bid}--*.md'))
+sh('git', 'add', '--', *files)
+c = sh('git', 'commit', '--only', '--no-verify', '-q', '-m', f'chore(beans): spec-feed files {bid} {msg}', '--', *files)
+print(f'filed {bid}: {title}' + ('' if c.returncode == 0 else f' (commit failed: {c.stderr.strip()[:120]})'))
