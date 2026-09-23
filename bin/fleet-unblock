@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# fleet-unblock — the unblocker: owns the BLOCKED (noop-held) pile so stuck work stops rotting.
+#
+# The fleet had coders (fresh work), reviewers (review) and a lead (orchestration) — but nothing owned
+# the held pile, so it grew (18 held on 2026-09-22, about a third already DONE) and starved dispatch.
+# fleet-watch runs this every 5 minutes. For each bean in state/noop-held:
+#
+#   RESOLVED     bean is already completed/scrapped           -> un-hold (finished work must not sit held)
+#   TIME-GATED   reason names a future date ("gate opens 2026-10-01", "not before", "until <date>")
+#                                                              -> stay held; a past date falls through
+#   LEAD         reason names a lead decision                  -> one line in state/lead-decisions, stay held
+#   HUMAN        reason names a human/founder/privileged approval -> one line in state/human-decisions, stay held
+#   ACTIONABLE   everything else (incl. no-op loops)          -> un-hold, append an UNBLOCK brief to the bean,
+#                re-enqueue. A coder re-examines the block: resolve it, or re-escalate crisply — never
+#                re-block without re-examining. A real block comes back here and is digested next run.
+#
+# The digests are deduped by `^<bean>\t`, so a bean is listed once however many runs see it.
+#
+#   fleet-unblock            triage the held pile now
+#   fleet-unblock --dry-run  show what it would do; change nothing
+set -uo pipefail
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+REPO="${DROVER_REPO:?set DROVER_REPO}"; STATE="$FLEET_STATE"; LOG="$(dirname "$STATE")/watch.log"
+DRY=0; [ "${1:-}" = "--dry-run" ] && DRY=1
+DIGEST="$STATE/human-decisions"; LEADDIGEST="$STATE/lead-decisions"
+mkdir -p "$STATE/unblock" "$STATE/noop-held"
+log(){ if [ "$DRY" = 1 ]; then echo "  [dry] $*"; else echo "$(date '+%H:%M:%S') UNBLOCK $*" >> "$LOG"; echo "  $*"; fi; }
+# LEAD first: a "lead decision" is the lead's call, never the human's — checked before HKW so the word
+# "decision" doesn't leak into the human pile.
+LKW='LEAD DECISION|lead decides|lead must|lead lands or scraps'
+# HUMAN: only what genuinely needs a person with authority. Deliberately narrow — bare "approved",
+# "decision" or "provision" over-flagged actionable work ("approved <branch>") into the human pile.
+HKW='HUMAN:|FOUNDER|needs (a |the )?human|human must|needs founder|admin to unlock|IAM grant|SRE approval'
+WKW='gate opens|window opens|not before|opens on|wait until|until 20[0-9]{2}-'
+resolved=0 escalated=0 leadq=0 redispatched=0 kept=0 waited=0
+for f in "$STATE/noop-held"/*; do
+  [ -e "$f" ] || continue; b=$(basename "$f")
+  st=$(cd "$REPO" && beans show "$b" --json 2>/dev/null | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin); x=d if isinstance(d,dict) and "status" in d else (d.get("bean") or d); print(x.get("status") or "")
+except Exception: print("")' 2>/dev/null)
+  reason=$(grep -F " $b " "$STATE/blocked" 2>/dev/null | tail -1); [ -n "$reason" ] || reason=$(grep -F "$b" "$STATE/blocked" 2>/dev/null | tail -1)
+  short=$(printf '%s' "$reason" | sed -E "s/^[0-9:]* *//; s/^[^ ]+ +${b} +//" | cut -c1-90)
+  case "$st" in
+    completed|scrapped)
+      [ "$DRY" = 1 ] || rm -f "$f"; resolved=$((resolved+1)); log "CLEARED $b (already $st) — un-held"; continue ;;
+  esac
+  if printf '%s' "$reason" | grep -qiE "$WKW"; then
+    # Nothing anyone can do until the date passes; re-dispatching just re-blocks (one bean looped every
+    # ~6 min on "calendar gate opens <date>", 2026-09-22). A date already past falls through.
+    gate=$(printf '%s' "$reason" | grep -oE '20[0-9]{2}-[0-9]{2}-[0-9]{2}' | head -1)
+    if [ -n "$gate" ] && [ "$(date +%F)" \< "$gate" ]; then
+      waited=$((waited+1)); [ "$DRY" = 1 ] && log "WAIT $b until $gate"; continue
+    fi
+  fi
+  if printf '%s' "$reason" | grep -qiE "$LKW"; then
+    if grep -qE "^$b	" "$LEADDIGEST" 2>/dev/null; then kept=$((kept+1))
+    else [ "$DRY" = 1 ] || printf '%s\t%s\n' "$b" "$short" >> "$LEADDIGEST"; leadq=$((leadq+1)); log "LEAD $b — $short"; fi
+  elif printf '%s' "$reason" | grep -qiE "$HKW"; then
+    if grep -qE "^$b	" "$DIGEST" 2>/dev/null; then kept=$((kept+1))
+    else [ "$DRY" = 1 ] || printf '%s\t%s\n' "$b" "$short" >> "$DIGEST"; escalated=$((escalated+1)); log "HUMAN $b — $short"; fi
+  else
+    redispatched=$((redispatched+1))
+    if [ "$DRY" = 1 ]; then log "RE-DISPATCH $b (actionable) — $short"; continue; fi
+    note="## Unblock (re-dispatched by fleet-unblock $(date +%F))
+
+This bean was BLOCKED: \"$short\". Re-examine before doing anything:
+- Is the blocker STILL valid? A dependency may have landed, main may be green now, or a prior finding may already be fixed.
+- If it cleared: do the bean's work and verify it.
+- If it is a real technical blocker you can fix: fix it.
+- If it GENUINELY needs a human: put one line \`HUMAN: <the single decision needed>\` in your report and announce BLOCKED with that. Do NOT re-block without re-examining."
+    (cd "$REPO" && printf '%s' "$note" | beans update "$b" --body-append - >/dev/null 2>&1) || true
+    printf '%s' "$short" > "$STATE/unblock/$b"
+    rm -f "$f"
+    "$DROVER_BIN"/fleet-watch enqueue "$b" >/dev/null 2>&1 || true
+    log "RE-DISPATCHED $b for unblocking — $short"
+  fi
+done
+echo ""
+echo "UNBLOCK summary: un-held=$resolved  human-decisions=$escalated  lead-decisions=$leadq  re-dispatched=$redispatched  already-digested=$kept  time-gated=$waited"
+if [ -s "$LEADDIGEST" ]; then
+  echo ""; echo "=== LEAD DECISIONS pending ($(grep -c . "$LEADDIGEST")) — $LEADDIGEST (the lead works these) ==="
+  sed 's/^/  /' "$LEADDIGEST"
+fi
+if [ -s "$DIGEST" ]; then
+  echo ""; echo "=== HUMAN DECISIONS pending ($(grep -c . "$DIGEST")) — $DIGEST (surface to the human) ==="
+  sed 's/^/  /' "$DIGEST"
+fi
