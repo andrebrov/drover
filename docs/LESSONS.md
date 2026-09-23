@@ -664,3 +664,67 @@ pause)**, other = real RED → pause; and the push-lock steal is raised above a 
 general rule: when you add a lock that introduces a new non-zero exit, audit every caller that treats
 "non-zero" as one thing.** Detection is not correction — the lock detected the collision correctly and
 the caller mis-corrected it into an outage.
+
+## State that gates dispatch or landing must expire or be re-proved (2026-09-22)
+
+One day, seven failures, one class. Each was a piece of fleet state that stopped work — a status, a
+flag, a marker, a lock order — and that nothing ever re-examined. Written once, trusted forever, and
+the fleet idled behind it while every guard reported healthy.
+
+- **Ghost in-progress beans (108 of them).** Dispatch reads `beans list --ready`, which excludes
+  `in-progress`. Every path that frees a seat — stale-owner release, task reap, credit-dead handback, a
+  relaunched pane — frees the *seat* and leaves the *bean* in-progress. 108 leaf beans sat there with no
+  task, review, followup, owner, approval or hold: invisible to dispatch for good, three of them blocking
+  an epic's next stage. Several were landed-but-never-closed — all their commits on main. Fix:
+  `fleet-ghost-reap` (every 10 min) returns in-progress leaves that no fleet state names, untouched for
+  30 min, to `todo` with a verify-first note, and names any commits on main that mention the bean so the
+  next coder closes shipped work instead of rebuilding it. **Metric (fails if >0):** in-progress leaf
+  beans with no fleet state older than an hour.
+- **A "retry" flag that never retried.** `fleet-land-bean` flagged "main moved; ff-only failed — retry"
+  into `needs-land` — and `auto_land` skips every `needs-land` bean until a human clears it. The word
+  said retry; the mechanism said park forever. One bean sat 90 minutes; then all 7 approved beans were
+  flagged and nothing landed. The cause was mostly not code at all: board writes (`beans update` in the
+  main checkout) are never committed by their writer, so `.beans` on main is routinely dirty and the ff
+  refuses to overwrite a bean file the land touches. Fix: commit the board first; if main advanced only
+  by board commits, rebase the scratch worktree onto it (`-X theirs`) and ff; if code moved, exit 3
+  RETRY with the bean still approved. A race is never a flag. **Metric (fails if >0):** `needs-land`
+  entries whose reason contains "retry".
+- **`return` where `continue` was meant.** `refill` walked the free coders and, on an empty queue,
+  `return`ed — so every seat after the first free one was never looked at, including a coder holding 4
+  followups, while "queue empty — nothing for <first seat>" logged every tick. An empty queue means no
+  NEW bean for *this* seat; later seats can still have fix rounds. Now it logs once per tick and keeps
+  walking.
+- **The deploy starved behind the lands.** The tick ran `auto_land` then `auto_push`, and `auto_push`
+  skips while a land holds the land lock. With lands running back to back the lock was almost always
+  held when push looked: 62 commits sat unpushed on local main. Now push runs first, and `auto_land`
+  yields while the push lock is held.
+- **A pause with no reason.** `auto_push` paused landing with `: > state/land-paused` — an empty file.
+  The one gate that stops all landing said nothing about why, so lifting it meant re-deriving the cause.
+  It now writes the time, the reason and the log path. A gate that stops the fleet must say what would
+  lift it. (Also: `git push` answering "Everything up-to-date" is pushed, not held.)
+- **One bean's conflict markers broke the whole board.** A half-merged bean file (`<<<<<<<` in its
+  front matter) makes the beans CLI fail for *every* query — dispatch, top-up and the feeders all saw an
+  empty board. Two rules: never commit a bean file containing conflict markers (the land's board commit
+  skips them), and any script that acts on the board **refuses on an unreadable or empty board** rather
+  than treating "no beans" as "nothing covered" — `fleet-spec-feed` would otherwise refile every change,
+  and `fleet-ghost-reap` would act on nothing it could verify.
+- **Proposals closed without build beans.** A proposal bean completes when the proposal is *written*;
+  nothing files the implementation. 173 of 182 OpenSpec changes with open tasks had no live bean, so the
+  dispatcher reported "queue empty" over a full backlog. `fleet-spec-feed` runs when a free seat asked
+  the queue and got nothing (not in top-up: a train-capped bean re-queued every tick made top-up report
+  "1 ready" while seats idled). It files ONE bean per call — first "Decompose epic X" for an open epic
+  with no live child, else "Implement OpenSpec `<change>`" as verify-then-build — capped on the beans the
+  feeder itself filed (counting their children froze it at "19/6" behind one capped epic), deduped by the
+  `spec-feed` tag. It must read the board with `beans query` (body + tags): `beans list --json` has
+  neither, so its first dry run called a change four live beans covered an orphan.
+
+And the held pile had no owner at all: 18 beans in `noop-held`, about a third already done, starving
+dispatch. `fleet-unblock` (every 5 min) un-holds finished beans, keeps date-gated ones held until the
+date, digests lead and human decisions into one deduped list each, and re-dispatches the rest with a
+"re-examine before re-blocking" brief.
+
+**The rule: every fleet state that gates dispatch or landing expires or is re-proved.** A status, flag,
+hold or lock is a claim made at one moment. Give it a TTL, or a periodic pass that re-checks the claim
+against the board and main — and when a gate stops the fleet, write why. **Metric (fails if >0):**
+gating entries (`needs-land`, `noop-held`, `land-paused`, in-progress-without-state) older than 24 h that
+no pass has re-examined.
