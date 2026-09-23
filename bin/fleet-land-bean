@@ -128,7 +128,35 @@ if [ "${FLEET_LAND_DRY:-0}" = 1 ]; then
   cleanup; echo "DRY $bean via $br ($n_picks commit) — clean cherry-pick, gates OK; would ff main to ${tip:0:9} (no write)"; exit 0
 fi
 # advance LOCAL main by fast-forward only (never a merge, never a push). Serial caller avoids races.
-if ! MAIN merge --ff-only "$tip" 2>"$STATE/land-$bean-ff.log"; then cleanup; flag "main moved; ff-only failed — retry"; exit 1; fi
+# main moving mid-land (a harvest or bean commit) is a RACE, not a land failure: do NOT flag. flag()
+# writes needs-land, and auto_land skips every needs-land bean until a human clears it — so the old
+# "main moved; retry" flag never retried (2026-09-22: one bean stuck 90 min, then all 7 approved beans
+# flagged and nothing landed). Exit 3 like the busy lock: the bean stays approved and re-lands next tick.
+#
+# Board writes (`beans update` run in $DROVER_REPO by dispatch and land) are never committed by their
+# writer, so main's .beans is routinely dirty, and ff refuses to overwrite a dirty bean file our commits
+# touch (2026-09-22: every approved bean failed here, mislabelled "main moved"). Commit the board first —
+# but NEVER a half-merged bean: conflict markers in one file's front matter make the whole beans CLI
+# fail, so dispatch sees an empty board (2026-09-22). Such files stay dirty; if the land touches one the
+# ff fails and the bean retries next tick.
+board=()
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  grep -qE '^(<<<<<<<|>>>>>>>) ' "$REPO/$f" 2>/dev/null && continue
+  board+=("$f")
+done < <(MAIN status --porcelain -- .beans | awk '{print $NF}')
+if [ ${#board[@]} -gt 0 ]; then
+  MAIN add -- "${board[@]}" && MAIN commit --only --no-verify -q -m "chore(beans): sync board state" -- "${board[@]}"
+fi
+# main advanced mid-land: bean-only drift -> replay onto it (the gated code is unchanged); code drift ->
+# retry next tick, which re-cherry-picks and re-gates against the new main.
+if ! MAIN merge-base --is-ancestor main "$tip"; then
+  drift=$(MAIN diff --name-only "$(WT merge-base HEAD main)" main -- . ':(exclude).beans')
+  if [ -n "$drift" ]; then cleanup; echo "RETRY $bean — main code moved during land; stays approved, re-lands next tick"; exit 3; fi
+  WT rebase -q -X theirs main 2>"$STATE/land-$bean-rebase.log" || { WT rebase --abort 2>/dev/null; cleanup; echo "RETRY $bean — bean-only rebase failed ($STATE/land-$bean-rebase.log)"; exit 3; }
+  tip=$(WT rev-parse HEAD)
+fi
+if ! MAIN merge --ff-only "$tip" 2>"$STATE/land-$bean-ff.log"; then cleanup; echo "RETRY $bean — ff failed ($STATE/land-$bean-ff.log); stays approved"; exit 3; fi
 cleanup; rm -f "$STATE/needs-land/$bean"
 ( cd "$REPO" && beans update "$bean" -s completed >/dev/null 2>&1 )
 rm -f "$STATE/approved/$bean" "$STATE/owner/$bean"
