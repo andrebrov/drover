@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""fleet-ghost-reap — return abandoned 'in-progress' beans to 'todo' so dispatch can see them again.
+
+Why: dispatch reads `beans list --ready`, which EXCLUDES in-progress. Every path that frees a seat
+(stale-owner release, reap, credit-dead handback, a relaunched pane) leaves the bean in-progress, so
+the work vanishes from dispatch for good. 2026-09-22: 108 leaf beans were in-progress with no seat,
+task, review, followup, owner, approval or hold — three of them blocking a whole epic's next stage.
+
+Ghost = in-progress, not an epic/milestone, no live child, no fleet state naming it (task file,
+followup, reviews/approved/needs-land/noop-held/owner marker), and not touched for GRACE minutes (a
+just-dispatched bean has a task file; the grace covers the announce -> route window).
+
+Env: DROVER_GHOST_GRACE_MIN  minutes a ghost must sit untouched (default 30)
+
+  fleet-ghost-reap            reset ghosts to todo (+ a verify-first note) and commit on main
+  fleet-ghost-reap --dry-run  list ghosts and which already have commits on main; change nothing
+"""
+import datetime, glob, json, os, subprocess, sys
+
+
+def drover_env():
+    """The same config every bash script sees: source drover-env (next to this file) and read it back."""
+    env = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drover-env')
+    out = subprocess.run(['bash', '-c', '. "$0"; printf "%s\\0%s\\0%s" "${DROVER_REPO:-}" "$FLEET_STATE" "$FLEET_TASKS"', env],
+                         capture_output=True, text=True, check=True).stdout.split('\0')
+    return dict(zip(('repo', 'state', 'tasks'), out))
+
+
+CFG = drover_env()
+REPO, S, T = CFG['repo'], CFG['state'], CFG['tasks']
+if not REPO:
+    sys.exit('fleet-ghost-reap: set DROVER_REPO (env or ~/.config/drover/config)')
+GRACE = int(os.environ.get('DROVER_GHOST_GRACE_MIN', '30'))
+DRY = '--dry-run' in sys.argv
+
+
+def sh(*a):
+    try:
+        return subprocess.run(a, cwd=REPO, capture_output=True, text=True)
+    except FileNotFoundError as e:   # no beans CLI on PATH: same as an unreadable board
+        return subprocess.CompletedProcess(a, 127, '', str(e))
+
+
+# One query for the whole board, filtered here: an EMPTY board is as suspect as a failed one (conflict
+# markers in one bean file fail the whole CLI, 2026-09-22), and resetting on bad data is worse than
+# doing nothing.
+q = sh('beans', 'query', '--json', '{ beans { id type status title updatedAt children { status } } }')
+try:
+    board = json.loads(q.stdout or '{}').get('beans', []) if q.returncode == 0 else []
+except ValueError:
+    board = []
+if not board:
+    print('ghost-reap: beans board unreadable or empty — refusing to reap:', (q.stderr or '').strip()[:160])
+    sys.exit(1)
+
+
+def text(pattern):
+    out = []
+    for f in glob.glob(pattern):
+        try: out.append(open(f, errors='ignore').read())
+        except OSError: pass
+    return ' '.join(out)
+
+
+tasks, fups = text(T + '/*'), text(S + '/followups/*')
+now = datetime.datetime.now(datetime.timezone.utc)
+ghosts = []
+for b in board:
+    i = b['id']
+    if b['status'] != 'in-progress' or b['type'] in ('epic', 'milestone'): continue
+    if any(c['status'] not in ('completed', 'scrapped') for c in b.get('children') or []): continue
+    if i in tasks or i in fups: continue
+    if any(os.path.exists(f'{S}/{d}/{i}') for d in ('reviews', 'approved', 'needs-land', 'noop-held', 'owner')): continue
+    try:
+        age = (now - datetime.datetime.fromisoformat(b['updatedAt'].replace('Z', '+00:00'))).total_seconds() / 60
+    except Exception:
+        age = GRACE + 1
+    if age >= GRACE:
+        ghosts.append(b)
+
+# A ghost is often LANDED-but-never-closed (2026-09-22: all four of a bean's commits on main, the bean
+# still in-progress). Name those commits so the next coder verifies and closes instead of rebuilding
+# shipped work. Board-sync commits mention every bean they touch, so they don't count.
+log = [l for l in sh('git', 'log', 'origin/main', '--since=120 days ago', '--format=%h %s').stdout.splitlines()
+       if 'chore(beans)' not in l]
+landed = {b['id']: [l.split()[0] for l in log if b['id'] in l][:8] for b in ghosts}
+
+print(f'ghosts: {len(ghosts)}')
+if DRY:
+    print(f'  of which have commits on main: {sum(1 for v in landed.values() if v)}')
+    for b in ghosts[:40]:
+        print(f"  {b['id']} {'LANDED? ' if landed[b['id']] else ''}{b['title'][:70]}")
+    sys.exit(0)
+if not ghosts:
+    sys.exit(0)
+
+note = ('## Returned to todo by fleet-ghost-reap (%s)\n\nThis bean sat in-progress with no seat, task, review or owner, '
+        'so dispatch could not see it. Someone started it before: **check what is already on main and on any '
+        '`fleet/*-%%s` branch before writing code**, finish what is missing, and verify every checklist item.'
+        % now.strftime('%Y-%m-%d'))
+files = []
+for b in ghosts:
+    shas = landed[b['id']]
+    extra = ('\n\n**Commits naming this bean are already on main: ' + ', '.join(shas) + '.** It may be done: '
+             'verify each checklist item against main; if all are met, record the evidence and complete the bean '
+             'without writing code.') if shas else ''
+    r = sh('beans', 'update', b['id'], '-s', 'todo', '--body-append', note % b['id'] + extra)
+    if r.returncode == 0:
+        files += glob.glob(os.path.join(REPO, f".beans/{b['id']}--*.md"))
+if files:
+    sh('git', 'add', '--', *files)
+    c = sh('git', 'commit', '--only', '--no-verify', '-q', '-m',
+           f'chore(beans): ghost-reap — {len(files)} abandoned in-progress bean(s) back to todo', '--', *files)
+    print(f'reset {len(files)}' + ('' if c.returncode == 0 else f' (commit failed: {c.stderr.strip()[:120]})'))
