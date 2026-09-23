@@ -91,14 +91,19 @@ clean worktree before `fleet-push` sends the green batch to origin. A cumulative
 9. **Sweep** (every 6 h), **WIP snapshot** (every 20 min), **inventory alert** (every 30 min: undeployed
    commits and integrity drift), **yolo guard** (every 5 min). **heal_repo** at the top of every tick
    restores `$DROVER_REPO` to main if an agent op drifted it off (otherwise the whole fleet idles).
-10. **Top up the queue** from `beans list --ready` when it is empty (sprint keywords first, then priority) —
+10. **Unblock + ghost reap** — every 5 min `fleet-unblock` triages the held pile (un-hold finished beans,
+    keep date-gated ones, digest lead/human decisions, re-dispatch the rest); every 10 min `fleet-ghost-reap`
+    returns in-progress beans no fleet state names to `todo`.
+11. **Top up the queue** from `beans list --ready` when it is empty (sprint keywords first, then priority) —
     unless the WIP cap is reached (see Guardrails): backpressure stops starting NEW beans while the
     integration backlog is full.
-11. **Refill** every free coder: a followup beats the queue; then the next queued bean, after re-checking it
+12. **Refill** every free coder: a followup beats the queue; then the next queued bean, after re-checking it
     is on main, still ready, not owned by another coder, not awaiting review or landing, within the epic
-    train cap, and that the seat is not credit-dead.
-12. **Land + push** (only with `DROVER_AUTOLAND=1`) — one approved bean per tick to LOCAL main via
-    `fleet-land-bean`, then the cumulative gate + push via `fleet-verify-main`; a red pauses landing.
+    train cap, and that the seat is not credit-dead. A free seat that finds the queue empty calls
+    `fleet-spec-feed`, which files one bean from a stuck epic or an orphan OpenSpec change.
+13. **Push + land** (only with `DROVER_AUTOLAND=1`) — push first: the cumulative gate + push via
+    `fleet-verify-main` (a red pauses landing, with the reason in `state/land-paused`); then one approved
+    bean per tick to LOCAL main via `fleet-land-bean`, which yields while a push is in flight.
 
 `state/last` holds a one-screen summary of the latest tick; `watch/watch.log` has every decision with a
 one-word tag (ROUTED, DISPATCH, FOLLOWUP, PARTIAL, SKIP, STALE, BUDGET, APPROVED, NO-OP, SEAT, …).
@@ -193,6 +198,9 @@ scripts call each other by absolute path, so only your interactive shell is affe
 | `fleet-push` | The only sanctioned push: runs `fleet-verify-main`, pushes local main to origin only if green. Never force. |
 | `fleet-scoreboard` | What shipped vs what's stuck: landed/pushed today, approved-awaiting-land, in-review, integrity drift. The metric that isn't utilization. |
 | `fleet-completed-audit` | List beans `completed` on main whose code isn't actually landed. `--count` for the cached number. |
+| `fleet-unblock` | Triage the held (`noop-held`) pile: un-hold finished beans, keep date-gated ones, digest lead/human decisions, re-dispatch the rest with a re-examine brief. `--dry-run`. |
+| `fleet-ghost-reap` | Return in-progress beans that no fleet state names back to `todo`, naming commits already on main. Refuses on an unreadable board. `--dry-run`. |
+| `fleet-spec-feed` | When a seat starves, file ONE bean: decompose a stuck epic, else verify-then-implement an orphan OpenSpec change. Capped, deduped by tag `spec-feed`. Refuses on an unreadable board. `--dry-run`. |
 | `fleet-done` | What an agent runs when it finishes. The only way the fleet learns about it. |
 | `fleet-wait` | Block until an agent announces (for a lead working without the watcher). |
 | `fleet-track` | Judge seats by artifacts: commits since dispatch and report presence. |
@@ -228,6 +236,9 @@ values as `${VAR:-value}` so an environment variable still wins. See [`examples/
 | `DROVER_CLONE_DIRS` | `node_modules` | Dirs APFS-cloned into a fresh worktree; also symlinked into land/verify scratch worktrees. |
 | `DROVER_COPY_FILES` | `.env` | Untracked files copied into a fresh worktree. |
 | `DROVER_QUEUE_KEYWORDS` | empty | Ready beans matching these words are queued first. |
+| `DROVER_SPEC_FEED_KEYWORDS` | empty | `fleet-spec-feed`: change ids containing these words are fed first. |
+| `DROVER_SPEC_FEED_CAP` | `6` | `fleet-spec-feed`: open feeder-filed beans at once. |
+| `DROVER_GHOST_GRACE_MIN` | `30` | `fleet-ghost-reap`: minutes an in-progress bean must sit untouched before it counts as a ghost. |
 | `DROVER_GENERATED` | empty | ERE of generated paths `fleet-claim` refuses to claim. |
 | `DROVER_LEAD_SEATS` | `lead lead-backup` | Seats `fleet-yolo` never restarts. |
 | `DROVER_HOME` | `~/.local/share/drover` | Queue, inbox, tasks, briefs, reports, snapshots, watcher state, logs. |
