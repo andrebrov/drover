@@ -291,10 +291,11 @@ Spend caps live in `~/.config/drover/caps` (`opencode_daily_usd=`, `active_from=
 ## Lessons
 
 [`docs/LESSONS.md`](docs/LESSONS.md) is the part of this repository most worth reading even if you never run
-it: some forty dated, measured lessons from running the fleet — why agents are never judged by their status
+it: over fifty dated, measured lessons from running the fleet — why agents are never judged by their status
 field, why every bean gets its own branch, why a `printf | grep -q` under `pipefail` idled 19 agents for four
-hours, why a test that needs no input from the system is documentation. The agent-facing subset is
-[`skills/fleet-peers/SKILL.md`](skills/fleet-peers/SKILL.md).
+hours, why a test that needs no input from the system is documentation, why two managers dispatching at once
+collide and observer mode is the fix, why a push lock must never evict a live owner by age. The agent-facing
+subset is [`skills/fleet-peers/SKILL.md`](skills/fleet-peers/SKILL.md).
 
 ## Limitations
 
