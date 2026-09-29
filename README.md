@@ -69,6 +69,33 @@ approved bean to LOCAL main behind a fast per-bean gate, and `fleet-verify-main`
 clean worktree before `fleet-push` sends the green batch to origin. A cumulative red pauses landing
 (`state/land-paused`) so one bad merge can't cascade. Migrations are still never applied automatically.
 
+## Operating model
+
+The loop above assumes the watcher is the one thing dispatching, reviewing, landing and pushing. Running
+the lead's own direct assignments *alongside* the watcher's automated lanes is the one combination this
+tool actively prevents you from reaching by accident, because it was tried once and every stall that day
+had to be found by a human reading logs: a bean released by one side got re-claimed by the other, a bean
+mid-review was interrupted then double-assigned, a third was displaced out from under its coder (see
+`docs/LESSONS.md`, "Two managers collide"). **Exactly one thing dispatches, reviews, lands and pushes at a
+time.**
+
+- **Observer mode** (`touch state/observer`) turns the watcher into a pure observer: every tick becomes
+  `fleet-observe` instead of the mutating lanes above — it reads state, logs, and alerts, and never presses
+  a key in a pane, reassigns a bean, lands, or pushes (`rm state/observer` restores the normal lanes). Use
+  it when a human or the agents themselves are going to own dispatch/landing directly for a while.
+- **The lead queue** is what a human or lead uses to hand out work while the watcher stays observer-only:
+  write a TAB-delimited `<bean>\t<harnesses-or-*>\t<prompt>` line to `state/lead-queue` and list eligible
+  seats in `state/lead-pool` (a `:named` suffix restricts a seat to lines that name it explicitly). Every
+  `fleet-observe` tick hands each free, in-pool seat its next matching line — see `docs/RUNBOOK.md`.
+- **Self-land** (`docs/agent-land-loop.md`) is what agents follow once assigned: own the bean end to end —
+  branch, code, update the bean file, rebase, get the FINAL diff reviewed by a different model (capped at 3
+  rounds, then a self-run SHIP-bar review takes over — see `docs/LESSONS.md`), push through the one
+  fleet-wide push lock (`examples/pre-push-lock.sh`), and prove the push landed with
+  `git merge-base --is-ancestor <sha> origin/main` before reporting DONE.
+
+`fleet-observe --board` gives a one-screen read of the fleet in observer mode, and observer ticks still
+stamp `state/last` so the tick-stall alert doesn't fire on a watcher that's running exactly as configured.
+
 ## What one watcher tick does
 
 `fleet-watch run` ticks every 60 seconds (`FLEET_TICK`). In order:
@@ -218,6 +245,12 @@ scripts call each other by absolute path, so only your interactive shell is affe
 | `fleet-retro` | Retro scaffold from the session's own artifacts. |
 | `fleet-tasks` | Task ledger derived from reports and git. |
 | `lead-watchdog` | Backup-lead takeover trigger. |
+| `fleet-observe` | Observer-mode tick: alert-only checks (dialogs, dead harnesses, stalled/blocked work, unowned critical beans, DONE reports not on origin) plus `--board` (one-screen read). Every tick also hands free, in-pool seats their next lead-queue line. Never mutates otherwise. |
+| `fleet-yolo-config` | Write the harness's approval-bypass flag into each seat's OWN worktree config (per-harness: allow rules, approval policy, CLI trust) so it survives a herdr-restored resume, not just a `fleet-yolo` relaunch. |
+| `fleet-mignum <bean>` | Reserve the next migration number under a lock, across main, every fleet branch, and every earlier reservation this session — never pick one by looking. |
+| `fleet-heal-drift` | One-off repair for a `.beans` board that drifted from what a batch of lands actually did; backs up before writing. |
+| `fleet-alert` | `send`, `check` (tick-stall, low disk, an optional MCP-footprint leak guard), `heartbeat` (for a periodic job). Used by the background land/push loop so a self-pause still wakes someone. |
+| `graphify-nightly` | No-op unless `graphify` is on PATH; else rebuilds the repo's knowledge graph (see `docs/LESSONS.md`, "Finding code"). Wired to `launchd/dev.drover.graphify-nightly.plist.in`. |
 
 ## Configuration
 
@@ -249,6 +282,9 @@ values as `${VAR:-value}` so an environment variable still wins. See [`examples/
 | `DROVER_YOLO` | `1` | Launch seats with the harness's approval-bypass flag. `0` makes every seat stop at permission prompts (and stop being unattended). |
 | `DROVER_SWEEP_SCRATCHPADS` | `0` | Let `fleet-sweep` delete stale >= 50 MB dirs inside Claude Code scratchpads. Only on a machine where every session is a seat. |
 | `FLEET_OPENCODE_MODEL`, `FLEET_CLAUDE_MODEL`, `FLEET_AGY_MODEL` | harness default | Spawn-time model pins. |
+| `DROVER_MIGRATIONS_DIR` | — (required for `fleet-mignum`) | Where migration files live, relative to `DROVER_REPO`. No safe generic default. |
+| `DROVER_PROD_LOG_GROUP`, `DROVER_PROD_LOG_REGION` | empty | Optional: a production log group `fleet-observe` checks hourly for post-deploy errors. Unset = that check is skipped entirely. |
+| `FLEET_MCP_LEAK_PATTERN`, `FLEET_MCP_LEAK_MAX_MB` | empty | Optional: `fleet-alert heartbeat` flags an MCP server process matching this pattern (ERE) once its RSS exceeds the cap. Unset pattern = no-op; verify the pattern's HEALTHY footprint before setting the cap, or it flags every healthy instance (see `docs/LESSONS.md`, "Every instrument ships with its own known-bad and known-good case"). |
 
 Spend caps live in `~/.config/drover/caps` (`opencode_daily_usd=`, `active_from=`), re-read every tick.
 

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# graphify-nightly — keep the project's code graph current, if you use graphify
+# (https://github.com/... — an AST-based structural index some agents query before grepping; see
+# LESSONS.md "Finding code: structure first, then a scoped search"). Optional: this script is a no-op
+# if `graphify` is not on PATH.
+#
+# Why a nightly job at all: a graph nobody refreshes silently drifts (measured: 12 days stale on one
+# fleet because nothing ran `graphify update .`). A refresh is AST-only — no model calls, a few minutes.
+set -uo pipefail
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+LOG="$DROVER_HOME/graphify-nightly.log"
+mkdir -p "$DROVER_HOME"
+command -v graphify >/dev/null 2>&1 || exit 0
+cd "$DROVER_REPO" || exit 1
+start=$(date +%s)
+if out=$(graphify update . 2>&1); then
+  echo "$(date '+%F %T') ok in $(( $(date +%s)-start ))s — $(echo "$out" | grep -m1 'Rebuilt:' | sed 's/.*Rebuilt: //')" >> "$LOG"
+else
+  echo "$(date '+%F %T') FAILED: $(echo "$out" | tail -2 | tr '\n' ' ')" >> "$LOG"
+  "$DROVER_BIN"/fleet-alert send graphify-nightly "graphify nightly update failed" "see $LOG" >/dev/null 2>&1 || true
+  exit 1
+fi

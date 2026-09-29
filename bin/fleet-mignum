@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# fleet-mignum <bean> — reserve the next migration number for a bean. Prints it.
+#
+# Why: checking every fleet branch for the highest existing number (see LESSONS.md "Migration numbers")
+# still lets two agents read the same free number at the same moment if they check within the same
+# window — two beans took the same number on the same day. A reservation is written under a lock, so a
+# number is handed out exactly once. Idempotent: the same bean asking again gets its existing reservation.
+#
+# Requires DROVER_MIGRATIONS_DIR (e.g. "backend/src/db/migrations"), a path relative to DROVER_REPO
+# whose files start with a zero-padded number. Unset = refuses; there is no safe generic default.
+set -euo pipefail
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+bean="${1:?usage: fleet-mignum <bean-id>}"
+DIR="${DROVER_MIGRATIONS_DIR:?set DROVER_MIGRATIONS_DIR (env or ~/.config/drover/config) to your migrations path, relative to DROVER_REPO}"
+RES="$DROVER_HOME/migration-reservations.tsv"; LOCK="$RES.lock"
+mkdir -p "$DROVER_HOME"; touch "$RES"
+until mkdir "$LOCK" 2>/dev/null; do sleep 0.2; done; trap 'rmdir "$LOCK"' EXIT
+prev=$(awk -F'\t' -v b="$bean" '$2==b{print $1; exit}' "$RES")
+if [ -n "$prev" ]; then echo "$prev"; exit 0; fi
+git -C "$DROVER_REPO" fetch -q origin main 2>/dev/null || true
+max=$( { git -C "$DROVER_REPO" ls-tree --name-only origin/main "$DIR/"
+         for b in $(git -C "$DROVER_REPO" for-each-ref --format='%(refname:short)' refs/heads/fleet/); do
+           git -C "$DROVER_REPO" ls-tree -r --name-only "$b" -- "$DIR" 2>/dev/null; done
+         cut -f1 "$RES"; } | sed 's#.*/##' | grep -oE '^[0-9]{3}' | sort -n | tail -1)
+next=$(printf '%03d' $((10#${max:-0} + 1)))
+printf '%s\t%s\t%s\n' "$next" "$bean" "$(date -u +%FT%TZ)" >> "$RES"
+echo "$next"

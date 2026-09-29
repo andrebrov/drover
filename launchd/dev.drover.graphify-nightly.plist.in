@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.drover.graphify-nightly</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BIN@/graphify-nightly</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <!-- If graphify (or a language runtime it needs, e.g. node) lives outside these, add its dir here:
+         launchd does not read your shell's rc files, so PATH must be set explicitly. -->
+    <string>@BIN@:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>@LOGS@/graphify-nightly.out</string>
+  <key>StandardErrorPath</key>
+  <string>@LOGS@/graphify-nightly.err</string>
+</dict>
+</plist>

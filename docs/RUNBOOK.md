@@ -36,6 +36,35 @@ spends no turns — until that prompt arrives.**
   `approved/<bean>` (cleared by landing).
 - Rules every agent loads: the `fleet-peers` skill (`fleet rules` installs it for each harness).
 
+## Observer mode (agents self-land)
+
+Running the lead's own direct assignments alongside the watcher's automated lanes is the one combination
+to avoid — see `docs/LESSONS.md`, "Two managers collide". Put the fleet in observer mode instead of running
+both:
+
+```bash
+touch ~/.local/share/drover/watch/state/observer   # watcher stops mutating; runs fleet-observe instead
+fleet-observe --board                               # one-screen read: what's live, what's stuck, what needs you
+rm ~/.local/share/drover/watch/state/observer        # restore the watcher's normal dispatch/review/land/push lanes
+```
+
+While `state/observer` exists:
+- **Assign work through the lead queue**, not `fleet assign` by hand: append a TAB-delimited line to
+  `state/lead-queue` — `<bean>\t<harnesses-or-*>\t<prompt>` (the middle field is a comma-separated harness
+  or seat-name allowlist, or `*` for anyone). `state/lead-pool` lists the seats eligible to take the next
+  matching line, one per line; suffix a seat with `:named` to mean "only take a queue line that names this
+  seat explicitly" (narrower remit) instead of matching on `*`/harness too. Every `fleet-observe` tick
+  (including each observer-mode watcher tick) hands each free, in-pool seat the next queue line it matches
+  and clears it from the queue — nothing to invoke by hand beyond keeping the two files filled.
+- **Agents self-land**: once assigned, an agent owns its bean through push — see
+  `docs/agent-land-loop.md` for the full loop (branch, code, bean file, rebase, cross-model review of the
+  FINAL diff, push through the fleet-wide lock, prove ancestry, report).
+- `fleet-observe` still alerts (dead harnesses, a seat stuck on its own question, a critical bean nobody
+  owns, a DONE report whose SHA never reached origin) — it just never acts on what it finds. Read
+  `watch/watch.log` for `OBSERVE` lines the same way you'd read the mutating lanes' `ROUTED`/`DISPATCH` ones.
+- The background 60-second land/push loop skips `auto_push`/`auto_land` while `state/observer` exists, but
+  `fleet-alert check` still runs every pass — a self-pause must still be able to wake someone.
+
 ## Landing (the lead's job)
 1. Reviewer verdict `VERDICT: APPROVE` with `LANDABLE: YES` in `<reports>/<reviewer>-review-<bean>-by-<coder>.md`.
 2. In a separate verify worktree: `git checkout --detach main && git cherry-pick -x <named commits>`. Bean-file

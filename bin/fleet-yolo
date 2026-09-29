@@ -16,14 +16,18 @@ What it does, per roster seat (DROVER_ROSTER, or FLEET= if set — see drover-en
   4. verifies the new process carries the flag
 A seat that is `working` is never interrupted; it is retried on the next run.
 
-  fleet-yolo            # fix every non-yolo roster seat
-  fleet-yolo --dry-run  # report only
-  fleet-yolo seat ...   # limit to these seats
+  fleet-yolo                     # fix every non-yolo roster seat
+  fleet-yolo --dry-run           # report only
+  fleet-yolo seat ...            # limit to these seats
+  fleet-yolo seat --force        # restart a named seat even if already yolo (e.g. to move it to a new model)
+  fleet-yolo seat --model=NAME   # relaunch with this model instead of whatever it was already running
 """
 import json, os, re, subprocess, sys, time
 
 DRY = '--dry-run' in sys.argv
 QUIET = '--quiet' in sys.argv
+FORCE = '--force' in sys.argv   # restart the named seats even when already in yolo mode (e.g. to move them to a new model)
+MODEL = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--model=')), None)   # force this model on restart
 ONLY = [a for a in sys.argv[1:] if not a.startswith('--')]
 
 FLAG = {  # must match agent_args() in fleet
@@ -57,10 +61,10 @@ def log(msg):
 def drover_env():
     """The same config every bash script sees: source drover-env (next to this file) and read it back."""
     env = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drover-env')
-    out = subprocess.run(['bash', '-c', '. "$0"; printf "%s\\0%s\\0%s\\0%s" "${FLEET:-$DROVER_ROSTER}" '
-                          '"$FLEET_STATE" "$FLEET_TASKS" "$DROVER_LEAD_SEATS"', env],
+    out = subprocess.run(['bash', '-c', '. "$0"; printf "%s\\0%s\\0%s\\0%s\\0%s" "${FLEET:-$DROVER_ROSTER}" '
+                          '"$FLEET_STATE" "$FLEET_TASKS" "$DROVER_LEAD_SEATS" "$DROVER_WORKTREES"', env],
                          capture_output=True, text=True, check=True).stdout.split('\0')
-    return dict(zip(('roster', 'state', 'tasks', 'leads'), out))
+    return dict(zip(('roster', 'state', 'tasks', 'leads', 'worktrees'), out))
 
 
 CFG = drover_env()
@@ -85,7 +89,11 @@ def pane_processes():
             continue
         pid, _, cmd = parts
         cmd = cmd.strip()
-        kind = next((k for k, p in BIN.items() if re.search(p, cmd) and 'Claude.app' not in cmd and 'mcp' not in cmd.lower()), None)
+        # Skip MCP SERVER processes, not agents whose own launch flags happen to mention an MCP server
+        # config (e.g. a harness flag that names an MCP server by id): a bare substring test on "mcp"
+        # matched those flags too and hid every seat of that harness. Match whole tokens only.
+        is_mcp_server = any(t == 'mcp' or t.endswith('-mcp') or t.startswith('mcp-') for t in cmd.lower().split())
+        kind = next((k for k, p in BIN.items() if re.search(p, cmd) and 'Claude.app' not in cmd and not is_mcp_server), None)
         if not kind:
             continue
         env = sh('ps', 'eww', '-o', 'command=', '-p', pid).stdout
@@ -106,7 +114,7 @@ def alive(pid):
 PENDING = os.path.join(CFG['state'], 'yolo-pending')
 
 
-def launch_in_shell(pane, kind, launch):
+def launch_in_shell(pane, kind, launch, seat=None):
     """Relaunch in the pane's shell. herdr keeps the seat name on the pane after the
     agent exits (agent start -> agent_name_taken), so the shell is the reliable path.
     Enter first flushes any junk on the line; printf pops the kitty keyboard mode an
@@ -114,6 +122,17 @@ def launch_in_shell(pane, kind, launch):
     time.sleep(1.5)
     sh('herdr', 'pane', 'send-keys', pane, 'enter')
     time.sleep(1.0)
+    # herdr context travels in the launch command, not in the pane shell's own environment: a seat
+    # restored after a reboot without HERDR_ENV set correctly refused to work "outside herdr" (its own
+    # rules require it). Prefix every relaunch with the pane's own identity, not whatever the shell has.
+    ws = pane.split(':')[0]
+    launch = f'HERDR_ENV=1 HERDR_PANE_ID={pane} HERDR_WORKSPACE_ID={ws} ' + launch
+    # Relaunch INSIDE the seat's own worktree when it has one (LESSONS.md "make yolo the per-worktree
+    # default"). herdr restores a pane in whatever cwd it had; after a restart a seat can come back in
+    # $HOME instead, and then do its next git operation in the SHARED checkout instead of its own tree.
+    wt = os.path.join(CFG.get('worktrees', ''), f'fleet-{seat}') if seat and CFG.get('worktrees') else None
+    if wt and os.path.isdir(wt):
+        launch = f'cd {wt} && ' + launch
     sh('herdr', 'pane', 'send-text', pane, "printf '\\e[<u'; " + launch)
     time.sleep(0.5)
     sh('herdr', 'pane', 'send-keys', pane, 'enter')
@@ -140,7 +159,7 @@ def recover_pending(ags, procs):
             os.remove(os.path.join(PENDING, name)); continue   # already back
         if DRY:
             log(f'  WOULD RECOVER {name} ({pane}): {launch}'); continue
-        _, new = launch_in_shell(pane, kind, launch)
+        _, new = launch_in_shell(pane, kind, launch, seat=name)
         if any(is_yolo(kind, c) for _, _, c in new):
             os.remove(os.path.join(PENDING, name)); n += 1
             held = {a.get('pane_id'): a.get('name') for a in json.loads(sh('herdr', 'agent', 'list').stdout)['result']['agents']}
@@ -185,8 +204,19 @@ def restore_names(ros):
 
 def restart(name, kind, pane, pid, cmd):
     m = re.search(RESUME[kind], cmd)
-    resume = [m.group(1), m.group(2)] if m else []
-    args = FLAG[kind] + resume
+    if m:
+        resume = [m.group(1), m.group(2)]
+    elif kind == 'opencode':
+        # opencode was launched without --session (e.g. a fresh start); --continue is the closest
+        # thing to a resume it has, and beats coming back to a blank conversation.
+        resume = ['--continue']
+    else:
+        resume = []
+    # Preserve the seat's own --model across the restart unless --model=... overrides it. opencode
+    # has no model flag on a bare relaunch either way, so it falls back to the spawn-time default.
+    mm = re.search(r'--model[= ](\S+)', cmd)
+    model = MODEL or (mm.group(1) if mm else None) or (kind == 'opencode' and os.environ.get('FLEET_OPENCODE_MODEL')) or None
+    args = FLAG[kind] + resume + (['--model', model] if model else [])
     if DRY:
         log(f'  WOULD RESTART {name} ({kind}, {pane}) with: {" ".join(args)}')
         return True
@@ -219,7 +249,7 @@ def restart(name, kind, pane, pid, cmd):
         os.remove(os.path.join(PENDING, name))
         log(f'  FAILED {name}: pid {pid} did not exit (Esc/Ctrl-C, /exit, Ctrl-D) — left untouched')
         return False
-    r, new = launch_in_shell(pane, kind, launch)
+    r, new = launch_in_shell(pane, kind, launch, seat=name)
     ok = True
     verified = ok and any(is_yolo(kind, c) for _, _, c in new)
     if verified:
@@ -267,7 +297,7 @@ def main():
             log(f'  skip {name}: no {kind} process found in pane {pane}')
             continue
         pid, _, cmd = mine[0]
-        if is_yolo(kind, cmd):
+        if is_yolo(kind, cmd) and not (FORCE and name in ONLY):
             log(f'  ok   {name}: yolo')
             continue
         if state == 'working':

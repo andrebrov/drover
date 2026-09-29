@@ -52,16 +52,19 @@ reap)
   # agent. Nothing released a claim on completion, so they accumulated forever.
   # Measured 2026-09-08: a bean completed at 01:20 and still held a core layout file
   # at 17:48, blocking another bean across THREE different seats.
+  # A claim on a bean id that does not exist on main at all guards nothing either — one
+  # such claim held a file for 10 days (measured), because "missing" was never checked,
+  # only "completed" and "scrapped".
   # Same defect class as the stale fleet-tasks files: state that outlives the thing it describes.
   released=0
   : > "$F.keep"
   while IFS=$'\t' read -r a bean path ts; do
     [ -n "${bean:-}" ] || continue
     bf=$(git -C "$ROOT" ls-files .beans 2>/dev/null | grep -m1 "^.beans/$bean--" || true)
-    st=""
+    st="missing"
     [ -n "$bf" ] && st=$(git -C "$ROOT" show "main:$bf" 2>/dev/null | awk '/^status:/{print $2; exit}')
     case "$st" in
-      completed|scrapped)
+      completed|scrapped|missing)
         echo "  released $path  ($bean is $st, held by $a)"; released=$((released+1)) ;;
       *) printf '%s\t%s\t%s\t%s\n' "$a" "$bean" "$path" "$ts" >> "$F.keep" ;;
     esac

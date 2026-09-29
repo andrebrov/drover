@@ -12,9 +12,12 @@
 #   HUMAN        reason names a human/founder/privileged approval -> one line in state/human-decisions, stay held
 #   ACTIONABLE   everything else (incl. no-op loops)          -> un-hold, append an UNBLOCK brief to the bean,
 #                re-enqueue. A coder re-examines the block: resolve it, or re-escalate crisply — never
-#                re-block without re-examining. A real block comes back here and is digested next run.
+#                re-block without re-examining. A real block comes back here and is digested next run —
+#                except the THIRD time: two re-dispatches that both re-block go straight to the lead
+#                (the block is real; a third round only spends a seat rediscovering it).
 #
-# The digests are deduped by `^<bean>\t`, so a bean is listed once however many runs see it.
+# The digests are deduped by `^<bean>\t`, so a bean is listed once however many runs see it; a bean
+# already on the lead's digest stays there even if a later round's reason text stops matching LKW.
 #
 #   fleet-unblock            triage the held pile now
 #   fleet-unblock --dry-run  show what it would do; change nothing
@@ -41,7 +44,7 @@ try:
     d=json.load(sys.stdin); x=d if isinstance(d,dict) and "status" in d else (d.get("bean") or d); print(x.get("status") or "")
 except Exception: print("")' 2>/dev/null)
   reason=$(grep -F " $b " "$STATE/blocked" 2>/dev/null | tail -1); [ -n "$reason" ] || reason=$(grep -F "$b" "$STATE/blocked" 2>/dev/null | tail -1)
-  short=$(printf '%s' "$reason" | sed -E "s/^[0-9:]* *//; s/^[^ ]+ +${b} +//" | cut -c1-90)
+  short=$(printf '%s' "$reason" | sed -E "s/^[0-9:]* *//; s/^[a-z0-9_-]+ +${b} +//" | cut -c1-90)
   case "$st" in
     completed|scrapped)
       [ "$DRY" = 1 ] || rm -f "$f"; resolved=$((resolved+1)); log "CLEARED $b (already $st) — un-held"; continue ;;
@@ -54,12 +57,21 @@ except Exception: print("")' 2>/dev/null)
       waited=$((waited+1)); [ "$DRY" = 1 ] && log "WAIT $b until $gate"; continue
     fi
   fi
+  # A bean the lead has already claimed stays on the lead's list even if this round's reason text no
+  # longer matches LKW — the digest is rebuilt from the held pile every run, so without this a bean the
+  # lead had already triaged onto its own list got silently pulled back out next time it was scanned.
+  if grep -qE "^$b	" "$LEADDIGEST" 2>/dev/null; then kept=$((kept+1)); continue; fi
   if printf '%s' "$reason" | grep -qiE "$LKW"; then
-    if grep -qE "^$b	" "$LEADDIGEST" 2>/dev/null; then kept=$((kept+1))
-    else [ "$DRY" = 1 ] || printf '%s\t%s\n' "$b" "$short" >> "$LEADDIGEST"; leadq=$((leadq+1)); log "LEAD $b — $short"; fi
+    [ "$DRY" = 1 ] || printf '%s\t%s\n' "$b" "$short" >> "$LEADDIGEST"; leadq=$((leadq+1)); log "LEAD $b — $short"
   elif printf '%s' "$reason" | grep -qiE "$HKW"; then
     if grep -qE "^$b	" "$DIGEST" 2>/dev/null; then kept=$((kept+1))
     else [ "$DRY" = 1 ] || printf '%s\t%s\n' "$b" "$short" >> "$DIGEST"; escalated=$((escalated+1)); log "HUMAN $b — $short"; fi
+  elif [ "$(cat "$STATE/unblock/$b.count" 2>/dev/null || echo 0)" -ge 2 ]; then
+    # Re-dispatched twice and blocked again: the block is real, and a third re-dispatch only spends a
+    # seat to rediscover it (measured: one bean re-dispatched 47 times before this cap existed). Park it
+    # for the lead with its reason instead of looping forever.
+    [ "$DRY" = 1 ] || printf '%s\t%s\n' "$b" "re-blocked after 2 unblock rounds: $short" >> "$LEADDIGEST"
+    leadq=$((leadq+1)); log "LEAD $b — re-blocked after 2 unblock rounds: $short"
   else
     redispatched=$((redispatched+1))
     if [ "$DRY" = 1 ]; then log "RE-DISPATCH $b (actionable) — $short"; continue; fi
@@ -72,6 +84,7 @@ This bean was BLOCKED: \"$short\". Re-examine before doing anything:
 - If it GENUINELY needs a human: put one line \`HUMAN: <the single decision needed>\` in your report and announce BLOCKED with that. Do NOT re-block without re-examining."
     (cd "$REPO" && printf '%s' "$note" | beans update "$b" --body-append - >/dev/null 2>&1) || true
     printf '%s' "$short" > "$STATE/unblock/$b"
+    echo $(( $(cat "$STATE/unblock/$b.count" 2>/dev/null || echo 0) + 1 )) > "$STATE/unblock/$b.count"
     rm -f "$f"
     "$DROVER_BIN"/fleet-watch enqueue "$b" >/dev/null 2>&1 || true
     log "RE-DISPATCHED $b for unblocking — $short"

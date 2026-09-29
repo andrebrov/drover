@@ -54,6 +54,14 @@ for a in $(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="codex" {print $1}'
     banner_line=$(printf '%s\n' "$pane" | grep -niE "usage limit|rate limit|session limit|hit your session" | tail -1 | cut -d: -f1)
     # any agent output AFTER the banner means it is stale
     after=$(printf '%s\n' "$pane" | tail -n +$((banner_line+1)) | grep -cE '^[[:space:]]*(•|✓|└|│)') || true
+    # An IDLE seat produces nothing after the banner, so "output after it" never clears an expired limit —
+    # measured: a banner reading "try again at 12:43 PM" still idled every codex seat over an hour later.
+    # codex names its own reset time in the banner; once that time has passed, treat it as history too.
+    ta=$(printf '%s' "$pane" | tr '\n' ' ' | tr -s ' ' \
+        | grep -oE 'try again at [A-Z][a-z]{2} [0-9]{1,2}(st|nd|rd|th), [0-9]{4} [0-9]{1,2}:[0-9]{2} [AP]M' \
+        | tail -1 | sed -E 's/^try again at //; s/([0-9])(st|nd|rd|th),/\1,/')
+    ts=""; [ -n "$ta" ] && ts=$(date -j -f '%b %d, %Y %I:%M %p' "$ta" +%s 2>/dev/null)
+    [ -n "$ts" ] && [ "$ts" -le "$(date +%s)" ] && after=1
     if [ "${after:-0}" -eq 0 ]; then cx_broke=$((cx_broke+1)); fi
   fi
 done

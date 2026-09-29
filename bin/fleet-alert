@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# fleet-alert — wake a human/lead when the fleet stops itself.
+#
+# Why: a self-pause (e.g. `auto_push` pausing ALL landing on a polluted checkout, or a tick that stops
+# completing) only logged one line to watch.log. Nobody reads the log live; commits sat unpushed and
+# approved beans waited an hour before anyone noticed. A self-stop that only logs is invisible. This
+# fires on the CONDITION (state/land-paused exists; a tick has not completed recently), not on each
+# writer of it, so a new pause path can't forget to alert.
+#
+#   fleet-alert check            alert if landing is paused (dedup: at most every $FLEET_ALERT_EVERY s)
+#   fleet-alert heartbeat        run the periodic health guards below (tick-stall, disk, MCP leaks)
+#   fleet-alert send KEY TITLE BODY   one-off alert through every channel (dedup per KEY)
+#
+# Channels: herdr toast (sound=request), a macOS notification, and a prompt into the lead's pane so the
+# lead session actually wakes (a busy Claude pane queues it as a mid-turn message).
+set -u
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+STATE="$FLEET_STATE"
+EVERY="${FLEET_ALERT_EVERY:-1800}"
+LEAD="${DROVER_LEAD_SEATS%% *}"; LEAD="${FLEET_LEAD:-${LEAD:-lead}}"
+DRY="${FLEET_ALERT_DRY:-0}"          # 1 = print what would be sent, send nothing (self-check)
+mkdir -p "$STATE/alerts"
+
+send() {  # key title body
+  local key=$1 title=$2 body=$3 stamp="$STATE/alerts/$1" now; now=$(date +%s)
+  if [ -f "$stamp" ] && [ $(( now - $(stat -f %m "$stamp") )) -lt "$EVERY" ]; then return 0; fi
+  touch "$stamp"
+  if [ "$DRY" = 1 ]; then echo "ALERT[$key] $title — $body"; return 0; fi
+  herdr notification show "$title" --body "$body" --sound request >/dev/null 2>&1
+  osascript -e "display notification \"${body//\"/\'}\" with title \"${title//\"/\'}\" sound name \"Basso\"" >/dev/null 2>&1
+  herdr agent prompt "$LEAD" "FLEET ALERT — $title: $body" >/dev/null 2>&1
+  printf '%s ALERT %s — %s\n' "$(date +%H:%M:%S)" "$title" "$body" >> "$(dirname "$STATE")/watch.log"
+}
+
+case "${1:-}" in
+  check)
+    if [ -f "$STATE/land-paused" ]; then
+      age=$(( ( $(date +%s) - $(stat -f %m "$STATE/land-paused") ) / 60 ))
+      send land-paused "Landing PAUSED (${age}m)" \
+        "$(head -c 240 "$STATE/land-paused" | tr '\n' ' ') — nothing lands or pushes until the lead clears state/land-paused"
+    elif [ -f "$STATE/alerts/land-paused" ]; then
+      rm -f "$STATE/alerts/land-paused"
+      EVERY=0 send land-resumed "Landing resumed" "state/land-paused cleared; the landing lane is running again"
+      rm -f "$STATE/alerts/land-resumed"
+    fi ;;
+  send) send "$2" "$3" "$4" ;;
+  heartbeat)
+    # The tick itself can hang (no dispatch/land/push runs, and nothing alerts, because the pause alert
+    # above only fires from INSIDE a completed tick). state/last is rewritten at the end of every tick.
+    last="$STATE/last"; lim=${FLEET_TICK_STALE:-2700}
+    if [ -f "$last" ]; then
+      age=$(( $(date +%s) - $(stat -f %m "$last") ))
+      if [ "$age" -gt "$lim" ]; then
+        send tick-stalled "Watcher tick STALLED ($((age/60))m)" \
+          "no tick has completed for $((age/60)) min — dispatch/landing/push are frozen; check the fleet-watch process tree for a hung step"
+      elif [ -f "$STATE/alerts/tick-stalled" ] && [ "$age" -lt 300 ]; then   # recovery = a genuinely fresh tick
+        rm -f "$STATE/alerts/tick-stalled"; EVERY=0 send tick-resumed "Watcher ticking again" "last tick ${age}s ago"
+        rm -f "$STATE/alerts/tick-resumed"
+      fi
+    fi
+    # Disk: at near-full, every git/IO call crawls and the tick hangs — warn well before that.
+    free_gb=$(df -g /System/Volumes/Data 2>/dev/null | awk 'NR==2{print $4}')
+    if [ -n "$free_gb" ] && [ "$free_gb" -lt "${FLEET_DISK_MIN_GB:-25}" ]; then
+      send disk-low "Disk low: ${free_gb} GB free" \
+        "worktrees and agent scratchpads fill it — run fleet-sweep (or du -sh $DROVER_HOME ${DROVER_WORKTREES:-})"
+    fi
+    # Optional per-plugin MCP-server memory guards: any local MCP server that leaks or gets misjudged as
+    # leaking (a fresh, healthy instance can legitimately start at several GB RSS — judge by PHYSICAL
+    # footprint above the process's own startup peak, not by a raw RSS threshold, or a healthy instance
+    # gets killed every tick and re-pays its startup cost forever). One example, off by default:
+    if [ -n "${FLEET_MCP_LEAK_PATTERN:-}" ] && [ "$DRY" != 1 ]; then
+      fp_mb() { vmmap --summary "$1" 2>/dev/null | awk '/^Physical footprint:/{v=$3; u=substr(v,length(v)); n=v+0; print int(u=="G"?n*1024:(u=="K"?n/1024:n)); exit}'; }
+      fat=$(for p in $(pgrep -f "${FLEET_MCP_LEAK_PATTERN}"); do m=$(fp_mb "$p"); [ "${m:-0}" -gt "${FLEET_MCP_LEAK_MAX_MB:-3072}" ] && echo "$p"; done)
+      if [ -n "$fat" ]; then
+        kill -9 $fat 2>/dev/null
+        send "mcp-leak-$(date +%H%M)" \
+          "Restarted $(echo "$fat" | wc -w | tr -d ' ') MCP server process(es) over ${FLEET_MCP_LEAK_MAX_MB:-3072} MB footprint" \
+          "matched FLEET_MCP_LEAK_PATTERN=${FLEET_MCP_LEAK_PATTERN}; it restarts on demand"
+      fi
+    fi ;;
+  *) echo "usage: fleet-alert check | heartbeat | send KEY TITLE BODY" >&2; exit 2 ;;
+esac

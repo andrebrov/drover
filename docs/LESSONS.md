@@ -728,3 +728,263 @@ hold or lock is a claim made at one moment. Give it a TTL, or a periodic pass th
 against the board and main — and when a gate stops the fleet, write why. **Metric (fails if >0):**
 gating entries (`needs-land`, `noop-held`, `land-paused`, in-progress-without-state) older than 24 h that
 no pass has re-examined.
+
+## Migration numbers must be RESERVED, not just checked (2026-09-26)
+
+"Look at main plus every fleet branch before picking a number" (the earlier lesson above) still has a
+race: two agents can read the same free number at the same instant. Two branches independently took the
+same next number this way. The fix is a lock, not a wider look: `fleet-mignum <bean>` reserves the number
+under a `mkdir` lock, across main, every fleet branch, and every earlier reservation for the session — the
+same bean asking twice gets the same number back; a different bean gets the next free one. Never pick a
+migration number by inspection again once this exists. **Metric (fails if >0):** a landed migration file
+whose number is not in the reservation log for its bean.
+
+## Two managers collide; the fix is one owner (2026-09-27)
+
+The fleet had two things dispatching, reviewing, landing and pushing at once: the lead's own direct
+assignments, and the watcher's fully automated lanes. They fought each other all day — a bean released by
+one was re-claimed by the other, a bean interrupted mid-review was then double-assigned, a third was
+displaced out from under its coder — and 16 approved-but-unlanded beans sat roughly an hour behind a push
+lock neither side thought it was holding. Every stall was found by a human reading logs, not by a check.
+
+**The rule: exactly one thing may dispatch, review, land and push at a time.** Put the fleet in
+**observer mode** (`touch state/observer`) and the watcher stops mutating entirely — the lead (or, further
+still, the agents themselves; see the next two lessons) becomes the one owner. `rm state/observer` returns
+to the watcher's own lanes. Never run both at once. **Metric (fails if >0):** a bean whose owner file
+changed twice within one tick with no human action in between.
+
+## Observer mode: alert, never act (2026-09-27)
+
+Once a system is deliberately not the one making decisions, it is tempting to let it "just this once" fix
+something it sees broken — and that is exactly how two managers collide again, quietly. `fleet-observe`,
+the thing that runs in place of the watcher's mutating tick while `state/observer` exists, is allowed to
+read state, log, and send an alert; it is never allowed to press a key in a pane, reassign a bean, land, or
+push. The discipline is mechanical, not a judgment call each time: an observer-mode function that would
+otherwise call a mutating helper calls the alerting helper instead, full stop. The one thing an observer
+tick must still do that a mutating tick does is stamp the tick-stall heartbeat file — otherwise the fleet
+reports itself STALLED for running exactly as configured. **Metric (fails if >0):** any pane keystroke,
+`beans update`, `git push`, or land/dispatch call made while `state/observer` exists.
+
+## Self-land: the agent owns its bean from code to origin/main (2026-09-27)
+
+With the watcher in observer mode, nothing routes a coder's review, lands its work, or pushes it — if the
+agent stops before that is done, nothing else finishes the bean. The loop that replaces the watcher's old
+lanes, one bean, start to finish, by the same agent: branch, bring or write the work, update the bean file
+before requesting review (not after), rebase onto the latest main, get the FINAL diff — after the
+rebase, not before — reviewed by a genuinely different model, push through the fleet-wide lock, and then
+**prove** the push landed with `git merge-base --is-ancestor <sha> origin/main` before reporting DONE. Every
+step exists because skipping it produced a real incident once: a review of a pre-rebase diff missed the
+conflict resolution that actually shipped; a report that named a SHA nobody had proven was on origin
+claimed a land that had not happened. See [`docs/agent-land-loop.md`](agent-land-loop.md) for the full
+ten-step loop. **Metric (fails if >0):** a DONE report whose named SHA is not an ancestor of origin/main.
+
+## A review-round cap needs a valve, or work stalls waiting for a reviewer that never comes (2026-09-27)
+
+"Fix real findings, review again" with no cap loops forever against a persistent style disagreement between
+two models. A hard cap alone just traps the bean BLOCKED at round 3 waiting on a human who may not be
+watching in observer mode. The fix is a valve: after round 3, the agent runs ONE more review **itself**,
+against a narrow SHIP bar — a production regression, a security/auth/data-loss hole, or a test that cannot
+fail; nothing about style or edge-case polish counts. APPROVE on that bar ships; a real finding gets fixed
+and the SHIP-bar review repeats once; a second real finding reports BLOCKED with the finding named, not a
+silent stall. Endless new-phrasing or polish findings past round 3 are never blockers — they become a
+follow-up bean and the push proceeds. **Metric (fails if >0):** a bean sitting past round 3 with neither a
+push nor a BLOCKED report naming the finding.
+
+## The orchestrator restores an agent with a bare resume command; make yolo the per-worktree default (2026-09-27)
+
+herdr resumes each agent after a restore with its native resume flag and nothing else — no yolo flag, and
+no config knob to add one (checked against its own docs before assuming otherwise). Every reboot silently
+dropped every seat back to prompting for approval, one seat at a time, however it had been launched. The
+fix is per-harness, because each one takes the flag differently, and it has to be written into the SEAT'S
+OWN worktree config, not passed on a relaunch command the orchestrator doesn't carry forward:
+- one harness's `defaultMode: bypassPermissions` in a local settings file is **not honoured** — a basic
+  write it should have allowed was blocked; explicit per-tool allow rules are what actually works
+  (verified by testing the blocked case, not by reading the setting's name).
+- another's approval-policy and sandbox-mode config keys work and are verified by reading its own launch
+  banner back.
+- a third's CLI needs its allow rules to exclude the shared secrets file explicitly, and could not be
+  verified at all until the machine's keychain was unlocked (see the next lesson).
+Whatever the per-worktree config can't reach, a periodic relaunch-with-flags pass is the backstop. **The
+rule: yolo is verified per harness, by testing the specific case the setting claims to cover — never
+assumed from the setting's name.** **Metric (fails if >0):** a live roster seat whose process command line
+is missing its harness's flag for more than one guard interval.
+
+## After a reboot, the login keychain is locked in the orchestrator's background session (2026-09-27)
+
+A harness that reads a credential from the OS keychain fails silently after a machine reboot, before a
+human has logged in and unlocked it in the session the orchestrator's background process actually runs in
+— failing in a way that is easy to misdiagnose as a config or network problem, because the error surface is
+generic ("401", "keychain error") and nothing points at the actual cause. **The rule: after any reboot or
+host-level restart, unlocking the login keychain in the orchestrator's own session is a required manual
+step before trusting a "seat is broken" diagnosis from a keychain-backed harness** — verify a
+keychain-independent seat first to tell the two failure classes apart.
+
+## A push lock's live owner is never evicted by age; a fleet-wide lock has exactly one implementation (2026-09-26)
+
+An age-only stale-lock backstop is a race waiting to happen: a legitimately slow push (a full-suite gate can
+run ten-plus minutes under load) looks identical, from the outside, to a crashed one. An age threshold set
+below the slow case's real runtime stole the lock out from under a live push and ran a second one
+concurrently — the two then fought over the same build directory. The fix has two parts, and both matter:
+check whether the recorded owner **process** is still alive (`kill -0 <pid>`) before ever touching the
+lock, and use age only as the backstop for a lock whose owner file was never written at all (a crash before
+the first write). And there is exactly ONE such lock fleet-wide, shared by every worktree's pre-push hook
+(see [`examples/pre-push-lock.sh`](../examples/pre-push-lock.sh)) — a per-worktree lock does not prevent two
+concurrent pushes from two different worktrees, which is the actual failure this exists to stop.
+**Metric (fails if >0):** two live processes holding what is meant to be one fleet-wide push lock at once.
+
+## A provider or network drop reads as "done" unless you check for it by name (2026-09-24)
+
+A harness that loses its connection mid-turn does not announce a failure — it just stops producing output,
+and a status check that only asks "is it still running / has it gone idle" reports that identically to a
+seat that finished cleanly. The fix is a signature check: match the pane's tail against the harness's own
+known error text for a dropped connection or provider outage, not just its idle/working state, before
+trusting a "done". **A seat whose connection keeps dropping is not a flaky-but-usable seat** — it degrades
+the whole fleet's throughput number silently, so a seat that drops repeatedly in a short window is pulled
+from the active pool rather than kept in rotation on the hope the next turn goes through.
+**Metric (fails if >0):** a seat marked idle/done whose last pane content matches a known
+provider-error signature rather than real output.
+
+## An agent waiting on its own question is "blocked", not "done" (2026-09-24)
+
+An agent that asks a question and then sits at an interactive prompt waiting for the answer looks, from a
+plain status read, exactly like an agent that finished and went idle — both are "not working". Reporting
+that state as done drops the question on the floor: nobody answers it, and the agent sits there
+indefinitely. The fix is a UI-level check, not a status-level one: detect the harness's own question/prompt
+chrome in the pane (not just idle-vs-working) and surface it as **blocked on its own question**, distinct
+from finished. And the alert has to key on the question's actual content, not just "this seat has a pending
+question" as a boolean — a dedup keyed on the boolean silently swallows a SECOND, different question from
+the same seat, because the first one already suppressed the alert. **Metric (fails if >0):** a seat sitting
+at its own harness's question prompt for more than one guard interval with no alert raised.
+
+## A test against a mocked database does not prove a query is valid SQL (2026-09-25)
+
+A unit test that mocks the database layer entirely will happily pass a query that references a column the
+real schema does not have — the mock returns whatever the test told it to, regardless of what SQL was
+actually sent. That let a query referencing a nonexistent column ship, green, through a suite that never
+once executed real SQL against a real schema. **The rule: any test covering a read path that matters must
+run its actual SQL against a real (even if disposable/test) database schema at least once** — a fully
+mocked DB layer is fine for the surrounding logic, never for the query text itself. **Metric (fails if >0):**
+a shipped query whose column/table references were never executed against a real schema in any test.
+
+## A production "proof" script must not hold a write-capable connection (2026-09-25)
+
+A script whose entire job is to verify something in production — read a value, confirm a migration applied,
+check a row exists — carries far more risk than its job requires if the connection it opens can also write.
+The failure mode is not hypothetical: a bug, a copy-pasted query, or a future edit to a "read-only" proof
+script becomes a production write the moment its connection has the privilege to make one. **Open
+proof/verification connections read-only at the connection level (a read-only role or `SET
+default_transaction_read_only = on`), not by promising in the script's own text that it will only read.**
+A related trap in the same family: an allow/deny filter that inspects the SQL TEXT for write keywords
+(`INSERT`, `UPDATE`, `DELETE`, ...) before running it is trivially bypassed by anything the filter's author
+didn't think of — a stored procedure call, a CTE with a `DELETE` buried inside, different casing — because
+it is pattern-matching intent instead of enforcing a real permission boundary. **Metric (fails if >0):** a
+script whose stated job is read-only production verification, opened with any connection that has write
+grants.
+
+## Credentials: one source, read-only, never harvested (2026-09-28)
+
+An agent needing production database access read the connection string out of the DEPLOYED SERVICE's own
+configuration (its host provider's console/API) and then tried logging in under a guessed username. Both
+are forbidden, for the same reason: a deployed service's own config is not a credential distribution
+channel, and a guessed username against production is a blind write risk with no audit trail. **The rule:
+there is exactly ONE credential source agents may read from** (the project's own local, git-ignored env
+file, loaded read-only into a subshell — never printed, logged, copied or committed), **it is never
+harvested from a deployed service's configuration, and a database user or password is never guessed.** A
+credential that is not in the one allowed source is a BLOCKED report naming what's missing, not an agent
+going looking for it elsewhere. Production access beyond that is read-only unless a human grants a specific
+write for a specific piece of work. **Metric (fails if >0):** any credential value observed anywhere outside
+the one designated source, or a login attempt using a username not read from it.
+
+## Generated files under self-land: the agent regenerates, not the lead (2026-09-27)
+
+The "never commit a generated file, the lead regenerates at land time" lesson above assumed a lead that
+lands every bean by hand. Under self-land (agents own their bean through push; see the lesson above) there
+is no such choke point — the AGENT is the one rebasing, resolving, and pushing, so the agent is the one who
+must regenerate. **Never hand-merge a generated file's conflict** (`DROVER_GENERATED`): take main's copy,
+run the repo's own generator, and commit the fresh output in the SAME commit as the change that made it
+stale — including again after every later rebase, since a rebase can make a generated file stale a second
+time. **Metric (fails if >0):** a merge/rebase resolution of a `DROVER_GENERATED` path that is not the
+generator's own fresh output.
+
+## Keyword-matched intent routing leaks forever; a classifier that fails closed does not (2026-09-26)
+
+Routing a message to a lane ("this needs a human", "this is lead-only") by matching keywords or phrases in
+its text is a leak that never finishes closing: every round of review finds one more phrasing that slips
+through unmatched, gets fixed with one more keyword, and the next round finds the next phrasing — six
+review rounds produced six new phrasings, not zero. A keyword list can only ever enumerate what has been
+SEEN; it cannot recognize what it hasn't. **The rule: intent that gates a real decision is classified, not
+keyword-matched, and an unrecognized case fails CLOSED** — routed to the stricter/safer lane by default,
+never silently treated as the permissive case just because no keyword matched. **Metric (fails if >0):** a
+routing decision that changed behavior after a new phrasing was observed, rather than being caught by the
+fail-closed default on its first occurrence.
+
+## Every instrument ships with its own known-bad and known-good case (2026-09-26)
+
+Six separate checks — a budget monitor, a quality judge, a review panel, a resource-leak guard, a land gate,
+and a launch-flag change — each reported healthy while being wrong, for a whole measurement period in some
+cases, because nobody had ever run them against a case they were supposed to catch. A budget check read an
+EXPIRED limit banner as still-live and refused over a hundred dispatches before anyone noticed the banner's
+own timestamp had already passed. A resource-leak guard killed every HEALTHY instance of the thing it
+guarded because it measured raw memory footprint without ever establishing what a healthy instance's
+footprint actually is. **The rule: a new or changed instrument (a guard, a judge, a lint, a gate, a launch
+config) ships only after both cases have been run and printed — one input it must flag, one it must pass,**
+using real historical artifacts where they exist. A config change is tested in every environment class it
+reaches, not just the one in front of you (see the yolo-per-worktree lesson above — a launch flag tested in
+one seat's directory crashed a different seat entirely). And a check whose verdict has not changed in a
+long time is suspect until you have looked at it, not trusted because it has been quiet. **Metric (fails if
+ever 0):** the number of instruments in active use that have a committed known-bad/known-good fixture pair.
+
+## Spend needs an explicit tenant and a per-tenant, per-day cap — not just a global one (2026-09-18)
+
+A test battery meant to exercise the product defaulted, when no target was specified, to whichever tenant
+happened to be configured in the shared environment — which was a live customer's data, not a scratch one.
+Over the course of one day it made on the order of 32,000 LLM calls against that tenant before anyone
+noticed the spend. A global daily spend cap alone would not have caught this early: the number looks like
+normal fleet activity until it's added up across every source hitting the same account. **The rule: any
+tool that can spend against a tenant requires an EXPLICIT tenant id with no live-tenant default, and spend
+is capped per tenant per day, not only in aggregate** — a scratch/test tenant is the only thing anything
+unattended is allowed to default to. **Metric (fails if >0):** LLM/API spend attributed to a tenant no
+invocation explicitly named.
+
+## Finding code: a knowledge graph first, then a scoped deep search (measured 2026-09-27)
+
+An eight-question benchmark with known answers, run three ways — a knowledge-graph query/path tool alone, a
+deep semantic search scoped to the module the graph pointed at, and that same deep search run unscoped over
+the whole codebase:
+
+| | graph query/path | deep search, scoped to the graph's answer | deep search, unscoped |
+|---|---|---|---|
+| "where is behaviour X" (6 qs) | 3/6 found, never ranked first | 6/6 found, 5 ranked first | 3/6 (rest: provider errors) |
+| structure: callers/connections (2 qs) | 2/2 | 1/2 | 0/2 |
+| median time | 5 s | 19 s | ~10 min |
+| output to read | ~1.6k tokens | ~20k tokens | ~14k tokens |
+
+The graph is fast, cheap, and good at structure (who calls what, how A reaches B) but matches on words, so
+it misses or under-ranks pure behaviour questions. A deep search is far more accurate on behaviour but far
+more expensive to read, and unscoped is both slow AND worse — a broad search dilutes its own ranking and
+starts hitting provider limits. **The rule: query the graph first to find which module owns the behaviour,
+then run the deep search scoped to that module** — never unscoped over a whole codebase. Keep the graph
+current with an incremental update after large changes; a full rebuild running nightly is a floor, not a
+substitute for updating after your own edit.
+
+## Never run the package manager's clean-install in a worktree whose dependency directory is a symlink (2026-09-23)
+
+Bean and gate worktrees often link a dependency directory (`node_modules` or equivalent) to the shared
+checkout to avoid reinstalling it per worktree (`DROVER_CLONE_DIRS`). A clean-install command
+(`npm ci` and equivalents) deletes that directory first — and deletes THROUGH the symlink, emptying the
+shared install every other worktree depends on. One such run, at a moment nobody was watching for it, took
+out test loading for every worktree sharing that install for about an hour, and several beans were falsely
+flagged as broken before the real cause was found. **Check before installing: if the dependency directory
+is a symlink, remove the link and make your own local copy (a clone/reflink where the filesystem supports
+it — seconds, no real disk cost) BEFORE running any install command in that worktree — never install
+through the link.**
+
+## Name every deletion; an unexplained missing file fails review by design (2026-09-08)
+
+A branch that is missing a file main has, with nothing on the branch explaining why, is indistinguishable
+from an accident — a bad rebase, a `core.worktree` redirect silently dropping a file from what got
+committed, a stray `git rm`. **The rule: to delete a file on purpose, list it explicitly under a `## Deletes`
+heading in the bean file, on your branch, before you report done.** Anything main has that the branch
+doesn't, and that isn't named there, is a finding a reviewer (or an automated diff-against-main check)
+raises on sight — deliberate deletions are named up front, never discovered after the fact.
+**Metric (fails if >0):** a landed branch missing a main file with no matching `## Deletes` entry.

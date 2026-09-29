@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# fleet-heal-drift <repo> — put a drifted shared checkout back on main when the ONLY dirty tracked files
+# are bean files (agents and fleet-watch write .beans constantly, so "only heal a clean tree" — the
+# original heal_repo rule — almost never fires: a checkout can sit off main for hours with landing
+# stalled behind it, its only "dirty" state being board writes nobody committed).
+#
+# Board state is merged newest-wins by frontmatter `updated_at`; a full .beans backup is kept before
+# anything is touched.
+#
+#   fleet-heal-drift <repo>
+#
+# Exit 0 = healed or nothing to do. Exit 2 = refused (non-bean tracked changes exist: a human's work in
+# progress — leave it and alert, never discard it).
+set -euo pipefail
+R="${1:?repo}"; G(){ git --git-dir="$R/.git" --work-tree="$R" "$@"; }
+b=$(G rev-parse --abbrev-ref HEAD)
+[ "$b" = main ] && exit 0
+nonbean=$(G status --porcelain --untracked-files=no | awk '{print $2}' | grep -v '^\.beans/' || true)
+if [ -n "$nonbean" ]; then echo "REFUSED: $R on $b with non-bean changes: $(echo "$nonbean" | cut -c1-200)"; exit 2; fi
+BK="${DROVER_HOME:-$HOME/.local/share/drover}/backups/beans-drift-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$(dirname "$BK")"; cp -R "$R/.beans" "$BK"
+G switch -f -q main
+python3 - "$BK" "$R/.beans" <<'PY'
+import sys, os, re, shutil
+bk, dst = sys.argv[1], sys.argv[2]
+
+
+def upd(p):
+    m = re.search(r'^updated_at:\s*(\S+)', open(p, encoding='utf-8', errors='replace').read(4000), re.M)
+    return m.group(1) if m else ''
+
+
+n = 0
+for f in os.listdir(bk):
+    if not f.endswith('.md'):
+        continue
+    s, d = os.path.join(bk, f), os.path.join(dst, f)
+    body = open(s, encoding='utf-8', errors='replace').read()
+    if re.search(r'^(<<<<<<<|>>>>>>>)', body, re.M):
+        continue   # never import a conflicted file
+    if not os.path.exists(d) or (open(s, 'rb').read() != open(d, 'rb').read() and upd(s) > upd(d)):
+        shutil.copy2(s, d); n += 1
+print(n)
+PY
+changed=$(G status --porcelain .beans | awk '{print $2}')
+# shellcheck disable=SC2086
+[ -n "$changed" ] && G add -- $changed && G commit -q --only \
+  -m "chore(beans): heal-drift — restored main from $b, board merged newest-wins (backup $BK)" -- $changed
+echo "HEALED: $R $b -> main; beans merged: $(echo "$changed" | grep -c . || true); backup $BK"

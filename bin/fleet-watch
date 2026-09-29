@@ -87,6 +87,11 @@ fi
 : "${REPO:?set DROVER_REPO (env or ~/.config/drover/config) to your project checkout}"
 mkdir -p "$Q" "$INBOX" "$(dirname "$LOG")" "$TASKS" "$STATE"
 log(){ printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG"; }
+# Hard wall-clock cap for helper scripts called inside the tick: one hung `git|sort` pipeline in a
+# helper froze the whole tick behind it — no dispatch, landing or push until someone noticed the
+# process was still there hours later. perl alarm needs no coreutils dependency; the helper's
+# whole process group is killed on expiry, not just the perl wrapper.
+capped(){ local secs=$1; shift; perl -e '$s=shift; $pid=fork; if(!$pid){setpgrp(0,0); exec @ARGV} $SIG{ALRM}=sub{kill -9,-$pid; exit 124}; alarm $s; waitpid($pid,0); exit($?>>8)' "$secs" "$@"; }
 kind_of(){ "$DROVER_BIN"/fleet status 2>/dev/null | awk -v n="$1" '$1==n{print $2}'; }
 
 case "$verb" in
@@ -106,6 +111,13 @@ clear_dialogs(){
       # Enter there KILLED three seats at once (measured 2026-09-16).
       *"Looks good — save it"*)  "$DROVER_BIN"/fleet keys "$a" Enter >/dev/null 2>&1; log "dialog: confirmed save on $a" ;;
       *"Switch to gpt"*|*"Keep current model"*)       "$DROVER_BIN"/fleet keys "$a" Down Down Enter >/dev/null 2>&1; log "dialog: kept model on $a" ;;
+      # After a harness restart (fleet-yolo relaunches every seat), each relaunch can stop on a startup
+      # dialog nothing answers, and a seat comes back "resumed" but sits blocked on it. Match the exact
+      # option text and only when the cursor sits on the known-safe neighbour, so a changed layout is
+      # ignored rather than mis-clicked.
+      *"❯ No, exit"*"Yes, I trust this folder"*)          "$DROVER_BIN"/fleet keys "$a" Down Enter >/dev/null 2>&1; log "dialog: trusted own worktree on $a" ;;
+      *"Update now"*"2. Skip"*"Skip until next version"*) "$DROVER_BIN"/fleet keys "$a" Down Enter >/dev/null 2>&1; log "dialog: skipped harness update on $a" ;;
+      *"Resume paused goal?"*"2. Leave paused"*)         "$DROVER_BIN"/fleet keys "$a" Down Enter >/dev/null 2>&1; log "dialog: left stale goal paused on $a" ;;
     esac
   done
 }
@@ -429,7 +441,7 @@ unblock_pass(){
   local m="$STATE/.unblock-last" now last; now=$(date +%s); last=$(cat "$m" 2>/dev/null || echo 0)
   [ $((now-last)) -ge 300 ] || return 0
   echo "$now" > "$m"
-  "$DROVER_BIN"/fleet-unblock >/dev/null 2>&1 || true
+  capped 600 "$DROVER_BIN"/fleet-unblock >/dev/null 2>&1 || log "UNBLOCK pass capped/failed (rc=$?)"
 }
 
 top_up_queue(){
@@ -477,6 +489,45 @@ print("\n".join(b["id"] for b in bs[:20]))
   [ "$n" = 0 ] || log "QUEUE topped up with $n ready bean(s)"
 }
 
+integration_pick(){  # $1 = free coder seat under the WIP cap
+  local a="$1" f b br why brief
+  for f in $(ls -tr "$STATE/needs-land" 2>/dev/null); do
+    b="$f"; why=$(head -c 300 "$STATE/needs-land/$b" 2>/dev/null)
+    # Test failures against the CURRENT main are rebase work too: approved beans sat flagged
+    # "related tests failed" while coders idled (the suites pass on main, the branches assert
+    # what main has since changed). Env failures are the gate's, never a coder's: skip those.
+    case "$why" in *"content conflict"*|*"stale branch"*|*"related tests failed"*|*"dependency install failed"*) ;; *) continue ;; esac
+    br=$(cd "$REPO" && git for-each-ref --format='%(refname:short)' "refs/heads/fleet/*-$b" | head -1); [ -n "$br" ] || continue
+    brief="$REPORTS/lead-land-$b-by-$a.md"
+    { echo "# LAND FOLLOWUP — $b (integration lane, $(date +%F)) — approved work that can't land; rebase it"
+      echo; echo "Blocker: $why"; echo
+      [ "$br" = "fleet/$a-$b" ] || printf 'Start from the approved branch in YOUR worktree:\n\n    git checkout -B fleet/%s-%s %s\n\nYou own this land now. Commit only on fleet/%s-%s; never touch the other seat'"'"'s branch/worktree.\n\n' "$a" "$b" "$br" "$a" "$b"
+      echo "1. Rebase onto current local main (no merge commits). 2. Resolve keeping BOTH sides' intent; never revert landed work; REGENERATE generated files instead of hand-merging (never commit one by hand — see DROVER_GENERATED). 3. If the blocker is a failing test: the suite PASSES on main, so your branch's change or a stale assertion breaks it — read the gate log named above, fix the cause (not the assertion) unless main legitimately changed the contract. 4. Build + the bean's related tests green, every commit builds alone. Commit, name the SHA, announce DONE."
+    } > "$brief"
+    rm -f "$STATE/needs-land/$b" "$STATE/approved/$b"; echo "$a" > "$STATE/owner/$b"
+    mkdir -p "$STATE/followups"; printf '%s\t%s\n' "$b" "$brief" >> "$STATE/followups/$a"
+    log "INTEGRATION $b -> $a (WIP cap: rebase a conflicted approved bean from $br)"; return 0
+  done
+}
+
+auto_announce(){
+  # A seat that finished, wrote its report, and went idle WITHOUT running fleet-done holds its task
+  # forever (a coder printed the fleet-done command as text instead of running it; stale-owner recovery
+  # only fires after 45 min). Relay the report's own verdict.
+  local st t a b rep v
+  st=$("$DROVER_BIN"/fleet status 2>/dev/null)
+  for t in "$TASKS"/*; do
+    [ -f "$t" ] || continue; a=$(basename "$t"); b=$(cut -f2 "$t" | head -1); [ -n "$b" ] || continue
+    printf '%s\n' "$st" | awk -v n="$a" '$1==n && ($3=="done" || $3=="idle"){f=1} END{exit !f}' || continue
+    rep=$(ls -t "$REPORTS/$a-$b"*.md 2>/dev/null | grep -v -- '-review-' | head -1); [ -n "$rep" ] || continue
+    [ "$rep" -nt "$t" ] || continue
+    [ $(( $(date +%s) - $(stat -f %m "$rep") )) -ge 300 ] || continue
+    v=$(grep -oE '^(DONE|BLOCKED|PARTIAL|CHANGES)\b' "$rep" | tail -1); v=${v:-DONE}
+    "$DROVER_BIN"/fleet-done "$a" "$b" "$v" "auto-announced by watcher: seat idle with a newer report (never ran fleet-done)" "$rep" >/dev/null 2>&1 \
+      && log "AUTO-ANNOUNCE $a $b $v (idle, report $(basename "$rep") newer than task)"
+  done
+}
+
 refill(){
   local qempty=""
   for a in $("$DROVER_BIN"/fleet status 2>/dev/null | awk 'NR>1 && $3!="MISSING" && $3!="blocked" && $1 ~ /coder(-[0-9]+)?$/ {print $1}'); do
@@ -513,7 +564,10 @@ refill(){
     fi
     if [ -f "$STATE/finish-first" ]; then continue; fi   # finish-and-land first: no new beans
     # WIP CAP: no NEW bean dispatch while the integration backlog is full (followups above still flow).
-    if [ "$(wip_count)" -ge "$(wip_cap)" ]; then continue; fi
+    # Backpressure must not idle coders: the backlog it waits on often needs a CODER (a conflicted
+    # approved bean). Measured: beans sat on real conflicts at the cap while coders idled with nothing
+    # to do. A free seat under the cap takes the oldest conflicted bean as a rebase followup instead.
+    if [ "$(wip_count)" -ge "$(wip_cap)" ]; then integration_pick "$a"; continue; fi
     # Empty queue = no NEW bean for this seat; later seats may still hold followups. `return` here
     # starved every seat after the first free one (2026-09-22: one coder sat on 4 followups while
     # "queue empty — nothing for <the first free coder>" logged every tick). Log once per tick, keep walking.
@@ -521,7 +575,7 @@ refill(){
         # A seat wanted work and got none: feed one orphan OpenSpec change (or stuck epic) onto the board
         # (capped, deduped; picked up next tick). Triggered HERE, not in top_up: a train-capped bean
         # re-queued every tick made top_up report "1 ready" while seats idled (2026-09-22, 121 orphan changes).
-        f=$("$DROVER_BIN"/fleet-spec-feed 2>&1 | grep '^filed'); [ -n "$f" ] && log "SPEC-FEED $f"; fi
+        f=$(capped 300 "$DROVER_BIN"/fleet-spec-feed 2>&1 | grep '^filed'); [ -n "$f" ] && log "SPEC-FEED $f"; fi
       qempty=1; continue; }
     bean=${next#*-}; rm -f "$Q/$next"
     # Drop EVERY other queue entry for this bean, not just the one popped. The queue is a
@@ -645,8 +699,8 @@ inventory_alert(){
   [ -f "$cm" ] && cage=$(( ( $(date +%s) - $(stat -f %m "$cm" 2>/dev/null || echo 0) ) / 60 ))
   if [ "$cage" -ge 60 ]; then
     : > "$cm"
-    local fc; fc=$("$DROVER_BIN"/fleet-completed-audit --count 2>/dev/null || echo 0)
-    ( "$DROVER_BIN"/fleet-completed-audit >/dev/null 2>&1 ) &   # refresh the cache off the tick
+    local fc; fc=$(capped 120 "$DROVER_BIN"/fleet-completed-audit --count 2>/dev/null || echo 0)
+    ( capped 900 "$DROVER_BIN"/fleet-completed-audit >/dev/null 2>&1 ) &   # refresh the cache off the tick
     [ "${fc:-0}" -gt 0 ] && log "INTEGRITY WARN: $fc bean(s) 'completed' on main but code NOT landed — run fleet-completed-audit; reconcile (re-land or reopen)"
   fi
 }
@@ -698,6 +752,30 @@ auto_land(){
     rmdir "$LK" 2>/dev/null
   fi
 }
+route_land_conflicts(){
+  # A needs-land bean stuck on a real conflict (not an env failure) just sits flagged forever unless
+  # something reassigns it. Per tick, after a settle window (a racing re-land might still clear it on
+  # its own), hand it to its owner if still live, else the least-loaded live coder.
+  local f b reason owner live seat n best bn bt
+  live=$("$DROVER_BIN"/fleet status 2>/dev/null | awk 'NR>1 && $3!="MISSING" && $1 ~ /coder(-[0-9]+)?$/ {print $1}')
+  for f in "$STATE"/needs-land/*; do
+    [ -f "$f" ] || continue; b="${f##*/}"; reason=$(LC_ALL=C tr -cd '\40-\176' < "$f")
+    case "$reason" in *"content conflict in"*|*"related tests failed"*) ;; *) continue ;; esac
+    [ $(( $(date +%s) - $(stat -f %m "$f") )) -ge 120 ] || continue      # let a racing re-land settle first
+    owner=$(head -1 "$STATE/owner/$b" 2>/dev/null); seat=""
+    if [ -n "$owner" ] && printf '%s\n' "$live" | grep -qx -- "$owner" && ! printf '%s' " $BROKE " | grep -q " $(kind_of "$owner") "; then seat=$owner
+    else best=999; for n in $live; do printf '%s' " $BROKE " | grep -q " $(kind_of "$n") " && continue
+           bn=0; [ -f "$STATE/followups/$n" ] && bn=$(wc -l < "$STATE/followups/$n"); [ "${bn:-0}" -lt "$best" ] && best=${bn:-0} && seat=$n; done; fi
+    [ -n "$seat" ] || { log "LAND-ROUTE $b: no live coder — flag kept"; continue; }
+    mkdir -p "$FLEET_BRIEFS" "$STATE/followups"
+    bt="${DROVER_BUILD:-run the project build}"; [ -n "${DROVER_TEST_CHANGED:-}" ] && bt="$bt; $DROVER_TEST_CHANGED"
+    printf '# Landing fix round: %s\n\nApproved, but it does not land on current main:\n\n    %s\n\nPrevious owner: %s. It is yours now.\n\n1. Branch fleet/%s-%s from current main; cherry-pick this bean'"'"'s commits (git log main..<old branch> --grep %s); resolve there. Never hand-merge a generated file (see DROVER_GENERATED): take main'"'"'s copy and regenerate.\n2. If main already has the work, say so and announce DONE "already on main".\n3. %s\n4. Report REBASED/VERIFIED/DONE with SHAs; fleet-done %s %s DONE "<one line>" <report>\n' \
+      "$b" "$reason" "${owner:-none}" "$seat" "$b" "$b" "$bt" "$seat" "$b" > "$FLEET_BRIEFS/land-$b.md"
+    grep -q -- "^$b	" "$STATE/followups/$seat" 2>/dev/null || printf '%s\t%s\n' "$b" "$FLEET_BRIEFS/land-$b.md" >> "$STATE/followups/$seat"   # never queue the same bean twice
+    echo "$seat" > "$STATE/owner/$b"; rm -f "$f" "$STATE/approved/$b"
+    log "LAND-ROUTE $b -> $seat (was ${owner:-none}): ${reason:0:80}"
+  done
+}
 auto_push(){
   # Push local main to origin after a land. SAFE because the DEPLOY-BOUNDARY full-suite gate
   # (fleet-verify-main) runs on a clean worktree first; on a cumulative RED we do NOT push and PAUSE
@@ -709,10 +787,19 @@ auto_push(){
   [ "${ahead:-0}" -gt 0 ] || return 0
   local PK="$STATE/.push-lock"
   if ! mkdir "$PK" 2>/dev/null; then
+    # A lock whose owner is dead is stale NOW, whatever its age: a watcher restart kills the push
+    # subshell mid-flight and an age-only backstop left the lock blocking every push for 30+ minutes
+    # before it aged out. A LIVE owner is never taken over just because it ran long — a full-suite
+    # verify at load runs 12m+, and a too-short age backstop stole the lock mid-verify and started a
+    # second, concurrent push. Check the owner's pid first; age is only the backstop for a lock
+    # nobody is holding (crash before the pid file was even written).
+    local owner; owner=$(cat "$PK/pid" 2>/dev/null)
     local age=$(( $(date +%s) - $(stat -f %m "$PK" 2>/dev/null || echo 0) ))
-    [ "$age" -gt 1800 ] && { rmdir "$PK" 2>/dev/null; mkdir "$PK" 2>/dev/null || return 0; } || return 0  # >30m: a full-suite verify at load runs 12m+; 600s stole the push-lock mid-verify and forced a redundant second gate
+    if { [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; } || { [ -z "$owner" ] && [ "$age" -gt 1800 ]; }; then
+      rm -rf "$PK"; mkdir "$PK" 2>/dev/null || return 0; log "AUTO-PUSH: took over stale push lock (owner ${owner:-unknown} gone, age ${age}s)"
+    else return 0; fi
   fi
-  ( cd "$REPO"
+  ( sh -c 'echo $PPID' > "$PK/pid"; cd "$REPO"
     "$DROVER_BIN"/fleet-verify-main main >"$STATE/auto-push-verify.log" 2>&1; vrc=$?
     if [ "$vrc" -eq 0 ]; then
       out=$(git push origin main 2>&1 | tail -4)
@@ -734,10 +821,45 @@ auto_push(){
     rmdir "$PK" 2>/dev/null ) &
 }
 
-tick(){ clear_dialogs; heal_repo; check_budget; h=$("$DROVER_BIN"/fleet-harvest-beans 2>/dev/null | grep "^harvested"); [ -n "$h" ] && log "HARVEST ${h:11:140}"; drain_inbox; retry_reviews; reap_tasks; seat_scan; owner_sync; sweep_guard; snapshot_wip; inventory_alert; yolo_guard; unblock_pass; ghost_reap; top_up_queue; refill
-  [ "${DROVER_AUTOLAND:-0}" = 1 ] && { auto_push; auto_land; }   # push first: see auto_land
-  { echo "tick $(date '+%H:%M:%S')"; echo "queue: $(ls "$Q" 2>/dev/null | wc -l | tr -d ' ')"; "$DROVER_BIN"/fleet-track check 2>/dev/null | head -20; } > "$STATE/last" 2>/dev/null; }
+# Time every step; a slow step delays EVERY seat's next assignment (measured: ticks of 3-6 min, a DONE
+# waited 3.5 min to be read). Logged only when >=15s, so the log names the culprit without noise.
+T(){ local _s=$SECONDS; "$@"; local _d=$((SECONDS-_s)); [ "$_d" -ge 15 ] && log "SLOW-STEP $1 ${_d}s"; return 0; }
+harvest_step(){ local h; h=$("$DROVER_BIN"/fleet-harvest-beans 2>/dev/null | grep "^harvested"); [ -n "$h" ] && log "HARVEST ${h:11:140}"; return 0; }
+
+# OBSERVER MODE: two managers (the lead and this watcher) both dispatching, reviewing and landing
+# collided — the fix is one owner. With state/observer present, agents own code -> review -> push
+# themselves and the lead owns assignment; the watcher only OBSERVES and ALERTS, never mutates.
+# `rm state/observer` restores the normal mutating lanes below.
+tick(){
+  if [ -f "$STATE/observer" ]; then observe_tick; return; fi
+  local _t0=$SECONDS
+  T clear_dialogs; T heal_repo; T check_budget; T harvest_step; T drain_inbox; T auto_announce; T retry_reviews
+  T reap_tasks; T seat_scan; T owner_sync; T sweep_guard; T snapshot_wip; T inventory_alert; T yolo_guard
+  T unblock_pass; T ghost_reap; T top_up_queue; T refill
+  [ "${DROVER_AUTOLAND:-0}" = 1 ] && { T auto_push; T auto_land; T route_land_conflicts; }   # push first: see auto_land
+  [ $((SECONDS-_t0)) -ge 60 ] && log "SLOW-TICK $((SECONDS-_t0))s"
+  { echo "tick $(date '+%H:%M:%S')"; echo "queue: $(ls "$Q" 2>/dev/null | wc -l | tr -d ' ')"; "$DROVER_BIN"/fleet-track check 2>/dev/null | head -20; } > "$STATE/last" 2>/dev/null
+}
+
+observe_tick(){
+  local _t0=$SECONDS
+  T check_budget; T inventory_alert
+  "$DROVER_BIN"/fleet-observe 2>&1 | while read -r l; do log "OBSERVE $l"; done
+  [ $((SECONDS-_t0)) -ge 30 ] && log "SLOW-OBSERVE $((SECONDS-_t0))s"
+  # The tick-stall detector reads state/last: an observer tick must stamp it too, or the fleet reports
+  # a false multi-hour STALL for a watcher that is running fine, just not mutating.
+  { echo "tick $(date '+%H:%M:%S') (observer)"; "$DROVER_BIN"/fleet-observe --board 2>/dev/null; } > "$STATE/last" 2>/dev/null
+}
 
 if [ "${1:-run}" = once ]; then tick; exit 0; fi
 log "fleet-watch started (tick ${TICK}s)"
+# Landing lane on its own 60s cadence, decoupled from the full tick: when the tick itself grows long
+# (a slow drain_inbox or retry_reviews pass), approved beans should not wait behind it. auto_push/
+# auto_land take their own locks and background their own work, so running them here too — as well as
+# inside tick() when DROVER_AUTOLAND=1 — cannot overlap with that copy.
+( while true; do sleep 60
+    "$DROVER_BIN"/fleet-alert check   # a self-pause must still be able to wake someone, even in observer mode
+    [ -f "$STATE/observer" ] && continue
+    [ "${DROVER_AUTOLAND:-0}" = 1 ] && { auto_push; auto_land; }
+  done ) &
 while true; do tick; sleep "$TICK"; done

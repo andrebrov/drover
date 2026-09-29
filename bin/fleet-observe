@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""fleet-observe — read-only exception view of the fleet; alerts, never acts.
+
+The observer half of "one manager" (see LESSONS.md "Two managers collide"): with `state/observer`
+present, fleet-watch calls this instead of its normal dispatch/review/land lanes. It reads panes,
+git and the board, and only ever calls `fleet-alert send` (deduped per key) or prints for watch.log.
+It NEVER presses a key, reassigns a bean, lands or pushes.
+
+  fleet-observe            run checks, alert on exceptions
+  fleet-observe --board    print the assignment ledger (owner, bean, branch, last proof of progress)
+  fleet-observe --dry      run checks, print what would alert, send nothing
+
+See docs/RUNBOOK.md "Observer mode" for the operating model this implements.
+"""
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+NOW = time.time()
+STALL_MIN = int(os.environ.get('FLEET_STALL_MIN', '30'))
+# Optional: an hourly check for stalled scheduled jobs in your own deploy's logs. Off unless set — see
+# README "Configuration". Any log source that can answer "what stalled in the last 15 minutes" fits;
+# this default assumes AWS CloudWatch Logs, but the check is skipped entirely with nothing configured.
+PROD_LOG_GROUP = os.environ.get('DROVER_PROD_LOG_GROUP', '')
+PROD_LOG_REGION = os.environ.get('DROVER_PROD_LOG_REGION', 'us-east-1')
+
+
+def drover_env():
+    """The same config every bash script sees: source drover-env (next to this file) and read it back."""
+    env = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drover-env')
+    out = subprocess.run(
+        ['bash', '-c', '. "$0"; printf "%s\\0%s\\0%s\\0%s\\0%s" "$DROVER_REPO" "$FLEET_TASKS" '
+         '"$FLEET_REPORTS" "$FLEET_STATE" "$DROVER_HOME"', env],
+        capture_output=True, text=True, check=True).stdout.split('\0')
+    return dict(zip(('repo', 'tasks', 'reports', 'state', 'home'), out))
+
+
+CFG = drover_env()
+REPO, TASKS, REPORTS, STATE = CFG['repo'], CFG['tasks'], CFG['reports'], CFG['state']
+
+# Harness-level failures read off a seat's screen -> (pattern, meaning, disable the harness?).
+# Add your own harness's known error text here the same way. Order matters: more specific first.
+DEAD = [
+    (r'Account \S+ is suspended|monthly spending limit', 'billing suspended', True),
+    (r"(you'?ve|you have) hit your usage limit|usage limit reached|rate limit reached|try again at \d",
+     'usage limit', True),
+    (r'http_status"?:\s*402|Payment Required', 'payment required (402)', True),
+    (r'keychain is locked', 'macOS login keychain locked — unlock it inside herdr (security unlock-keychain)', False),
+    (r'Not logged in|Run /login|access token could not be refreshed|Please sign in again',
+     'not logged in / stale login — restart the seat (a fresh process picks up the current login)', False),
+    (r'open in another app', 'conversation open in another app (press R in the pane)', False),
+    (r'agent executor error|write: broken pipe|request failed: Post|network issue connecting to the server',
+     'transient provider/network error mid-task — its edits are in the worktree; prompt it to continue', False),
+    (r'Question \d+ of \d+|How should I proceed\?',
+     'waiting on a question it asked (herdr reports this as done, not blocked) — read the pane and answer', False),
+    (r'not inside herdr|HERDR_ENV is not 1',
+     'lost herdr context after a resume; confirm it in a prompt or relaunch the seat', False),
+]
+
+
+def sh(*a, timeout=20, cwd=None):
+    try:
+        return subprocess.run(a, capture_output=True, text=True, timeout=timeout, cwd=cwd).stdout
+    except Exception:
+        return ''
+
+
+def git(*a):
+    return sh('git', '-C', REPO, *a).strip()
+
+
+SENT = f'{STATE}/observe-sent'   # key -> last alert epoch; one alert per key per 6h
+
+
+def alert(key, title, body):
+    sent = dict(l.split('\t', 1) for l in open(SENT).read().split('\n') if '\t' in l) if os.path.exists(SENT) else {}
+    if key in sent and NOW - float(sent[key]) < 6 * 3600:
+        return
+    print(f'{key}: {title} — {body}')
+    if '--dry' not in sys.argv:
+        sent[key] = str(NOW)
+        open(SENT, 'w').write('\n'.join(f'{k}\t{v}' for k, v in sent.items() if NOW - float(v) < 86400))
+        sh(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fleet-alert'),
+           'send', key, title, body, timeout=30)
+
+
+def agents():
+    try:
+        return {a['name']: a for a in json.loads(sh('herdr', 'agent', 'list'))['result']['agents'] if a.get('name')}
+    except Exception:
+        return {}
+
+
+def screen(name):
+    return sh('herdr', 'agent', 'read', name, '--source', 'visible', '--lines', '40')
+
+
+REPORT_OF = {}
+
+
+def ledger():
+    rows = []
+    for seat in sorted(os.listdir(TASKS)) if os.path.isdir(TASKS) else []:
+        f = os.path.join(TASKS, seat)
+        parts = open(f).read().split('\t')
+        bean = parts[1].strip() if len(parts) > 1 else '?'
+        rows.append((seat, bean, os.path.getmtime(f)))
+        if len(parts) > 3 and parts[3].strip():
+            REPORT_OF[(seat, bean)] = parts[3].strip()   # the report path the assignment recorded
+    return rows
+
+
+def progress(seat, bean, since):
+    """Newest proof of progress: a commit on the bean branch or a report file, as epoch seconds."""
+    best = since
+    br = f'fleet/{seat}-{bean}'
+    # agents often work on suffixed branches (fleet/<seat>-<bean>-registry, -core, ...): newest commit on any
+    refs = git('for-each-ref', '--sort=-committerdate', '--format=%(committerdate:unix) %(refname:short)',
+               f'refs/heads/{br}', f'refs/heads/{br}-*')
+    for line in refs.splitlines()[:1]:
+        t, name = line.split(' ', 1)
+        if t.isdigit():
+            best = max(best, int(t)); br = name
+    for fn in os.listdir(REPORTS) if os.path.isdir(REPORTS) else []:
+        if bean in fn and fn.endswith('.md'):
+            best = max(best, os.path.getmtime(os.path.join(REPORTS, fn)))
+    rp = REPORT_OF.get((seat, bean))
+    if rp and os.path.exists(rp):
+        best = max(best, os.path.getmtime(rp))
+    return best, br
+
+
+def board():
+    ag = agents()
+    print(f"{'seat':18} {'bean':11} {'status':8} {'last proof':>10}  branch")
+    for seat, bean, t0 in ledger():
+        p, br = progress(seat, bean, t0)
+        st = ag.get(seat, {}).get('agent_status', 'absent')
+        print(f'{seat:18} {bean:11} {st:8} {int((NOW - p) / 60):>7}min  {br}')
+
+
+def check():
+    ag = agents()
+    off = set(open(f'{STATE}/harness-off').read().split()) if os.path.exists(f'{STATE}/harness-off') else set()
+
+    # 1. seats: dialogs and dead harnesses (read the screen of every non-working roster seat)
+    for name, a in ag.items():
+        if not re.search(r'coder|reviewer|analyst', name) or a.get('agent') in off:
+            continue
+        st = a.get('agent_status')
+        if st == 'blocked':
+            alert(f'dialog-{name}', f'{name} is waiting on a dialog',
+                  'Seat is blocked on an approval/question UI. Read it (herdr agent read) and answer it '
+                  'deliberately; the observer never presses keys.')
+        if st == 'working':
+            continue
+        txt = screen(name)
+        for pat, what, disable in DEAD:
+            if re.search(pat, txt, re.I):
+                if disable and a.get('agent'):
+                    with open(f'{STATE}/harness-off', 'a') as fh:
+                        fh.write(a['agent'] + '\n')
+                    off.add(a['agent'])
+                key = f'dead-{name}-{what[:12]}-' + hashlib.md5(txt[-600:].encode()).hexdigest()[:6]
+                alert(key, f'{name}: {what}',
+                      f"harness {a.get('agent')} {'disabled (state/harness-off)' if disable else 'left on'}; "
+                      f"its assignment is not progressing.")
+                break
+
+    # 2. finished / blocked / stalled assignments. With no inbox lane in observer mode, the seat's own report
+    # is the outcome: DONE on origin -> release the seat; BLOCKED -> surface the blocker once and release; else stall.
+    for seat, bean, t0 in ledger():
+        if ag.get(seat, {}).get('agent') in off:
+            continue   # harness switched off (billing/limit): its seat cannot progress; the dead-harness alert already fired
+        p, br = progress(seat, bean, t0)
+        st = ag.get(seat, {}).get('agent_status', 'absent')
+        rep = REPORT_OF.get((seat, bean)) or os.path.join(REPORTS, f'{seat}-{bean}.md')
+        if st != 'working' and os.path.exists(rep) and os.path.getmtime(rep) >= t0:
+            body = open(rep, errors='ignore').read()
+            # the FIRST line is the verdict (the self-land contract's report step); a trailing "DONE <path>"
+            # echo must not override a BLOCKED head.
+            head = next((l for l in body.splitlines()[:3] if re.search(r'\b(DONE|BLOCKED|LANDED)\b', l)), '')
+            verdict = head or next((l for l in reversed(body.strip().splitlines())
+                                     if re.match(r'(DONE|BLOCKED)\b', l)), '')
+            if 'BLOCKED' in verdict:
+                why = next((l for l in body.splitlines() if re.match(r'\s*(HUMAN|LEAD|BLOCKED)[:\s]', l)), verdict)
+                key = f'blocked-{seat}-{bean}-' + hashlib.md5(verdict.encode()).hexdigest()[:6]
+                alert(key, f'{seat} BLOCKED on {bean}', f'{why.strip()[:300]} — report: {rep}')
+                os.remove(os.path.join(TASKS, seat)); continue
+            if re.search(r'DONE|LANDED', verdict) or not verdict:
+                # a report written after the assignment by a seat that stopped = finished (a research report
+                # leads with its summary, not a DONE word — the same shape as a genuinely done task)
+                print(f'released {seat} ({bean}: {(verdict or (body.splitlines()[0] if body else ""))[:80]})')
+                os.remove(os.path.join(TASKS, seat)); continue
+        if st != 'working' and NOW - p > STALL_MIN * 60 and re.search(
+                r'(shells?|monitors?|background terminals?) (still )?running|still running', screen(seat)):
+            continue   # idle between waits on its own background jobs (herdr says "done") — busy, not stalled
+        if st != 'working' and NOW - p > STALL_MIN * 60:
+            alert(f'stall-{seat}-{bean}', f'{seat} stalled on {bean}',
+                  f'status={st}, no commit on {br} and no report for {int((NOW - p) / 60)} min. '
+                  f'Read the pane, then reassign or unblock.')
+
+    # 3. critical runnable work with no owner (queued-by-the-lead counts as owned)
+    try:
+        q = ('{ beans(filter:{status:["todo"], priority:["critical"], type:["bug","feature","task"], '
+             'isBlocked:false}) { id title } }')
+        crit = json.loads(sh('beans', 'query', '--json', q, cwd=REPO, timeout=30))['beans']
+    except Exception:
+        crit = []
+    owned = {b for _, b, _ in ledger()}
+    if os.path.exists(QUEUE):
+        owned |= {l.split('\t')[0] for l in open(QUEUE) if l.strip()}
+    free = [b['id'] for b in crit if b['id'] not in owned and not os.path.exists(f"{STATE}/noop-held/{b['id']}")]
+    if free:   # ONE alert, keyed on the set, so it re-fires only when the set changes
+        key = 'crit-unowned-' + hashlib.md5(' '.join(sorted(free)).encode()).hexdigest()[:8]
+        alert(key, f'{len(free)} critical bean(s) with no owner', ' '.join(free))
+
+    # 4. DONE reports that name a SHA not on origin/main (the self-land contract: pushed means on origin)
+    git('fetch', '-q', 'origin', 'main')
+    for fn in os.listdir(REPORTS) if os.path.isdir(REPORTS) else []:
+        f = os.path.join(REPORTS, fn)
+        if not fn.endswith('.md') or NOW - os.path.getmtime(f) > 6 * 3600 or '-review-' in fn:
+            continue
+        head = open(f, errors='ignore').read(600)
+        if not re.search(r'LANDED|pushed|DONE', head) or re.match(r'\W*BLOCKED', head):
+            continue   # a BLOCKED report claims nothing; the blocked alert above covers it
+        owner = next((n for n in ag if fn.startswith(n + '-')), None)
+        if owner and ag[owner].get('agent_status') == 'working':
+            continue   # its owner is still on it (e.g. mid-rebase/push) — alert only once the seat stops
+        m = re.search(r'\b([0-9a-f]{9,40})\b', head)
+        if m and subprocess.run(['git', '-C', REPO, 'merge-base', '--is-ancestor', m.group(1), 'origin/main'],
+                                 capture_output=True).returncode != 0:
+            if git('cat-file', '-t', m.group(1)) == 'commit':
+                alert(f'notpushed-{fn}', f'{fn}: claims landed but {m.group(1)} is not on origin/main',
+                      'The self-land contract: DONE means the SHA is an ancestor of origin/main. Send it back.')
+
+    # 4b. hand queued work to free seats
+    dispatch(ag, off)
+
+    # 5. optional: production scheduled jobs stalled (hourly; skipped with no DROVER_PROD_LOG_GROUP)
+    if PROD_LOG_GROUP:
+        stamp = f'{STATE}/observe-prod.stamp'
+        if not os.path.exists(stamp) or NOW - os.path.getmtime(stamp) > 3600:
+            open(stamp, 'w').write(str(int(NOW)))
+            out = sh('aws', 'logs', 'filter-log-events', '--region', PROD_LOG_REGION,
+                      '--log-group-name', PROD_LOG_GROUP, '--start-time', str(int((NOW - 900) * 1000)),
+                      '--filter-pattern', '"has not completed since"',
+                      '--query', 'events[].message', '--output', 'text', timeout=60)
+            jobs = sorted(set(re.findall(r'job \\?"([a-z0-9-]+)\\?" has not completed', out)))
+            if jobs:
+                alert('prod-jobs-stalled', f'{len(jobs)} production scheduled jobs stalled',
+                      ', '.join(jobs[:12]) + (' …' if len(jobs) > 12 else ''))
+
+
+# --- lead queue ---------------------------------------------------------------------------------------
+# ONE manager: the lead writes the ORDER (state/lead-queue); this only hands the next line to a free seat,
+# so no seat waits on the lead's next message. Line format: <bean>\t<harnesses: claude,cursor,agy | *>\t<prompt>
+# Pool = seats allowed to take queued work (state/lead-pool, one seat name per line, optionally `name:named`
+# to mean "only take a line that names this seat explicitly", for a seat with a narrower remit).
+QUEUE = f'{STATE}/lead-queue'
+POOL = f'{STATE}/lead-pool'
+
+
+def dispatch(ag, off):
+    if not os.path.exists(QUEUE) or not os.path.exists(POOL):
+        return
+    pool_raw = [l.strip() for l in open(POOL) if l.strip()]
+    pool = [l.split(':')[0] for l in pool_raw]
+    named_only = {l.split(':')[0] for l in pool_raw if l.endswith(':named')}
+    lines = [l.rstrip('\n') for l in open(QUEUE) if l.strip()]
+    held = {seat for seat, _, _ in ledger()}
+    idle = []
+    for seat in pool:
+        a = ag.get(seat)
+        if not a or a.get('agent') in off or seat in held or a.get('agent_status') not in ('idle', 'done'):
+            continue
+        pick = next((i for i, l in enumerate(lines)
+                     if len(l.split('\t')) >= 3 and (
+                         (seat in l.split('\t')[1].split(','))
+                         if seat in named_only else
+                         (l.split('\t')[1] == '*' or a.get('agent') in l.split('\t')[1].split(',')
+                          or seat in l.split('\t')[1].split(','))
+                     )), None)
+        if pick is None:
+            idle.append(seat); continue
+        bean, _, prompt = lines.pop(pick).split('\t', 2)
+        rep = os.path.join(REPORTS, f'{seat}-{bean}.md')
+        open(os.path.join(TASKS, seat), 'w').write(f'{int(NOW)}\t{bean}\tnone\t{rep}\n')
+        r = subprocess.run(
+            ['herdr', 'agent', 'prompt', seat, prompt + f' Report to {rep} (first line = verdict + pushed SHA).'],
+            capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:   # a failed send puts the work back (never claim what did not start)
+            os.remove(os.path.join(TASKS, seat)); lines.insert(pick, f'{bean}\t*\t{prompt}')
+            print(f'DISPATCH-FAILED {seat} {bean}'); continue
+        print(f'DISPATCH {bean} -> {seat}')
+    open(QUEUE, 'w').write(''.join(l + '\n' for l in lines))
+    if len(idle) >= 2 and not lines:
+        alert('queue-empty-' + time.strftime('%Y%m%d%H'), f'{len(idle)} seats idle, lead queue empty',
+              f'Idle: {" ".join(idle)}. Fill {QUEUE}.')
+
+
+if __name__ == '__main__':
+    board() if '--board' in sys.argv else check()

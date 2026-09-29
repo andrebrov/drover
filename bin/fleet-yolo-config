@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""fleet-yolo-config — make yolo the DEFAULT in every fleet seat's own worktree config.
+
+herdr restores agents with the harness's native `--resume` and no extra flags (it has no per-agent
+resume-args setting), so after any host reboot every seat comes back prompting for approvals. Putting
+yolo in the PER-PROJECT config the harness reads on any start (fresh or resumed) fixes that at the
+source, instead of relying on `fleet-yolo` to catch it after the fact. Scoped to seat worktrees only;
+your own interactive sessions are untouched. Idempotent — safe to run every tick.
+
+  claude  -> .claude/settings.local.json   permissions.allow (a LOCAL defaultMode bypass is NOT honoured — measured)
+  codex   -> .codex/config.toml            approval_policy / sandbox_mode; git skip-worktree so a seat can't commit it
+  cursor  -> .cursor/cli.json              allow Shell/Read/Write everything
+  other harnesses -> no per-project config knob; fleet-yolo's relaunch stays the backstop
+"""
+import json
+import os
+import re
+import subprocess
+
+HOME = os.path.expanduser('~')
+
+
+def drover_env():
+    env = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drover-env')
+    out = subprocess.run(
+        ['bash', '-c', '. "$0"; printf "%s\\0%s" "${FLEET:-$DROVER_ROSTER}" "$DROVER_WORKTREES"', env],
+        capture_output=True, text=True, check=True).stdout.split('\0')
+    return dict(zip(('roster', 'worktrees'), out))
+
+
+CFG = drover_env()
+ROOT = CFG['worktrees']
+roster = {s.split(':')[0]: s.split(':')[1] for s in CFG['roster'].split() if ':' in s}
+
+CODEX_HEAD = '''# fleet-yolo-config: this seat runs unattended.
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+'''
+
+
+def claude(wt):
+    p = os.path.join(wt, '.claude/settings.local.json')
+    d = json.load(open(p)) if os.path.exists(p) else {}
+    # defaultMode=bypassPermissions in LOCAL settings is NOT honoured (measured: a plain Bash write was
+    # still blocked; the same probe with the harness's own skip-permissions launch flag passed). Allow
+    # rules ARE honoured — list what your seats actually need.
+    want = ['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'NotebookEdit']
+    perms = d.setdefault('permissions', {})
+    perms.pop('defaultMode', None)
+    allow = perms.setdefault('allow', [])
+    if all(w in allow for w in want):
+        return 'ok'
+    allow.extend(w for w in want if w not in allow)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    json.dump(d, open(p, 'w'), indent=2)
+    return 'set'
+
+
+def codex(wt):
+    p = os.path.join(wt, '.codex/config.toml')
+    s = open(p).read() if os.path.exists(p) else ''
+    if 'approval_policy = "never"' in s:
+        return 'ok'
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    open(p, 'w').write(CODEX_HEAD + s)
+    # a tracked project config file must never be committed by a seat that edits it
+    subprocess.run(['git', '-C', wt, 'update-index', '--skip-worktree', '.codex/config.toml'],
+                    capture_output=True)
+    return 'set'
+
+
+def cursor(wt):
+    p = os.path.join(wt, '.cursor/cli.json')
+    d = json.load(open(p)) if os.path.exists(p) else {}
+    allow = d.setdefault('permissions', {}).setdefault('allow', [])
+    want = ['Shell(*)', 'Read(**)', 'Write(**)']
+    if all(w in allow for w in want):
+        return 'ok'
+    allow.extend(w for w in want if w not in allow)
+    d['permissions'].setdefault('deny', [])
+    json.dump(d, open(p, 'w'), indent=2)
+    return 'set'
+
+
+H = {'claude': claude, 'codex': codex, 'cursor': cursor}
+for seat, kind in sorted(roster.items()):
+    wt = os.path.join(ROOT, f'fleet-{seat}')
+    if not os.path.isdir(wt):
+        continue
+    f = H.get(kind)
+    print(f'{seat:20} {kind:8} {f(wt) if f else "no project knob (yolo_guard backstop)"}')
