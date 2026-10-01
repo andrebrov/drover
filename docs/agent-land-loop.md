@@ -20,12 +20,21 @@ Repo: `$DROVER_REPO`. You run in your own worktree (`$DROVER_WORKTREES/fleet-<yo
 5. Update the bean file NOW, before review: tick the checklist items you proved, add a summary of
    changes, and set it complete only if every item is done (else leave it open and write what is left).
    Commit code + the bean file together, explicit paths.
-6. Rebase: `git fetch -q origin && git rebase origin/main`. Re-run the build and the touched suites
-   after the rebase — a clean rebase can still break behaviour the pre-rebase run never exercised.
+6. Rebase: `git fetch -q origin && git rebase origin/main`. Re-run the build and the RELATED tests after
+   the rebase — the tests of every file that imports what you changed (e.g. `jest --findRelatedTests
+   <changed files>`), the same set the pre-push hook runs. Your touched suites alone miss callers: a change
+   that passed all 33 of its own suites broke a route test it never touched.
 7. Review the FINAL diff (after rebase) with a DIFFERENT model than yours — pipe the diff to whichever
    other harness is free (`git diff origin/main...HEAD | <other harness> "<review prompt>"`), read-only,
    asking it to check correctness, tests that fail when the code is broken, and production safety, and
    to reply with a clear APPROVE/CHANGES verdict and file:line findings.
+   - If the reviewer returns an execution error or an empty result (seen from a sandboxed seat while the
+     same command worked from the lead's shell), do NOT retry in a loop and do NOT push unreviewed: write
+     the diff to `<reports>/<you>-<bean>.diff`, make the first line of your report
+     `REVIEW-NEEDED <local sha> <diff path>`, and `fleet-done ... BLOCKED`. The observer holds your seat
+     (it is waiting, not free) and alerts the lead, who runs the review and sends you the findings.
+   - Never put a list-taking flag (`--allowedTools`, `--tools`, ...) before a positional prompt: it
+     swallows the prompt. Pipe the prompt and the diff on stdin instead.
    Fix real findings, commit, and review AGAIN — up to 3 rounds. Any code change after an APPROVE,
    including conflict resolution in a later rebase, needs a fresh review of the new final diff.
    After round 3 with the last fixes still unreviewed, do NOT stop and wait for the lead: run ONE final
