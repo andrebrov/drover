@@ -33,10 +33,11 @@ def drover_env():
     """The same config every bash script sees: source drover-env (next to this file) and read it back."""
     env = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drover-env')
     out = subprocess.run(
-        ['bash', '-c', '. "$0"; printf "%s\\0%s\\0%s\\0%s\\0%s" "$DROVER_REPO" "$FLEET_TASKS" '
-         '"$FLEET_REPORTS" "$FLEET_STATE" "$DROVER_HOME"', env],
+        ['bash', '-c', '. "$0"; printf "%s\\0%s\\0%s\\0%s\\0%s\\0%s\\0%s\\0%s\\0%s" "$DROVER_REPO" "$FLEET_TASKS" '
+         '"$FLEET_REPORTS" "$FLEET_STATE" "$DROVER_HOME" "$DROVER_LEAD_SEATS" "$DROVER_SRC" '
+         '"$DROVER_SELF_SERVE" "$DROVER_MIGRATIONS_STATUS"', env],
         capture_output=True, text=True, check=True).stdout.split('\0')
-    return dict(zip(('repo', 'tasks', 'reports', 'state', 'home'), out))
+    return dict(zip(('repo', 'tasks', 'reports', 'state', 'home', 'leads', 'src', 'self_serve', 'mig_status'), out))
 
 
 CFG = drover_env()
@@ -73,6 +74,9 @@ def git(*a):
     return sh('git', '-C', REPO, *a).strip()
 
 
+# The pane ends in the harness's own API error (the turn was dropped), not in a question or a finish.
+HARNESS_ERR = re.compile(r'Something went wrong\. Please try again|stream closed with error|stream disconnected|'
+                         r'API Error: (5\d\d|Overloaded|Connection)|ECONNRESET.*(anthropic|openai|cursor)', re.I)
 SENT = f'{STATE}/observe-sent'   # key -> last alert epoch; one alert per key per 6h
 
 
@@ -89,10 +93,35 @@ def alert(key, title, body):
 
 
 def agents():
+    # herdr drops a seat's name when it re-detects the agent (a fresh session, a restart): several seats went
+    # unnamed at once and became unaddressable, so dispatch and prompts failed. Remember pane -> seat for every
+    # named seat; rename an unnamed agent sitting on a remembered pane.
     try:
-        return {a['name']: a for a in json.loads(sh('herdr', 'agent', 'list'))['result']['agents'] if a.get('name')}
+        lst = json.loads(sh('herdr', 'agent', 'list'))['result']['agents']
     except Exception:
         return {}
+    mp_file = f'{STATE}/pane-seat.json'
+    try:
+        mp = json.load(open(mp_file))
+    except Exception:
+        mp = {}
+    leads = set(CFG['leads'].split())
+    changed = False
+    for a in lst:
+        n, pane = a.get('name'), a.get('pane_id')
+        if n and pane and n not in leads and mp.get(pane) != n:
+            mp[pane] = n; changed = True
+    named = {a.get('name') for a in lst if a.get('name')}
+    for a in lst:
+        pane = a.get('pane_id')
+        seat = mp.get(pane) if pane else None
+        if not a.get('name') and seat and seat not in named and '--dry' not in sys.argv:
+            r = subprocess.run(['herdr', 'agent', 'rename', pane, seat], capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                a['name'] = seat; named.add(seat); print(f'RENAMED {pane} -> {seat}')
+    if changed:
+        tmp = mp_file + '.tmp'; json.dump(mp, open(tmp, 'w')); os.replace(tmp, mp_file)
+    return {a['name']: a for a in lst if a.get('name')}
 
 
 def screen(name):
@@ -125,6 +154,15 @@ def progress(seat, bean, since):
         t, name = line.split(' ', 1)
         if t.isdigit():
             best = max(best, int(t)); br = name
+    # ...and seats often name the branch after a bean they FILED, not the queue item: any commit on this seat's
+    # branches made after the dispatch is progress on its current assignment (one was flagged "stalled" with
+    # four fresh commits on a differently named branch).
+    if best == since:
+        for line in git('for-each-ref', '--sort=-committerdate', '--format=%(committerdate:unix) %(refname:short)',
+                        f'refs/heads/fleet/{seat}-*').splitlines()[:1]:
+            t, name = line.split(' ', 1)
+            if t.isdigit() and int(t) > since:
+                best = int(t); br = name
     for fn in os.listdir(REPORTS) if os.path.isdir(REPORTS) else []:
         if bean in fn and fn.endswith('.md'):
             best = max(best, os.path.getmtime(os.path.join(REPORTS, fn)))
@@ -179,6 +217,15 @@ def check():
         p, br = progress(seat, bean, t0)
         st = ag.get(seat, {}).get('agent_status', 'absent')
         rep = REPORT_OF.get((seat, bean)) or os.path.join(REPORTS, f'{seat}-{bean}.md')
+        if not os.path.exists(rep) and os.path.exists(os.path.join(REPORTS, f'{bean}.md')):
+            rep = os.path.join(REPORTS, f'{bean}.md')   # seats sometimes drop the seat prefix
+        if not os.path.exists(rep) and os.path.isdir(REPORTS):
+            # a brief may name its own report path: take the seat's newest report written since the assignment
+            # (a finished seat was flagged "stalled" 30 min after writing its report under the brief's name)
+            mine = [os.path.join(REPORTS, f) for f in os.listdir(REPORTS) if f.startswith(seat + '-') and f.endswith('.md')]
+            mine = [f for f in mine if os.path.getmtime(f) >= t0]
+            if mine:
+                rep = max(mine, key=os.path.getmtime)
         if st != 'working' and os.path.exists(rep) and os.path.getmtime(rep) >= t0:
             body = open(rep, errors='ignore').read()
             # the FIRST line is the verdict (the self-land contract's report step); a trailing "DONE <path>"
@@ -186,19 +233,33 @@ def check():
             head = next((l for l in body.splitlines()[:3] if re.search(r'\b(DONE|BLOCKED|LANDED)\b', l)), '')
             verdict = head or next((l for l in reversed(body.strip().splitlines())
                                      if re.match(r'(DONE|BLOCKED)\b', l)), '')
+            if re.match(r'\W*REVIEW-NEEDED', body):
+                # the seat's cross-model reviewer failed and it handed the diff to the lead: it is WAITING, not
+                # free. Releasing it here dispatched new work over a slice the lead was about to approve.
+                alert(f'review-needed-{seat}-{bean}', f'{seat} needs a lead review on {bean}', body.splitlines()[0][:300])
+                continue
             if 'BLOCKED' in verdict:
                 why = next((l for l in body.splitlines() if re.match(r'\s*(HUMAN|LEAD|BLOCKED)[:\s]', l)), verdict)
                 key = f'blocked-{seat}-{bean}-' + hashlib.md5(verdict.encode()).hexdigest()[:6]
                 alert(key, f'{seat} BLOCKED on {bean}', f'{why.strip()[:300]} — report: {rep}')
                 os.remove(os.path.join(TASKS, seat)); continue
-            if re.search(r'DONE|LANDED', verdict) or not verdict:
-                # a report written after the assignment by a seat that stopped = finished (a research report
-                # leads with its summary, not a DONE word — the same shape as a genuinely done task)
+            # A report with NO verdict line is a progress note, not a finish: releasing on it dispatched new work
+            # over a seat mid-task. Research and verification reports lead with a verdict word too.
+            if not verdict and re.search(r'^\W*(HUNT|VERDICT|COMPLETE|PASSED|[0-9]+/[0-9]+ (PASS|scenarios))',
+                                         body, re.M | re.I):
+                verdict = 'DONE'
+            if re.search(r'DONE|LANDED', verdict):
                 print(f'released {seat} ({bean}: {(verdict or (body.splitlines()[0] if body else ""))[:80]})')
                 os.remove(os.path.join(TASKS, seat)); continue
         if st != 'working' and NOW - p > STALL_MIN * 60 and re.search(
                 r'(shells?|monitors?|background terminals?) (still )?running|still running', screen(seat)):
             continue   # idle between waits on its own background jobs (herdr says "done") — busy, not stalled
+        if st != 'working' and NOW - p > STALL_MIN * 60 and HARNESS_ERR.search(screen(seat)[-1500:]):
+            # the harness's API dropped the turn mid-task: not a stall. One nudge to continue fixes it;
+            # reassigning would throw the work away.
+            alert(f'harness-err-{seat}-{bean}', f'{seat}: its harness API dropped the turn on {bean}',
+                  'The pane ends in a harness/API error, not a question or a finish. Nudge it to continue from the last step.')
+            continue
         if st != 'working' and NOW - p > STALL_MIN * 60:
             alert(f'stall-{seat}-{bean}', f'{seat} stalled on {bean}',
                   f'status={st}, no commit on {br} and no report for {int((NOW - p) / 60)} min. '
@@ -208,10 +269,17 @@ def check():
     try:
         q = ('{ beans(filter:{status:["todo"], priority:["critical"], type:["bug","feature","task"], '
              'isBlocked:false}) { id title } }')
-        crit = json.loads(sh('beans', 'query', '--json', q, cwd=REPO, timeout=30))['beans']
+        # Read the board as it is on origin/main, not the shared checkout: the checkout lags every landing and
+        # reported beans already completed on main as unowned.
+        snap = f'{STATE}/beans-origin'
+        sh('git', '-C', REPO, 'fetch', '-q', 'origin', timeout=60)
+        subprocess.run(['rm', '-rf', snap]); os.makedirs(snap, exist_ok=True)
+        subprocess.run(f"git -C '{REPO}' archive origin/main .beans .beans.yml | tar -x -C '{snap}'", shell=True, timeout=60)
+        crit = json.loads(sh('beans', 'query', '--json', q, cwd=snap, timeout=30))['beans']
     except Exception:
         crit = []
-    owned = {b for _, b, _ in ledger()}
+    # owned = assigned on a seat, claimed through state/owner/<bean> (self-serve or lead), or queued
+    owned = {b for _, b, _ in ledger()} | (set(os.listdir(f'{STATE}/owner')) if os.path.isdir(f'{STATE}/owner') else set())
     if os.path.exists(QUEUE):
         owned |= {l.split('\t')[0] for l in open(QUEUE) if l.strip()}
     free = [b['id'] for b in crit if b['id'] not in owned and not os.path.exists(f"{STATE}/noop-held/{b['id']}")]
@@ -226,7 +294,10 @@ def check():
         if not fn.endswith('.md') or NOW - os.path.getmtime(f) > 6 * 3600 or '-review-' in fn:
             continue
         head = open(f, errors='ignore').read(600)
-        if not re.search(r'LANDED|pushed|DONE', head) or re.match(r'\W*BLOCKED', head):
+        # "not pushed" is the opposite of a landing claim, and REVIEW-NEEDED waits on the lead
+        first = head.splitlines()[0] if head else ''
+        if (not re.search(r'LANDED|(?<!not )(?<!NOT )\bpushed|DONE', head) or re.match(r'\W*(BLOCKED|REVIEW-NEEDED)', head)
+                or re.search(r'\bBLOCKED\b|not landed|NOT LANDED', first)):
             continue   # a BLOCKED report claims nothing; the blocked alert above covers it
         owner = next((n for n in ag if fn.startswith(n + '-')), None)
         if owner and ag[owner].get('agent_status') == 'working':
@@ -240,6 +311,48 @@ def check():
 
     # 4b. hand queued work to free seats
     dispatch(ag, off)
+
+    # 4c. optional: migrations on main but not applied (hourly). A "migration NNN needs applying" line in a report
+    # was the only signal, and migrations sat unapplied while the code that needs them was live.
+    # DROVER_MIGRATIONS_STATUS = a command run in DROVER_REPO that prints one "PENDING <number>_<name>" per
+    # unapplied migration. state/migrations-held: one per line, first token the number, the rest the reason.
+    if CFG['mig_status']:
+        mstamp = f'{STATE}/observe-migrations.stamp'
+        if not os.path.exists(mstamp) or NOW - os.path.getmtime(mstamp) > 3600:
+            open(mstamp, 'w').write(str(int(NOW)))
+            hf = f'{STATE}/migrations-held'
+            held = {l.split()[0] for l in open(hf) if l.split()} if os.path.exists(hf) else set()
+            out = sh('bash', '-c', CFG['mig_status'], cwd=REPO, timeout=180)
+            pend = [m for m in re.findall(r'PENDING (\d+)_\S+', out) if m not in held]
+            if pend:
+                alert('migrations-pending-' + '-'.join(pend), f'{len(pend)} migration(s) on main not applied: {" ".join(pend)}',
+                      'Code that needs them may already be deployed. Review each and apply, '
+                      'or add it to state/migrations-held with a reason.')
+
+    # 4d. keep the shared checkout's main current. Hooks that measure LOCAL main refused good pushes while it sat
+    # far behind, because the old fast-forward swallowed its own failure.
+    git('fetch', '-q', 'origin')
+    if git('rev-parse', '--abbrev-ref', 'HEAD') == 'main' and git('rev-list', '--count', 'main..origin/main') not in ('', '0'):
+        r = subprocess.run(['git', '-C', REPO, 'merge', '-q', '--ff-only', 'origin/main'], capture_output=True, text=True)
+        lock = f'{REPO}/.git/index.lock'
+        if r.returncode != 0 and 'index.lock' in r.stderr and (not os.path.exists(lock) or NOW - os.path.getmtime(lock) < 600):
+            pass   # a live git op holds the lock and frees it in seconds; only a lock older than 10 min is stuck
+        elif r.returncode != 0:
+            blockers = re.findall(r'^\t(\S+)', r.stderr, re.M)[:6]
+            alert('main-ff-blocked-' + time.strftime('%Y%m%d%H'), 'shared checkout main cannot fast-forward',
+                  f'{git("rev-list", "--count", "main..origin/main")} behind; blocked by: '
+                  + (', '.join(blockers) or r.stderr.strip()[:200])
+                  + '. Compare each with origin/main; move identical or stale copies aside, then fast-forward.')
+
+    # 4e. bean files created in the SHARED checkout instead of a seat worktree are invisible to dispatch and to
+    # every other seat until someone commits them.
+    stray = [l[3:] for l in git('status', '--porcelain', '--untracked-files=all', '--', '.beans').splitlines()
+             if l.startswith('?? ')]
+    if stray:
+        alert('stray-beans-' + hashlib.md5(' '.join(sorted(stray)).encode()).hexdigest()[:8],
+              f'{len(stray)} bean file(s) uncommitted in the shared checkout',
+              'Not on main, so dispatch cannot see them: ' + ', '.join(os.path.basename(x)[:40] for x in stray[:6])
+              + ('…' if len(stray) > 6 else '') + '. Have the filing seat commit them from its worktree and push.')
 
     # 5. optional: production scheduled jobs stalled (hourly; skipped with no DROVER_PROD_LOG_GROUP)
     if PROD_LOG_GROUP:
@@ -263,6 +376,10 @@ def check():
 # to mean "only take a line that names this seat explicitly", for a seat with a narrower remit).
 QUEUE = f'{STATE}/lead-queue'
 POOL = f'{STATE}/lead-pool'
+# Harnesses that pick their own work when nothing queued fits them (DROVER_SELF_SERVE, e.g. "opencode"), per
+# docs/self-serve-playbook.md. Seats on cheap or free models otherwise sat idle beside a queue routed elsewhere.
+SELF_SERVE = set(CFG['self_serve'].split())
+PLAYBOOK = os.path.join(CFG['src'], 'docs', 'self-serve-playbook.md')
 
 
 def dispatch(ag, off):
@@ -286,10 +403,27 @@ def dispatch(ag, off):
                           or seat in l.split('\t')[1].split(','))
                      )), None)
         if pick is None:
-            idle.append(seat); continue
+            # throttled per seat, so a seat that finds nothing is not re-prompted every tick
+            stamp = f'{STATE}/self-serve-{seat}.stamp'
+            if a.get('agent') in SELF_SERVE and (not os.path.exists(stamp) or NOW - os.path.getmtime(stamp) > 1200):
+                open(stamp, 'w').write(str(int(NOW)))
+                lines.append(f'self-serve\t{seat}\tSelf-serve: read and follow {PLAYBOOK} section "Self-serve" '
+                             '(pick an unowned ready bean in scope and land it, or run one hunt).')
+                pick = len(lines) - 1
+            else:
+                idle.append(seat); continue
         bean, _, prompt = lines.pop(pick).split('\t', 2)
         rep = os.path.join(REPORTS, f'{seat}-{bean}.md')
         open(os.path.join(TASKS, seat), 'w').write(f'{int(NOW)}\t{bean}\tnone\t{rep}\n')
+        if bean == 'self-serve' and a.get('agent') == 'opencode':
+            # each self-serve round starts in a FRESH opencode session (`/new` keeps the model): rounds piled up
+            # in one session until its context ran out mid-bean. herdr sees the new session as a new agent and
+            # drops the seat name, so re-assert it on the same pane.
+            pane = a.get('pane_id')
+            subprocess.run(['herdr', 'agent', 'prompt', seat, '/new'], capture_output=True, text=True, timeout=30)
+            time.sleep(3)
+            if pane:
+                subprocess.run(['herdr', 'agent', 'rename', pane, seat], capture_output=True, text=True, timeout=15)
         r = subprocess.run(
             ['herdr', 'agent', 'prompt', seat, prompt + f' Report to {rep} (first line = verdict + pushed SHA).'],
             capture_output=True, text=True, timeout=60)
@@ -298,9 +432,9 @@ def dispatch(ag, off):
             print(f'DISPATCH-FAILED {seat} {bean}'); continue
         print(f'DISPATCH {bean} -> {seat}')
     open(QUEUE, 'w').write(''.join(l + '\n' for l in lines))
-    if len(idle) >= 2 and not lines:
-        alert('queue-empty-' + time.strftime('%Y%m%d%H'), f'{len(idle)} seats idle, lead queue empty',
-              f'Idle: {" ".join(idle)}. Fill {QUEUE}.')
+    if len(idle) >= 2:   # not only when the queue is EMPTY: idle seats beside a queue none may take stayed silent
+        alert('queue-empty-' + time.strftime('%Y%m%d%H'), f'{len(idle)} seats idle, nothing in the lead queue they may take',
+              f'Idle: {" ".join(idle)}. Queue holds {len(lines)} line(s) routed elsewhere. Fill or re-route {QUEUE}.')
 
 
 if __name__ == '__main__':

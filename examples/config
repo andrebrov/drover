@@ -17,6 +17,13 @@ DROVER_LEAD_SEATS="${DROVER_LEAD_SEATS:-lead lead-backup}"
 # its pinned model, so a restart cannot quietly move e.g. the judge to the harness default.
 DROVER_SEAT_MODELS="${DROVER_SEAT_MODELS:-}"   # e.g. 'judge=<model-id> architect=<model-id>'
 
+# Observer mode (fleet-observe). Harnesses whose idle seats pick their own work from the board when no queued
+# line fits them (docs/self-serve-playbook.md). Empty = idle seats just raise the idle alert.
+DROVER_SELF_SERVE="${DROVER_SELF_SERVE:-}"            # e.g. 'opencode'
+# A command, run in DROVER_REPO, that prints one "PENDING <number>_<name>" line per unapplied migration.
+# fleet-observe alerts hourly on any not listed in state/migrations-held. Empty = check off.
+DROVER_MIGRATIONS_STATUS="${DROVER_MIGRATIONS_STATUS:-}"   # e.g. 'npx tsx scripts/migrate.mts --status'
+
 # What a coder and a reviewer are told to run before they may say DONE / APPROVE.
 DROVER_BUILD="${DROVER_BUILD:-}"          # e.g. 'npm run build' or 'cd backend && npm run build'
 DROVER_TEST="${DROVER_TEST:-}"            # e.g. 'npx jest <file>' — how to run one test file
