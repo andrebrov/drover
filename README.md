@@ -92,6 +92,9 @@ time.**
   rounds, then a self-run SHIP-bar review takes over — see `docs/LESSONS.md`), push through the one
   fleet-wide push lock (`examples/pre-push-lock.sh`), and prove the push landed with
   `git merge-base --is-ancestor <sha> origin/main` before reporting DONE.
+- **Self-serve** (`docs/self-serve-playbook.md`): seats on a harness listed in `DROVER_SELF_SERVE` pick their
+  own ready bean (claimed atomically through `state/owner/<bean>`) or run one hunt when no queued line fits
+  them, instead of idling beside a queue routed to other harnesses.
 
 `fleet-observe --board` gives a one-screen read of the fleet in observer mode, and observer ticks still
 stamp `state/last` so the tick-stall alert doesn't fire on a watcher that's running exactly as configured.
@@ -273,7 +276,10 @@ values as `${VAR:-value}` so an environment variable still wins. See [`examples/
 | `DROVER_SPEC_FEED_CAP` | `6` | `fleet-spec-feed`: open feeder-filed beans at once. |
 | `DROVER_GHOST_GRACE_MIN` | `30` | `fleet-ghost-reap`: minutes an in-progress bean must sit untouched before it counts as a ghost. |
 | `DROVER_GENERATED` | empty | ERE of generated paths `fleet-claim` refuses to claim. |
-| `DROVER_LEAD_SEATS` | `lead lead-backup` | Seats `fleet-yolo` never restarts. |
+| `DROVER_LEAD_SEATS` | `lead lead-backup` | Seats `fleet-yolo` never restarts and `fleet-observe` never maps for auto-rename. |
+| `DROVER_SEAT_MODELS` | empty | `seat=model` pairs: a seat with no `--model` of its own is relaunched on its pin by `fleet-yolo`. |
+| `DROVER_SELF_SERVE` | empty | Harnesses whose idle seats self-serve per `docs/self-serve-playbook.md` (e.g. `opencode`). |
+| `DROVER_MIGRATIONS_STATUS` | empty | Command printing `PENDING <n>_<name>` per unapplied migration; `fleet-observe` alerts hourly on any not in `state/migrations-held`. |
 | `DROVER_HOME` | `~/.local/share/drover` | Queue, inbox, tasks, briefs, reports, snapshots, watcher state, logs. |
 | `DROVER_WORKTREES` | `~/.herdr/worktrees/<repo name>` | Where herdr puts seat worktrees. |
 | `DROVER_BEAN_PREFIX` | from `.beans.yml` | Bean id prefix; ids are `<prefix>` + 4 chars (`DROVER_BEAN_RE` to change). |
