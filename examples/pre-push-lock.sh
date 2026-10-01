@@ -22,7 +22,13 @@ PUSH_LOCK="${DROVER_HOME:-$HOME/.local/share/drover}/watch/state/.push-lock"
 mkdir -p "$(dirname "$PUSH_LOCK")"
 until mkdir "$PUSH_LOCK" 2>/dev/null; do
   _owner=$(cat "$PUSH_LOCK/pid" 2>/dev/null || true)
-  if [ -n "$_owner" ] && ! kill -0 "$_owner" 2>/dev/null; then rm -rf "$PUSH_LOCK"; continue; fi
+  # kill -0 fails for a DEAD pid ("No such process") AND for a LIVE pid we may not signal ("Operation not
+  # permitted", e.g. a hook started from a sandboxed seat). Treating both as dead stole a live lock: two
+  # hooks ran at once and approved pushes lost the race to main. Only "no such process" means dead.
+  if [ -n "$_owner" ] && kill -0 "$_owner" 2>&1 | grep -qi 'no such process'; then
+    printf '%s\tstale lock from dead pid %s taken by pid %s\n' "$(date '+%F %T')" "$_owner" "$$" >> "$(dirname "$PUSH_LOCK")/push-lock-steals.log"
+    rm -rf "$PUSH_LOCK"; continue
+  fi
   echo "[pre-push] another push (pid ${_owner:-?}) holds the lock; waiting..." >&2
   sleep 15
 done
