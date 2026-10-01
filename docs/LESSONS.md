@@ -988,3 +988,68 @@ heading in the bean file, on your branch, before you report done.** Anything mai
 doesn't, and that isn't named there, is a finding a reviewer (or an automated diff-against-main check)
 raises on sight — deliberate deletions are named up front, never discovered after the fact.
 **Metric (fails if >0):** a landed branch missing a main file with no matching `## Deletes` entry.
+
+## A replaced path is not replaced until its old writers are gone (2026-10-01)
+
+Four live defects in one period had one shape: a governed path was built for an action (approval gate,
+consent filter, receipts), and the legacy path that performs the same write stayed live and skipped the
+guarantee. A weekly refresh re-uploaded audiences without the consent filter the governed push applies; a
+legacy "auto" mode applied budget changes without the approval gate; a legacy approve route recorded the
+approval and never executed; two stores disagreed about the automation mode. **The rule: a change that
+introduces a governed path for an action lists every other writer of the same platform object (search for the
+client call, not the service name) and, in the same change, routes each through the governed path or deletes
+it.** The check that can fail: a test that fails when a second call site for the write exists outside the
+governed module. **Metric (fails if >0):** hunt findings of the shape "a second path skips the guarantee".
+
+## An operator gate is tested through the operator's exact command (2026-10-01)
+
+A migration carried a deliberate operator gate: it refused to run unless the operator set a session setting
+confirming a manual drain. Its must-fire tests ran the SQL directly and passed. Through the real migration
+runner the gate could never be satisfied: the runner set its own connection options and silently replaced the
+operator's, so the documented command always refused. The known-good case of a gate has to go through the same
+entry point the operator uses — the runner, the CLI, the button — not the function underneath it.
+**Metric (fails if >0):** gates found unreachable through their documented command.
+
+## A gate that fails under fleet load is the lead's problem the same hour (2026-10-01)
+
+A critical security fix was refused by the pre-push gate nine times. Each run a different suite failed
+(connection resets, socket hang-ups, the test runner's default timeout), every one green when run alone, at a
+load average several times the core count. One was a one-off module-load cost that always landed on whichever
+test ran first (found by swapping the test order). **Rules:** (1) a seat whose push is refused twice on suites
+that pass alone stops and reports BLOCKED with the suite names and the load average — it never loops and never
+skips the hook; (2) the lead fixes the timing root (first-load cost, shared server lifecycle) or lands it the
+same hour, and any raised timeout carries the measurement that justifies it.
+**Metric:** pre-push refusals per day whose failing suites pass alone.
+
+## A bean is complete only when its fix is an ancestor of origin/main (2026-10-01)
+
+A critical bean sat `completed` on the board while none of its commits were on main: the status was set in a
+branch commit that never landed. The completion must ride in the SAME push that lands the fix. The observer's
+stray-bean alert caught it (the completed bean file sat uncommitted in the shared checkout);
+`fleet-completed-audit` covers the other half. **A stray bean file that says completed is checked for ancestry
+before anyone commits it — never committed as-is.**
+
+## The lead's own mistakes get mechanical rules (2026-10-01)
+
+The lead caused the largest share of incidents in the period. Each one became a rule a script or a habit can
+enforce:
+- File bodies (briefs, notes, bean text) are written with an editor tool or one quoted heredoc. A quoted heredoc
+  nested inside `bash <<'EOF'` ends the OUTER script at the inner terminator, and the rest runs in the
+  interactive shell — queue lines were silently lost that way.
+- Lists of paths go through bash or a script, never an unquoted variable in zsh: zsh does not word-split it, so a
+  multi-file `git add` failed as one bogus path.
+- A brief's report path is always `<seat>-<task-key>.md`. A brief that named another path produced a false
+  stall alert 30 minutes after the seat finished (the observer now also accepts the seat's newest report since
+  the assignment).
+- Outward-facing copy starts from the newest positioning record, never from an older dated reference file.
+- Never print any part of a secret to check it; test presence with `[ -n "$X" ]`.
+- Edit a live hook or watcher by writing a temp copy and `mv` over it, never in place: an in-place edit broke a
+  hook that was running at that moment.
+**Metric:** lead self-inflicted incidents per session (target ≤ 2).
+
+## Report verdict words are a contract (2026-10-01)
+
+The first line of a report is the verdict and starts with one of: DONE, LANDED, BLOCKED, PASSED, HUNT, VERDICT,
+COMPLETE, REVIEW-NEEDED, or `N/M PASS`. A verification report that led with PASSED was not recognised and its seat
+was flagged stalled while finished; a report with no verdict line at all is a progress note and does not free the
+seat (releasing on it once dispatched new work over a seat mid-task).
