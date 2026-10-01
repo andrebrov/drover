@@ -60,11 +60,22 @@ reap)
   : > "$F.keep"
   while IFS=$'\t' read -r a bean path ts; do
     [ -n "${bean:-}" ] || continue
-    bf=$(git -C "$ROOT" ls-files .beans 2>/dev/null | grep -m1 "^.beans/$bean--" || true)
+    # Read the board from origin/main, not the local checkout: a stale local main reported
+    # landed beans as still open and kept their claims.
+    bf=$(git -C "$ROOT" ls-tree -r --name-only origin/main .beans 2>/dev/null | grep -m1 "^.beans/$bean--" || true)
     st="missing"
-    [ -n "$bf" ] && st=$(git -C "$ROOT" show "main:$bf" 2>/dev/null | awk '/^status:/{print $2; exit}')
+    [ -n "$bf" ] && st=$(git -C "$ROOT" show "origin/main:$bf" 2>/dev/null | awk '/^status:/{print $2; exit}')
+    # A PARKED bean (noop-held) that no seat's task file names guards nothing: nobody is editing it.
+    # Measured: three seats blocked in one day by claims of parked beans. An owned bean keeps its claims.
+    if [ "$st" != missing ] && [ -e "$FLEET_STATE/noop-held/$bean" ] \
+       && ! cut -f2 "$FLEET_TASKS"/* 2>/dev/null | grep -qx "$bean"; then st=parked; fi
+    # A seat whose harness is switched off (state/harness-off) edits nothing: its old claims blocked
+    # live work for two weeks after the harness ran out of credit.
+    for h in $(cat "$FLEET_STATE/harness-off" 2>/dev/null); do
+      case "$a" in "$h"*) st="harness-off" ;; esac
+    done
     case "$st" in
-      completed|scrapped|missing)
+      completed|scrapped|missing|parked|harness-off)
         echo "  released $path  ($bean is $st, held by $a)"; released=$((released+1)) ;;
       *) printf '%s\t%s\t%s\t%s\n' "$a" "$bean" "$path" "$ts" >> "$F.keep" ;;
     esac
