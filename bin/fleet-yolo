@@ -61,13 +61,16 @@ def log(msg):
 def drover_env():
     """The same config every bash script sees: source drover-env (next to this file) and read it back."""
     env = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drover-env')
-    out = subprocess.run(['bash', '-c', '. "$0"; printf "%s\\0%s\\0%s\\0%s\\0%s" "${FLEET:-$DROVER_ROSTER}" '
-                          '"$FLEET_STATE" "$FLEET_TASKS" "$DROVER_LEAD_SEATS" "$DROVER_WORKTREES"', env],
+    out = subprocess.run(['bash', '-c', '. "$0"; printf "%s\\0%s\\0%s\\0%s\\0%s\\0%s" "${FLEET:-$DROVER_ROSTER}" '
+                          '"$FLEET_STATE" "$FLEET_TASKS" "$DROVER_LEAD_SEATS" "$DROVER_WORKTREES" "$DROVER_SEAT_MODELS"', env],
                          capture_output=True, text=True, check=True).stdout.split('\0')
-    return dict(zip(('roster', 'state', 'tasks', 'leads', 'worktrees'), out))
+    return dict(zip(('roster', 'state', 'tasks', 'leads', 'worktrees', 'seat_models'), out))
 
 
 CFG = drover_env()
+# Per-seat model pins (DROVER_SEAT_MODELS="judge=model-a architect=model-b"): a seat with no --model of its
+# own is relaunched on its pinned model, so a restart cannot silently move it to the harness default.
+SEAT_MODEL = dict(p.split('=', 1) for p in CFG.get('seat_models', '').split() if '=' in p)
 
 
 def roster():
@@ -215,7 +218,7 @@ def restart(name, kind, pane, pid, cmd):
     # Preserve the seat's own --model across the restart unless --model=... overrides it. opencode
     # has no model flag on a bare relaunch either way, so it falls back to the spawn-time default.
     mm = re.search(r'--model[= ](\S+)', cmd)
-    model = MODEL or (mm.group(1) if mm else None) or (kind == 'opencode' and os.environ.get('FLEET_OPENCODE_MODEL')) or None
+    model = MODEL or (mm.group(1) if mm else None) or SEAT_MODEL.get(name) or (kind == 'opencode' and os.environ.get('FLEET_OPENCODE_MODEL')) or None
     args = FLAG[kind] + resume + (['--model', model] if model else [])
     if DRY:
         log(f'  WOULD RESTART {name} ({kind}, {pane}) with: {" ".join(args)}')

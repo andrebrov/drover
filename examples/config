@@ -13,6 +13,10 @@ DROVER_ROSTER="${DROVER_ROSTER:-claude-coder:claude codex-coder:codex opencode-c
 # Seats fleet-yolo must never restart (the lead sessions that run the fleet).
 DROVER_LEAD_SEATS="${DROVER_LEAD_SEATS:-lead lead-backup}"
 
+# Per-seat model pins, seat=model pairs. fleet-yolo relaunches a seat that has no --model of its own on
+# its pinned model, so a restart cannot quietly move e.g. the judge to the harness default.
+DROVER_SEAT_MODELS="${DROVER_SEAT_MODELS:-}"   # e.g. 'judge=<model-id> architect=<model-id>'
+
 # What a coder and a reviewer are told to run before they may say DONE / APPROVE.
 DROVER_BUILD="${DROVER_BUILD:-}"          # e.g. 'npm run build' or 'cd backend && npm run build'
 DROVER_TEST="${DROVER_TEST:-}"            # e.g. 'npx jest <file>' — how to run one test file
