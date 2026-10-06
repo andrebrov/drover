@@ -10,12 +10,16 @@ Ghost = in-progress, not an epic/milestone, no live child, no fleet state naming
 followup, reviews/approved/needs-land/noop-held/owner marker), and not touched for GRACE minutes (a
 just-dispatched bean has a task file; the grace covers the announce -> route window).
 
+A noop-held marker expires after 24h: it gates dispatch, so it needs a reaper. Ninety of them once sat
+for days and hid buildable beans from every seat. Expired markers move to state/noop-held.expired; a bean
+that is genuinely blocked on a human stays parked by its own blocked text, not by this flag.
+
 Env: DROVER_GHOST_GRACE_MIN  minutes a ghost must sit untouched (default 30)
 
   fleet-ghost-reap            reset ghosts to todo (+ a verify-first note) and commit on main
   fleet-ghost-reap --dry-run  list ghosts and which already have commits on main; change nothing
 """
-import datetime, glob, json, os, subprocess, sys
+import datetime, glob, json, os, subprocess, sys, time
 
 
 def drover_env():
@@ -32,6 +36,18 @@ if not REPO:
     sys.exit('fleet-ghost-reap: set DROVER_REPO (env or ~/.config/drover/config)')
 GRACE = int(os.environ.get('DROVER_GHOST_GRACE_MIN', '30'))
 DRY = '--dry-run' in sys.argv
+
+NH, NH_TTL = f'{S}/noop-held', 86400
+if os.path.isdir(NH) and not DRY:
+    os.makedirs(NH + '.expired', exist_ok=True)
+    for f in os.listdir(NH):
+        if time.time() - os.path.getmtime(os.path.join(NH, f)) > NH_TTL:
+            os.replace(os.path.join(NH, f), os.path.join(NH + '.expired', f))
+
+
+def marked(d, i):
+    p = f'{S}/{d}/{i}'
+    return os.path.exists(p) and (d != 'noop-held' or time.time() - os.path.getmtime(p) <= NH_TTL)
 
 
 def sh(*a):
@@ -70,7 +86,7 @@ for b in board:
     if b['status'] != 'in-progress' or b['type'] in ('epic', 'milestone'): continue
     if any(c['status'] not in ('completed', 'scrapped') for c in b.get('children') or []): continue
     if i in tasks or i in fups: continue
-    if any(os.path.exists(f'{S}/{d}/{i}') for d in ('reviews', 'approved', 'needs-land', 'noop-held', 'owner')): continue
+    if any(marked(d, i) for d in ('reviews', 'approved', 'needs-land', 'noop-held', 'owner')): continue
     try:
         age = (now - datetime.datetime.fromisoformat(b['updatedAt'].replace('Z', '+00:00'))).total_seconds() / 60
     except Exception:
@@ -111,4 +127,17 @@ if files:
     sh('git', 'add', '--', *files)
     c = sh('git', 'commit', '--only', '--no-verify', '-q', '-m',
            f'chore(beans): ghost-reap — {len(files)} abandoned in-progress bean(s) back to todo', '--', *files)
-    print(f'reset {len(files)}' + ('' if c.returncode == 0 else f' (commit failed: {c.stderr.strip()[:120]})'))
+    pushed = False
+    if c.returncode == 0:
+        # With no push lane running (observer mode, or DROVER_AUTOLAND unset), a commit left on the shared main
+        # diverges from origin and blocks every fast-forward of the checkout. Push it — but only as a plain
+        # fast-forward carrying nothing but this commit. Never rebase here: the shared checkout usually has
+        # uncommitted work in it, a rebase refuses on a dirty tree, and an autostash would touch other seats' files.
+        # TODO: when origin/main has moved, rebuild the commit on origin/main in a scratch worktree and push that.
+        sh('git', 'fetch', '-q', 'origin')
+        if sh('git', 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip() == 'main' and \
+                sh('git', 'rev-list', '--count', 'origin/main..HEAD').stdout.strip() == '1' and \
+                sh('git', 'merge-base', '--is-ancestor', 'origin/main', 'HEAD').returncode == 0:
+            pushed = sh('git', 'push', '-q', 'origin', 'HEAD:main').returncode == 0
+    print(f'reset {len(files)}' + (f' (commit failed: {c.stderr.strip()[:120]})' if c.returncode != 0
+                                   else ' pushed' if pushed else ' NOT PUSHED (origin moved or main has other local commits)'))

@@ -65,6 +65,12 @@ reap)
     bf=$(git -C "$ROOT" ls-tree -r --name-only origin/main .beans 2>/dev/null | grep -m1 "^.beans/$bean--" || true)
     st="missing"
     [ -n "$bf" ] && st=$(git -C "$ROOT" show "origin/main:$bf" 2>/dev/null | awk '/^status:/{print $2; exit}')
+    # ...but a bean filed on a branch is not on main YET: a claim under 24h old on a missing bean is live work,
+    # not stale. Releasing those dropped ~300 claims mid-change from one seat whose bean was still branch-only.
+    if [ "$st" = missing ] && [ -n "${ts:-}" ]; then
+      age=$(( $(date -u +%s) - $(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || echo 0) ))
+      [ "$age" -lt 86400 ] && st=young-branch-bean
+    fi
     # A PARKED bean (noop-held) that no seat's task file names guards nothing: nobody is editing it.
     # Measured: three seats blocked in one day by claims of parked beans. An owned bean keeps its claims.
     if [ "$st" != missing ] && [ -e "$FLEET_STATE/noop-held/$bean" ] \
