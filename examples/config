@@ -20,6 +20,9 @@ DROVER_SEAT_MODELS="${DROVER_SEAT_MODELS:-}"   # e.g. 'judge=<model-id> architec
 # Observer mode (fleet-observe). Harnesses whose idle seats pick their own work from the board when no queued
 # line fits them (docs/self-serve-playbook.md). Empty = idle seats just raise the idle alert.
 DROVER_SELF_SERVE="${DROVER_SELF_SERVE:-}"            # e.g. 'opencode'
+# Areas a single seat owns alone (`area:owner-seat`, space-separated). Self-serve prompts to every OTHER seat say
+# never to take a bean in them. Empty = no owned areas.
+DROVER_OWNED_AREAS="${DROVER_OWNED_AREAS:-}"          # e.g. 'billing:billing-reviewer'
 # A command, run in DROVER_REPO, that prints one "PENDING <number>_<name>" line per unapplied migration.
 # fleet-observe alerts hourly on any not listed in state/migrations-held. Empty = check off.
 DROVER_MIGRATIONS_STATUS="${DROVER_MIGRATIONS_STATUS:-}"   # e.g. 'npx tsx scripts/migrate.mts --status'

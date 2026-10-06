@@ -17,13 +17,20 @@ minutes per seat), and the seat picks its own work by the rules below.
   4. Answer your own questions from the rules below before asking. Ask the lead only for a human decision,
      a credential, or a migration to apply.
 
+## Single-owner areas are never self-served
+Some areas belong to one seat alone (for example, a quality area the human assigned to one reviewer). List them in
+`DROVER_OWNED_AREAS` (`area:owner-seat`, space-separated): `fleet-observe` appends "NEVER take a bean in these
+single-owner areas" to every self-serve prompt it sends a seat that is not the owner. A scope decision like this
+reaches EVERY prompt source the same hour — this playbook, any role playbook, AND the observer's generated prompt.
+When only the playbooks said it, three seats drifted into an owned area from the prompt text.
+
 ## Self-serve: picking your own work (only when the observer sends you "self-serve")
 1. `cd` to your worktree, `git fetch -q && git checkout --detach origin/main` (a fresh base).
 2. Candidates: `beans list --json --ready`, type bug, task or small feature (never an epic — an epic's CHILD
    beans are fine), priority critical/high/normal, inside the project's current focus. Skip anything under
    `$FLEET_STATE/noop-held/<bean>`, anything with `$FLEET_STATE/owner/<bean>`, anything whose body says a human
-   decision is pending, migration-only work, and anything touching more than ~5 files (too big — leave it for
-   the lead).
+   decision is pending, migration-only work, any bean in an area another seat owns (`DROVER_OWNED_AREAS`), and
+   anything touching more than ~5 files (too big — leave it for the lead).
 3. CLAIM before touching code, atomically: `set -o noclobber; echo <your-seat> > $FLEET_STATE/owner/<bean>`.
    If that write fails, someone else has it: pick the next candidate. Then `fleet-claim take <seat> <bean>
    <paths>`.
