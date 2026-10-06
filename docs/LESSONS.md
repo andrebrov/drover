@@ -1,7 +1,7 @@
 # Lessons
 
 These are the dated, measured lessons from running a fleet of 10–25 coding agents (Claude Code, Codex,
-opencode, Grok, Cursor, Antigravity) on one production codebase, August–September 2026. Each one was
+opencode, Grok, Cursor, Antigravity) on one production codebase, August–October 2026. Each one was
 written the day it cost something, by the lead or in a retro, and most end in a rule that can visibly fail.
 
 They are the reason drover's scripts look the way they do. The operational subset that agents load is
@@ -1053,3 +1053,80 @@ The first line of a report is the verdict and starts with one of: DONE, LANDED, 
 COMPLETE, REVIEW-NEEDED, or `N/M PASS`. A verification report that led with PASSED was not recognised and its seat
 was flagged stalled while finished; a report with no verdict line at all is a progress note and does not free the
 seat (releasing on it once dispatched new work over a seat mid-task).
+
+## Retro 2026-10-06 — rules added and changed
+
+Evidence base: about 2,700 commits, 549 reviews and 330 alerts in the five days since the previous retro, plus a
+review of four research papers on agent self-correction and multi-turn reliability.
+
+## Landed and reviewed are decided by the repo, not by the report (2026-10-06)
+
+A bean is completed only when a commit on origin/main names it and changes code, or a SHA in its body is an
+ancestor of origin/main. A review counts only with a verdict word or file:line findings, from a different model.
+One review whose entire output was the review CLI's own banner ("Reading additional input from stdin...") was
+treated as a review, and its seat idled 83 minutes waiting on it. Never ask the same model "are you sure?" in place
+of an outside check: self-correction without external feedback lowers accuracy (Huang et al., ICLR 2024). The
+watcher now runs `fleet-landed-check` and `fleet-review-check` every observer pass and alerts on each UNPROVEN /
+EMPTY line; `eval/eval-checkers.sh` holds the known-good and known-bad case for both.
+**Metric (target 0):** UNPROVEN + EMPTY alerts per day.
+
+## PARTIAL is not a stopping point; a new slice starts fresh (2026-10-06)
+
+Measured: six seats landed a slice, wrote PARTIAL and idled for one to six hours until the human noticed. After
+landing a slice, start the next one in the same turn. When a session is long, write the remaining scope into the
+bean as ONE self-contained block (goal, done-criteria, owned files, landed SHAs, open decisions) and report PARTIAL;
+the lead restarts the seat in a fresh session from that block. A multi-turn study measured a ~39% drop when a spec
+arrives in pieces, and ~95% of it recovered by restating the spec as one prompt. The observer treats a report that
+starts with PARTIAL, IN PROGRESS or WIP as work still owned: it never releases the seat on one (seats released on
+PARTIAL were handed self-serve rounds and walked away from their assignments).
+**Metric:** stall alerts per period, 19 → under 8.
+
+## BLOCKED names a person and an action (2026-10-06)
+
+A finding in your own branch — even a review's CHANGES — is your work, never a blocker. BLOCKED means the next step
+needs someone else: name them and the exact action ("human: apply migration N", "human: choose the account").
+**Metric (target 0):** BLOCKED reports whose blocker is the seat's own code.
+
+## Pushes stay parallel; a lost race is fixed in the gate (2026-10-05)
+
+Never freeze main, and never single-slot landings. A seat that loses a push race does not ask for a pause: it
+rebases and pushes again, and the lead fixes the gate instead (for example, reuse a gate pass when main's new
+commits are disjoint from the push). `fleet-slot` keeps `FLEET_PUSH_SLOTS` push slots apart from the general
+heavy-run slots for this reason: pushes wait only for each other, never behind a test run, and several run at once.
+The general slots exist because load reached 205 on a 16-core machine when every seat ran suites at once, and
+timing-sensitive tests went red that pass alone.
+**Metric (target 0):** freeze requests.
+
+## One owner per area — applied to every prompt source the same hour (2026-10-06)
+
+The human assigned one quality area to one reviewer seat alone. The role playbooks were updated; the watcher's
+generated self-serve prompt still named the area as fair game, and three seats drifted into it. A scope decision is
+applied the same hour to EVERY prompt source: role playbooks AND generated prompt text. drover makes the generated
+half configuration (`DROVER_OWNED_AREAS`), so it cannot be forgotten in code.
+**Metric (target 0):** commits in an owned area by a non-owner seat.
+
+## "Absence reported as a value" is now mechanical (2026-10-06, changed)
+
+The 2026-09-01 rule (see "NaN and its string form...") was prose, and it failed: 11 of 25 findings in the period
+were an outcome the code could not observe recorded as a known value (sent, delivered, 0, approved, a contrast
+ratio). Every write of a delivery or outcome status now ships with a test in which the dependency THROWS and the
+recorded status is failed/unknown — never success. A reviewer treats a status write without that test as CHANGES.
+**Metric:** findings of this shape, 11 → under 4.
+
+## A watcher step that can hang will, and launchd's Background class starves it (2026-10-05/06)
+
+The lead's incident target (≤ 2 per session) failed at 8. The watcher stall took two wrong fixes before its cause
+was measured in the running process: the launchd job ran with `ProcessType` `Background`, which throttles CPU and
+IO under load — every step ran 30–60x slower and one tick stalled for 76 minutes. The templates now use `Standard`.
+The same days found three hang paths inside the tick, each now bounded:
+- a timed-out `git fetch` left its `git-remote-https` child holding the output pipe, and the parent waited on the
+  pipe forever (50 minutes) — `fleet-observe` now runs every child in its own process group and kills the group;
+- one `git merge` that hit its timeout raised an exception that killed the whole observe pass after 1,357 s, which
+  the fleet saw as a 45-minute stall — every `subprocess.run` there now turns a timeout into exit code 124;
+- an unbounded `rm -rf` of the board snapshot hung the tick 50 minutes while the disk reclaimed 49 GB — the snapshot
+  is now renamed (instant) and deleted in the background. The spend query and `fleet-budget` got hard alarms
+  (20 s, 60 s), and `check_budget` logs any sub-step over 15 s as `SLOW-SUB`.
+Rules that came with it: measure the cause in the running process before patching; read the whole artifact before
+judging it (a review was called empty from its CLI banner — it ended `VERDICT: CHANGES`); verify an id before
+sending it to a seat (an assignment went out with an empty bean id); and one free model's usage cap ("Free usage
+exceeded") is not the harness being out of credits — only "insufficient balance" disables a harness.

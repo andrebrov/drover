@@ -227,6 +227,9 @@ scripts call each other by absolute path, so only your interactive shell is affe
 | `fleet-verify-main` | The cumulative merge-queue gate: full build+suite on a clean detached worktree at a ref. Exit 0 = safe to push. |
 | `fleet-push` | The only sanctioned push: runs `fleet-verify-main`, pushes local main to origin only if green. Never force. |
 | `fleet-scoreboard` | What shipped vs what's stuck: landed/pushed today, approved-awaiting-land, in-review, integrity drift. The metric that isn't utilization. |
+| `fleet-landed-check` | Every bean that became `completed` on origin/main in the window must name a SHA on origin/main, or have a code-changing commit there that names it (or say `Landed: none — <reason>`). Prints `UNPROVEN`; the observer tick alerts on each. `--hours N`. |
+| `fleet-review-check` | A review artifact counts only with a verdict word or a file:line reference after CLI banner noise is dropped. Prints `EMPTY`; the observer tick alerts on each. `--minutes N`. Known-good/bad cases: `eval/eval-checkers.sh`. |
+| `fleet-slot` | flock-based limit on concurrent heavy runs: `run [--push] -- <cmd>`, `hold`, `held`, `status`. `FLEET_PUSH_SLOTS` parallel push slots, separate from the general slots; the child inherits the lock, a crashed holder is released by the kernel. |
 | `fleet-completed-audit` | List beans `completed` on main whose code isn't actually landed. `--count` for the cached number. |
 | `fleet-unblock` | Triage the held (`noop-held`) pile: un-hold finished beans, keep date-gated ones, digest lead/human decisions, re-dispatch the rest with a re-examine brief. `--dry-run`. |
 | `fleet-ghost-reap` | Return in-progress beans that no fleet state names back to `todo`, naming commits already on main. Refuses on an unreadable board. `--dry-run`. |
@@ -279,6 +282,8 @@ values as `${VAR:-value}` so an environment variable still wins. See [`examples/
 | `DROVER_LEAD_SEATS` | `lead lead-backup` | Seats `fleet-yolo` never restarts and `fleet-observe` never maps for auto-rename. |
 | `DROVER_SEAT_MODELS` | empty | `seat=model` pairs: a seat with no `--model` of its own is relaunched on its pin by `fleet-yolo`. |
 | `DROVER_SELF_SERVE` | empty | Harnesses whose idle seats self-serve per `docs/self-serve-playbook.md` (e.g. `opencode`). |
+| `DROVER_OWNED_AREAS` | empty | `area:owner-seat` pairs: areas one seat owns alone. Every self-serve prompt sent to another seat says never to take a bean there. |
+| `FLEET_HEAVY_SLOTS`, `FLEET_PUSH_SLOTS` | `5`, `4` | `fleet-slot`: general heavy-run slots are 2..N (`0` disables the limiter); push slots are separate and parallel. |
 | `DROVER_MIGRATIONS_STATUS` | empty | Command printing `PENDING <n>_<name>` per unapplied migration; `fleet-observe` alerts hourly on any not in `state/migrations-held`. |
 | `DROVER_HOME` | `~/.local/share/drover` | Queue, inbox, tasks, briefs, reports, snapshots, watcher state, logs. |
 | `DROVER_WORKTREES` | `~/.herdr/worktrees/<repo name>` | Where herdr puts seat worktrees. |

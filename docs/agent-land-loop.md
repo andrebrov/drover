@@ -44,9 +44,10 @@ Repo: `$DROVER_REPO`. You run in your own worktree (`$DROVER_WORKTREES/fleet-<yo
    real (1)-(3) item → fix it and repeat that final review once; if it still finds one, report BLOCKED
    with the finding. Endless new-phrasing or polish findings are NOT blockers: file them as a follow-up
    bean and push anyway.
-8. Push: `git push origin HEAD:main`. The pre-push hook builds, runs the related tests, and holds ONE
+8. Push: `git push origin HEAD:main`. The pre-push hook builds, runs the related tests, and holds a
    fleet-wide push lock (it waits while another push runs — do not kill it; see
-   `examples/pre-push-lock.sh`). NEVER skip the hook. Non-fast-forward → back to step 6. A hook failure
+   `examples/pre-push-lock.sh`; with `fleet-slot run --push` there are `FLEET_PUSH_SLOTS` parallel push
+   slots instead of one). NEVER skip the hook. Non-fast-forward → back to step 6. A hook failure
    is fixed, never bypassed.
 9. Prove it: `git fetch -q origin && git merge-base --is-ancestor <your SHA> origin/main` must exit 0.
    The observer alerts on any report that claims landed for a SHA not on origin/main.
@@ -61,3 +62,29 @@ against it is forbidden — read-only reads through your own worktree are fine).
 Generated files (`DROVER_GENERATED`): never hand-edit or hand-merge one; if your change makes them
 stale, regenerate with the repo's own generator and commit the result in the SAME commit; after any
 rebase, regenerate again rather than carrying the old generated output forward.
+
+## PARTIAL is not a stopping point (2026-10-06)
+Measured: six seats landed a slice, wrote PARTIAL and sat idle 4-6 hours until the human noticed the fleet had gone
+stale. After landing a slice, start the next slice of the same bean in the same turn. Stop only when (a) every
+task of the bean is done -> LANDED, or (b) the next step needs someone else -> BLOCKED naming the exact person and
+action. A finding in your own branch — even a review's CHANGES — is your work, never a blocker. A tool or review
+that returns empty output is not a review: re-run it. The observer never releases a seat on a report that starts
+with PARTIAL, IN PROGRESS or WIP: the rest of the bean is still yours.
+
+## Landed and reviewed are decided by the repo, not by the report (2026-10-06)
+- **Landed** = a commit on origin/main that names the bean in its message and changes code, or a SHA in the bean
+  body that is an ancestor of origin/main. `fleet-landed-check` verifies every bean marked completed; an unproven
+  one alerts the lead and is reopened. A bean that lands no code says `Landed: none — <reason>` in its body.
+- **Reviewed** = a review artifact with a verdict (APPROVE/CHANGES) or file:line findings, from a different model.
+  `fleet-review-check` flags anything else as EMPTY; an empty review does not count — re-run it. Never ask the
+  same model "are you sure?" as a substitute: self-correction without outside feedback makes answers worse
+  (Huang et al., "Large Language Models Cannot Self-Correct Reasoning Yet", ICLR 2024).
+- **One run proves little** (a multi-turn study found run-to-run spread doubled while skill barely moved): a flaky
+  gate or a generator gets k>=3 runs, and you report the spread, not the best run.
+
+## A new slice starts from a consolidated spec (2026-10-06)
+Long multi-turn sessions lose the task: in a multi-turn study, performance fell ~39% when a spec arrived in pieces,
+and restating it as one prompt recovered ~95%. So after landing a slice, when the session is long: (1) write the
+REMAINING scope into the bean as one self-contained block — goal, done-criteria, files you own, what already
+landed with SHAs, open decisions; (2) report PARTIAL with that block's location; (3) the lead restarts you in a
+FRESH session pointed at that block. Do not carry a long session across slices.
