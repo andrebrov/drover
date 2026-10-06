@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""fleet-landed-check — a bean is `completed` only when the code it names is on origin/main.
+
+Landed is decided by the repo, never by the agent's report. For every bean whose status became `completed` on
+origin/main within the window, require ONE of:
+  1. a commit SHA named in the bean body (7-40 hex chars) that resolves to a commit and is an ancestor of
+     origin/main, or
+  2. a commit on origin/main whose message names the bean and that changes a file outside .beans/ (how the fleet
+     actually lands: the agent's own commit message, not its report).
+Beans that legitimately land no code (decisions, docs, verifications) carry `Landed: none — <reason>` in the body.
+A bean already completed before the window is not this window's claim and is skipped.
+
+  fleet-landed-check [--hours N]     print one `UNPROVEN <bean>: ...` line per violation; exit 1 when any exist
+Read-only. fleet-watch runs it every observer tick and alerts on each line.
+"""
+import os
+import re
+import subprocess
+import sys
+
+
+def drover_repo():
+    env = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drover-env')
+    return subprocess.run(['bash', '-c', '. "$0"; printf "%s" "${DROVER_REPO:-}"', env],
+                          capture_output=True, text=True, check=True).stdout
+
+
+REPO = drover_repo()
+if not REPO:
+    sys.exit('fleet-landed-check: set DROVER_REPO (env or ~/.config/drover/config)')
+hours = int(sys.argv[sys.argv.index('--hours') + 1]) if '--hours' in sys.argv else 24
+
+
+def git(*a):
+    return subprocess.run(['git', '-C', REPO, *a], capture_output=True, text=True, timeout=60)
+
+
+base = git('rev-list', '-1', '--before', f'{hours} hours ago', 'origin/main').stdout.strip()
+files = sorted({l for l in git('log', 'origin/main', f'--since={hours} hours ago', '--name-only', '--format=',
+                                '--', '.beans/').stdout.splitlines() if l.endswith('.md')})
+SHA = re.compile(r'\b[0-9a-f]{7,40}\b')
+bad = 0
+for f in files:
+    now = git('show', f'origin/main:{f}').stdout
+    st = re.search(r'^status:\s*(\S+)', now, re.M)
+    if not st or st.group(1) != 'completed':
+        continue
+    before = git('show', f'{base}:{f}').stdout if base else ''
+    b = re.search(r'^status:\s*(\S+)', before, re.M)
+    if b and b.group(1) == 'completed':
+        continue                                    # completed before the window: not this window's claim
+    if re.search(r'^Landed:\s*none\b', now, re.M | re.I):
+        continue
+    bean = os.path.basename(f).split('--')[0]
+    shas = set(SHA.findall(now.split('\n---', 2)[-1] if now.startswith('---') else now))   # body, not front matter
+    proven = False
+    for s in shas:
+        full = git('rev-parse', '--verify', '--quiet', f'{s}^{{commit}}').stdout.strip()
+        if full and git('merge-base', '--is-ancestor', full, 'origin/main').returncode == 0:
+            proven = True
+            break
+    if not proven:
+        for line in git('log', 'origin/main', f'--grep={bean}', '--format=%H', '-n', '50').stdout.split():
+            changed = git('show', '--name-only', '--format=', line).stdout.split()
+            if any(not c.startswith('.beans/') for c in changed):
+                proven = True
+                break
+    if not proven:
+        bad += 1
+        why = 'names no commit' if not shas else f'none of {len(shas)} named commit(s) is on origin/main'
+        print(f'UNPROVEN {bean}: completed but {why}')
+sys.exit(1 if bad else 0)

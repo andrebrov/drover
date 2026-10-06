@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""fleet-review-check — a review counts only when it is grounded.
+
+A review whose whole output was the CLI's own banner ("Reading additional input from stdin...") was treated as a
+review, and its seat idled 83 minutes waiting on it. Ungrounded critique does not help either: a review must give
+a verdict or point at code.
+
+A review artifact in the reports dir (name contains "review" as its own word, .md or .out) written within the
+window is EMPTY when, after dropping CLI banner/noise lines, it has fewer than 200 characters, or it carries
+neither a verdict word (VERDICT/APPROVE/CHANGES/LANDABLE) nor any file:line reference.
+
+  fleet-review-check [--minutes N] [--dir D] [FILE...]   print one `EMPTY <file>: ...` line per violation;
+                                                         exit 1 when any exist
+Read-only. fleet-watch runs it every observer tick and alerts on each line.
+"""
+import glob
+import os
+import re
+import subprocess
+import sys
+import time
+
+
+def reports_dir():
+    env = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drover-env')
+    return subprocess.run(['bash', '-c', '. "$0"; printf "%s" "$FLEET_REPORTS"', env],
+                          capture_output=True, text=True, check=True).stdout
+
+
+args = sys.argv[1:]
+minutes = int(args[args.index('--minutes') + 1]) if '--minutes' in args else 60
+d = args[args.index('--dir') + 1] if '--dir' in args else reports_dir()
+explicit = [a for a in args if os.path.isfile(a)]
+# Banner and transcript chrome of the review CLIs (here: codex exec). Add your own reviewer's chrome the same way.
+NOISE = re.compile(r'^\s*(Reading additional input from stdin\.*|OpenAI Codex v[\d.]+.*|-{3,}|workdir:.*|model:.*|'
+                   r'provider:.*|approval:.*|sandbox:.*|reasoning (effort|summaries):.*|session id:.*|user|codex|'
+                   r'thinking|tokens used.*|\[\d{4}-\d\d-\d\dT[^\]]*\].*)\s*$', re.I)
+VERDICT = re.compile(r'\b(VERDICT|APPROVE[D]?|CHANGES|LANDABLE|REQUEST[_ ]CHANGES)\b')
+FILELINE = re.compile(r'[\w./-]+\.(ts|tsx|js|mjs|cjs|py|sql|sh|md|json|go|rs|rb|java|kt)[:#L]\d+')
+# a review artifact, not a report by a seat whose NAME contains "reviewer" (codex-reviewer-self-serve.md)
+IS_REVIEW = re.compile(r'(^|[-_.])review(?!er)([-_.]|$)', re.I)
+files = explicit or [f for f in glob.glob(os.path.join(d, '*review*'))
+                     if f.endswith(('.md', '.out')) and IS_REVIEW.search(os.path.basename(f))
+                     and time.time() - os.path.getmtime(f) < minutes * 60]
+bad = 0
+for f in sorted(files):
+    try:
+        text = open(f, errors='replace').read()
+    except OSError:
+        continue
+    body = '\n'.join(l for l in text.splitlines() if l.strip() and not NOISE.match(l))
+    if len(body) < 200 or not (VERDICT.search(body) or FILELINE.search(body)):
+        bad += 1
+        print(f'EMPTY {os.path.basename(f)}: {len(body)} chars of review after noise, '
+              f'verdict={"y" if VERDICT.search(body) else "n"} file:line={"y" if FILELINE.search(body) else "n"}')
+sys.exit(1 if bad else 0)
