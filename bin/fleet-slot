@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""fleet-slot — fleet-wide limit on concurrent heavy runs (test suites, full builds, DB materialisation).
+
+Load reached 205 on a 16-core machine because every seat ran its suites at once, and timing-sensitive tests
+went red that pass alone. Slots are kernel advisory locks (flock) on N files: a crashed holder's lock is
+released by the kernel, so there is nothing to reap and nothing to go stale.
+
+  fleet-slot run [--push] -- <cmd...>   take a slot, run cmd as a child that INHERITS the lock, pass its exit code
+  fleet-slot hold [--push]               hold a slot until stdin closes (for runners that cannot be wrapped)
+  fleet-slot held                        exit 0 if this process already runs under a slot (re-entrancy)
+  fleet-slot status                      which slots are busy
+
+FLEET_PUSH_SLOTS (default 4): push slots p1..pN, used only by the pre-push gate (--push). They are separate from
+the general slots, so a push never waits behind a general run — and there are several on purpose: pushes stay
+parallel, never single-slot (see docs/LESSONS.md, "Pushes stay parallel; a lost race is fixed in the gate").
+FLEET_HEAVY_SLOTS (default 5): general slots 2..N (slot 1 was once the single push slot). 0 disables the limiter.
+
+A child started by `run` gets FLEET_SLOT_HELD=<slot>; a nested `fleet-slot run` sees it and runs directly,
+so a gate that calls a script that also takes a slot never deadlocks waiting on itself.
+"""
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+
+
+def state_dir():
+    """$FLEET_STATE from drover-env (next to this file), so every script agrees on where state lives."""
+    env = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drover-env')
+    out = subprocess.run(['bash', '-c', '. "$0"; printf "%s" "$FLEET_STATE"', env],
+                         capture_output=True, text=True, check=True).stdout
+    return os.path.join(out, 'heavy-slots')
+
+
+DIR = state_dir()
+N = int(os.environ.get('FLEET_HEAVY_SLOTS', '5'))
+P = int(os.environ.get('FLEET_PUSH_SLOTS', '4'))
+LOG = os.path.join(DIR, 'log.jsonl')
+
+
+def log(ev, **kw):
+    try:
+        with open(LOG, 'a') as f:
+            f.write(json.dumps({'t': int(time.time()), 'ev': ev, 'pid': os.getpid(), **kw}) + '\n')
+    except OSError:
+        pass
+
+
+def slots(push):
+    return [f'p{i}' for i in range(1, P + 1)] if push else list(range(2, N + 1))
+
+
+def acquire(push):
+    os.makedirs(DIR, exist_ok=True)
+    start, said = time.time(), 0
+    while True:
+        for i in slots(push):
+            fd = os.open(os.path.join(DIR, f'slot-{i}.lock'), os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                os.ftruncate(fd, 0)
+                os.write(fd, f'{os.getpid()} {int(time.time())}\n'.encode())
+                log('acquire', slot=i, waited=int(time.time() - start), push=push)
+                return fd, i
+            except BlockingIOError:
+                os.close(fd)
+        if time.time() - start >= said + 30:
+            said += 30
+            print(f'[fleet-slot] waiting for a {"push" if push else "heavy-run"} slot ({said}s)', file=sys.stderr, flush=True)
+        time.sleep(1)
+
+
+def busy(i):
+    path = os.path.join(DIR, f'slot-{i}.lock')
+    if not os.path.exists(path):
+        return False
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def main(argv):
+    if not argv or argv[0] in ('-h', '--help'):
+        print(__doc__)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    push = '--push' in rest
+    rest = [a for a in rest if a != '--push']
+    if cmd == 'held':
+        return 0 if os.environ.get('FLEET_SLOT_HELD') else 1
+    if cmd == 'status':
+        for i in slots(True) + slots(False):
+            print(f'slot-{i} {"push   " if str(i).startswith("p") else "general"} {"BUSY" if busy(i) else "free"}')
+        return 0
+    if cmd == 'run':
+        if rest and rest[0] == '--':
+            rest = rest[1:]
+        if not rest:
+            print('fleet-slot run: no command', file=sys.stderr)
+            return 2
+        if N <= 0 or os.environ.get('FLEET_SLOT_HELD'):
+            return subprocess.call(rest)          # disabled, or already under a slot: never deadlock on re-entry
+        fd, i = acquire(push)
+        t0 = time.time()
+        try:
+            # the child inherits the lock fd: killing this wrapper does not free the slot while the run goes on
+            rc = subprocess.call(rest, env=dict(os.environ, FLEET_SLOT_HELD=str(i)), pass_fds=(fd,))
+        finally:
+            log('release', slot=i, secs=int(time.time() - t0))
+        return rc
+    if cmd == 'hold':
+        if N <= 0 or os.environ.get('FLEET_SLOT_HELD'):
+            sys.stdin.read()
+            return 0
+        _, i = acquire(push)
+        print(f'held slot-{i}', flush=True)
+        sys.stdin.read()
+        log('release', slot=i)
+        return 0
+    print(f'unknown command {cmd}', file=sys.stderr)
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
