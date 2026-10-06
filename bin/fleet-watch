@@ -125,14 +125,18 @@ clear_dialogs(){
 # --- 4. budget --------------------------------------------------------------
 BROKE=""
 check_budget(){
-  local out; out=$("$DROVER_BIN"/fleet-budget 2>/dev/null)
+  # fleet-budget capped at 60s with a timestamped xtrace: an uncapped budget read once hung the tick, and the
+  # trace names the step that was slow. Each sub-step taking >=15s is logged as SLOW-SUB.
+  local out _b=$SECONDS
+  out=$(PS4='+$(date +%T) ' perl -e 'alarm 60; exec @ARGV' bash -x "$DROVER_BIN"/fleet-budget 2>"$STATE/budget-trace.log")
+  [ $((SECONDS-_b)) -ge 15 ] && log "SLOW-SUB fleet-budget $((SECONDS-_b))s"
   BROKE=""
   # hard off-switch: harnesses listed in state/harness-off are never dispatched to, whatever the panes say
   for h in $(cat "$STATE/harness-off" 2>/dev/null); do BROKE="$BROKE $h"; done
   echo "$out" | grep -q "^opencode.*OUT OF CREDITS" && BROKE="$BROKE opencode" && log "BUDGET: opencode out of credits — not dispatching to it"
   echo "$out" | grep -q "^codex.*AT USAGE LIMIT"    && BROKE="$BROKE codex"    && log "BUDGET: codex at usage limit — not dispatching to it"
   echo "$out" | grep -q "^claude.*AT SESSION LIMIT" && BROKE="$BROKE claude"   && log "BUDGET: claude at session limit — not dispatching to it"
-  spend_guard
+  _b=$SECONDS; spend_guard; [ $((SECONDS-_b)) -ge 15 ] && log "SLOW-SUB spend_guard $((SECONDS-_b))s"
 }
 
 # --- guardrail: opencode daily spend cap (2026-09-17/18: $290 then $376 a day, vs $27-$82 on each of the four days before) ---
@@ -156,8 +160,12 @@ spend_guard(){
     return 0; fi
   if [ ! -f "$cache" ] || [ $(( now - $(stat -f %m "$cache") )) -ge 300 ] || [ "$(date -r "$(stat -f %m "$cache")" +%F)" != "$(date +%F)" ]; then
     local usd mid; mid=$(( $(date -j -f '%Y-%m-%d %H:%M:%S' "$(date +%F) 00:00:00" +%s) * 1000 ))
-    usd=$(sqlite3 -readonly "file:$OPENCODE_DB?mode=ro" \
-      "select printf('%.2f',coalesce(sum(json_extract(m.data,'\$.cost')),0)) from session s join message m on m.session_id=s.id and m.time_created >= $mid;" 2>/dev/null)
+    # Walk session -> message through the session index (CROSS JOIN pins the join order; only sessions updated
+    # today are visited) instead of letting the planner walk every message ever written. Bounded twice:
+    # sqlite's busy timeout and a 20s alarm, so a locked or slow db costs one stale cached figure, never a
+    # stuck tick (an unbounded step inside the tick stalls every seat's next assignment).
+    usd=$(perl -e 'alarm 20; exec @ARGV' sqlite3 -readonly -cmd ".timeout 5000" "file:$OPENCODE_DB?mode=ro" \
+      "select printf('%.2f',coalesce(sum(json_extract(m.data,'\$.cost')),0)) from session s cross join message m on m.session_id=s.id and m.time_created >= $mid where s.time_updated >= $mid;" 2>/dev/null)
     [ -n "$usd" ] && printf '%s\n' "$usd" > "$cache"
   fi
   local spent; spent=$(cat "$cache" 2>/dev/null); [ -n "$spent" ] || return 0
@@ -844,6 +852,12 @@ tick(){
 observe_tick(){
   local _t0=$SECONDS
   T check_budget; T inventory_alert
+  # A bean is completed only when its code is on origin/main, and a review counts only when it is grounded
+  # (a verdict line or a file:line citation). Both checkers print one line per violation; each is alerted.
+  "$DROVER_BIN"/fleet-review-check --minutes 30 2>/dev/null | while read -r _ f rest; do
+    "$DROVER_BIN"/fleet-alert send "empty-review-${f%:}" "empty review: ${f%:}" "${rest} — re-run the review; it does not count" >/dev/null 2>&1; done
+  "$DROVER_BIN"/fleet-landed-check --hours 24 2>/dev/null | while read -r _ bean rest; do
+    "$DROVER_BIN"/fleet-alert send "unproven-${bean%:}" "${bean%:} marked completed without landed code" "${rest} — reopen it or record the landing commit" >/dev/null 2>&1; done
   "$DROVER_BIN"/fleet-observe 2>&1 | while read -r l; do log "OBSERVE $l"; done
   [ $((SECONDS-_t0)) -ge 30 ] && log "SLOW-OBSERVE $((SECONDS-_t0))s"
   # The tick-stall detector reads state/last: an observer tick must stamp it too, or the fleet reports

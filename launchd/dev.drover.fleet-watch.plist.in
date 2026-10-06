@@ -13,8 +13,10 @@
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <!-- Standard, never Background: launchd throttles a Background job's CPU and IO under load. Measured: every
+       step ran 30-60x slower and the watcher tick stalled for 76 minutes while the machine was busy. -->
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Standard</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
