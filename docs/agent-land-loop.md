@@ -33,6 +33,12 @@ Repo: `$DROVER_REPO`. You run in your own worktree (`$DROVER_WORKTREES/fleet-<yo
      the diff to `<reports>/<you>-<bean>.diff`, make the first line of your report
      `REVIEW-NEEDED <local sha> <diff path>`, and `fleet-done ... BLOCKED`. The observer holds your seat
      (it is waiting, not free) and alerts the lead, who runs the review and sends you the findings.
+   - Leave generated files out of the review diff (append `-- . ':(exclude)<generated path>'` for each of
+     `DROVER_GENERATED` to every `git diff` above). A generated snapshot can run to millions of characters; a
+     reviewer CLI refuses input over its size limit ("Input exceeds the maximum length") and the snapshot carries
+     nothing to review.
+   - If the preferred reviewer harness is at its usage limit, use any other available harness in a fresh
+     session; the rule is a different model than yours, not a particular one.
    - Never put a list-taking flag (`--allowedTools`, `--tools`, ...) before a positional prompt: it
      swallows the prompt. Pipe the prompt and the diff on stdin instead.
    Fix real findings, commit, and review AGAIN — up to 3 rounds. Any code change after an APPROVE,
@@ -46,9 +52,12 @@ Repo: `$DROVER_REPO`. You run in your own worktree (`$DROVER_WORKTREES/fleet-<yo
    bean and push anyway.
 8. Push: `git push origin HEAD:main`. The pre-push hook builds, runs the related tests, and holds a
    fleet-wide push lock (it waits while another push runs — do not kill it; see
-   `examples/pre-push-lock.sh`; with `fleet-slot run --push` there are `FLEET_PUSH_SLOTS` parallel push
-   slots instead of one). NEVER skip the hook. Non-fast-forward → back to step 6. A hook failure
-   is fixed, never bypassed.
+   `examples/pre-push-lock.sh`; with `fleet-slot run --push` the push gate takes one of `FLEET_PUSH_SLOTS` slots,
+   default 1, in a pool separate from general runs). NEVER skip the hook, and no environment variable or alternate hooks path overrides it. Non-fast-forward →
+   back to step 6. A message like "main moved to <sha> while this push waited ... (no gate was run)" costs
+   seconds, not a gate: rebase onto origin/main and push again at once, as many times as it takes. Only a
+   refusal AFTER the gate ran (a build or test failure) is a reason to stop. A hook failure is fixed, never
+   bypassed.
 9. Prove it: `git fetch -q origin && git merge-base --is-ancestor <your SHA> origin/main` must exit 0.
    The observer alerts on any report that claims landed for a SHA not on origin/main.
 10. Report: write `<reports>/<you>-<bean>.md` (first line: verdict + pushed SHA), then
@@ -62,6 +71,39 @@ against it is forbidden — read-only reads through your own worktree are fine).
 Generated files (`DROVER_GENERATED`): never hand-edit or hand-merge one; if your change makes them
 stale, regenerate with the repo's own generator and commit the result in the SAME commit; after any
 rebase, regenerate again rather than carrying the old generated output forward.
+
+## After the ancestry proof: delete your branch
+Once `git merge-base --is-ancestor <sha> origin/main` passes for every commit on your `fleet/<seat>-<bean>`
+branch (`git cherry origin/main origin/<branch>` prints no `+`), delete it:
+`git push origin --delete fleet/<seat>-<bean>`. Landed branches piled up by the dozen otherwise. Never delete a
+branch with an unlanded commit.
+
+## Clean up everything the task created, the same turn it lands
+A finished task leaves nothing behind. After the ancestry proof, in this order:
+1. Extra worktrees you added for the bean (`git worktree list` — anything that is not your seat worktree):
+   `git worktree remove <path>` only when `git -C <path> status --porcelain` is empty and its branch has no
+   unlanded commit. Never `--force`.
+2. The local branch: `git branch -d fleet/<seat>-<bean>` (`-d`, not `-D`: git refuses an unmerged branch, which
+   is the check you want). Then the remote branch as above.
+3. Scratch copies, logs and test databases you made for this bean. Keep reports.
+4. Then `git worktree prune`.
+Anything with uncommitted or unlanded work is NOT removed: list it in your report under `Left in place:` with
+the reason. Report what you removed in one line (`Cleaned: 1 worktree, 2 branches, 1.2 GB scratch`).
+
+## Start the next task in a fresh session
+When a task is DONE, the lead starts your next one in a fresh session. Everything the next task needs is in its
+brief, the bean, and your report, never in your old context. Write the report so a fresh session can continue
+from it.
+
+## Review routing
+- **Bean-file / docs-only changes skip review.** A push whose diff touches only the bean files, specs, docs or
+  `*.md` lands without a reviewer (the pre-push gate already skips them). Anything touching source, scripts,
+  migrations or hooks keeps one cross-model review of the final diff.
+- **Anything that changes how a page or an email LOOKS is judged on the rendered output**, by a design seat that
+  compares it with the brand's references, not by a code reviewer. The code review still runs for correctness;
+  acceptance of the look is the design seat's verdict on the rendered images. A code-level judge passed renders
+  the human failed at a glance.
+- Unchanged: one reviewer, a different harness; two CHANGES rounds -> REVIEW-NEEDED to the lead, never a third round.
 
 ## PARTIAL is not a stopping point (2026-10-06)
 Measured: six seats landed a slice, wrote PARTIAL and sat idle 4-6 hours until the human noticed the fleet had gone

@@ -10,10 +10,13 @@ released by the kernel, so there is nothing to reap and nothing to go stale.
   fleet-slot held                        exit 0 if this process already runs under a slot (re-entrancy)
   fleet-slot status                      which slots are busy
 
-FLEET_PUSH_SLOTS (default 4): push slots p1..pN, used only by the pre-push gate (--push). They are separate from
-the general slots, so a push never waits behind a general run — and there are several on purpose: pushes stay
-parallel, never single-slot (see docs/LESSONS.md, "Pushes stay parallel; a lost race is fixed in the gate").
-FLEET_HEAVY_SLOTS (default 5): general slots 2..N (slot 1 was once the single push slot). 0 disables the limiter.
+FLEET_PUSH_SLOTS (default 1): push slots p1..pN, used only by the pre-push gate (--push). They are a separate
+pool from the general slots, so a push never waits behind a general run. Raise it when the machine has headroom;
+the default is one because a memory-pressured machine runs red gates that pass alone (see docs/LESSONS.md,
+"Pushes stay parallel; a lost race is fixed in the gate").
+FLEET_HEAVY_SLOTS (default 2): general slots 2..N, so the default is ONE general job (slot 1 was once the
+single push slot). Default maximum concurrency is therefore TWO: one push gate plus one general run. Jobs in the
+same pool wait for each other. 0 disables the limiter.
 
 A child started by `run` gets FLEET_SLOT_HELD=<slot>; a nested `fleet-slot run` sees it and runs directly,
 so a gate that calls a script that also takes a slot never deadlocks waiting on itself.
@@ -35,8 +38,8 @@ def state_dir():
 
 
 DIR = state_dir()
-N = int(os.environ.get('FLEET_HEAVY_SLOTS', '5'))
-P = int(os.environ.get('FLEET_PUSH_SLOTS', '4'))
+N = int(os.environ.get('FLEET_HEAVY_SLOTS', '2'))
+P = int(os.environ.get('FLEET_PUSH_SLOTS', '1'))
 LOG = os.path.join(DIR, 'log.jsonl')
 
 

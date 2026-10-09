@@ -1,124 +1,217 @@
 #!/usr/bin/env bash
 # fleet-budget — what each harness costs and whether it can still run.
-# Written 2026-09-07 after opencode ran out of credits mid-run and silently
-# idled 10 of 25 agents: every one reported "done" with no work and no error.
-# The failure is invisible from `fleet status`, which is the whole problem.
+# Written after a harness ran out of credits mid-run and silently idled 10 of 25 agents: every one reported
+# "done" with no work and no error. The failure is invisible from `fleet status`, which is the whole problem.
+#
+# Every native read (fleet status, fleet read, git) runs through bounded_capture: its own process group, a hard
+# deadline, a byte cap. A cap or a deadline is an UNSUCCESSFUL inspection (rc 125/124) and yields verdict
+# UNKNOWN, never a healthy tail. Output: one `SEAT <name> <kind> <state> <verdict>` line per seat, then the
+# per-harness human summary.
+set +x
 set -euo pipefail
 # shellcheck source=drover-env
 . "$(dirname "$0")/drover-env"
-# Seats are classified by the KIND column of `fleet status` (the harness herdr reports), never by name:
-# a name-based match miscounts any seat whose name does not spell its harness.
-# `fleet status` exits 1 whenever a seat is MISSING; under pipefail that killed this script on its first
-# line and the watcher read "no budget problem" for every harness (found 2026-09-18). One tolerant snapshot.
-FS=$("$DROVER_BIN"/fleet status 2>/dev/null || true)
+# Own the native read's process group. Bound capture before any shell variable.
+# stdout cap/deadline are unsuccessful inspections (125/124), never healthy tails.
+bounded_capture(){
+  python3 - "$@" <<'PY'
+import os,selectors,signal,subprocess,sys,time,ctypes
+secs=float(sys.argv[1]);cap=int(sys.argv[2]);command=sys.argv[3:]
+if not 0<secs<=120 or not 0<cap<=65536 or not command:sys.exit(125)
+proc=None;sel=selectors.DefaultSelector();interrupted=[];chunks=[];size=0;rc=125
+for sig in (signal.SIGTERM,signal.SIGINT):signal.signal(sig,lambda s,f:interrupted.append(s))
+subreaper=False
+if sys.platform.startswith('linux'):subreaper=ctypes.CDLL(None).prctl(36,1,0,0,0)==0
+def send(sig):
+ global rc
+ if proc is None:return
+ try:os.killpg(proc.pid,sig)
+ except ProcessLookupError:pass
+ except PermissionError:rc=125
+try:
+ start=time.monotonic();proc=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,start_new_session=True,close_fds=True,bufsize=0)
+ os.set_blocking(proc.stdout.fileno(),False);sel.register(proc.stdout,selectors.EVENT_READ)
+ exited_at=None
+ while True:
+  if interrupted:rc=128+interrupted[0];break
+  now=time.monotonic()
+  # Natural exit is not pipe EOF. Drain real buffered bytes, but inherited
+  # writers get at most one second after observed exit and no extra deadline.
+  drain_deadline=min(start+secs,exited_at+1) if exited_at is not None else start+secs
+  if now>=drain_deadline:rc=124;break
+  ready=sel.select(min(.02,max(0,drain_deadline-now)))
+  if ready:
+   try:b=os.read(proc.stdout.fileno(),min(65536,cap-size))
+   except BlockingIOError:b=None
+   if b==b'':
+    sel.unregister(proc.stdout)
+   elif b is not None:
+    chunks.append(b);size+=len(b)
+    if size>=cap:rc=125;break
+  native=proc.poll()
+  if native is not None and exited_at is None:exited_at=time.monotonic()
+  if not sel.get_map() and native is not None:
+   rc=native if native>=0 else 128-native;break
+except (OSError,ValueError):rc=125
+finally:
+ # Close inherited pipe first; even an exited leader can have live descendants.
+ sel.close()
+ if proc is not None:
+  if proc.stdout:proc.stdout.close()
+  send(signal.SIGTERM)
+  # No killpg(..., 0) probe: Darwin can return EPERM as a just-reaped
+  # group disappears. Kill the owned group directly; permission failure is
+  # an unsuccessful inspection, never a healthy result. Immediate escalation
+  # also gives nested read helpers time to clean up on an outer deadline.
+  send(signal.SIGKILL)
+  try:proc.wait(timeout=.05)
+  except subprocess.TimeoutExpired:rc=125
+  if subreaper:
+   for _ in range(64):
+    try:
+     pid,_=os.waitpid(-proc.pid,os.WNOHANG)
+     if pid==0:break
+    except ChildProcessError:break
+sys.stdout.buffer.write(b''.join(chunks));sys.exit(rc)
+PY
+}
+if [ "${1:-}" = --capture ]; then shift; bounded_capture "$@"; exit $?; fi
+bounded_fleet(){ local secs=$1 cap=$2; shift 2; bounded_capture "$secs" "$cap" "$DROVER_BIN/fleet" "$@"; }
+set +e
+FS=$(bounded_fleet 8 65536 status); status_rc=$?
+set -e
+# Actual fleet contract is NAME KIND STATE; status 1 can carry valid MISSING rows.
+ROWS=$(printf '%s\n' "$FS" | awk 'NR==1{header=($1=="NAME" && $2=="KIND" && $3=="STATE");next} header && $0 !~ /\(not on roster\)$/ && $1 ~ /^[A-Za-z0-9][A-Za-z0-9_.-]*$/ && $2 ~ /^(opencode|codex|claude|grok|agy|cursor)$/ && $3 ~ /^(working|idle|done|blocked|unknown|MISSING)$/ {print $1,$2,$3}')
+status_valid=1
+if { [ "$status_rc" -ne 0 ] && [ "$status_rc" -ne 1 ]; } || [ -z "$ROWS" ]; then status_valid=0; fi
+footer(){ printf '%s\n' "$1" | awk 'NF{lines[++n]=$0}END{s=n-3;if(s<1)s=1;for(i=s;i<=n;i++)print lines[i]}'; }
+retry_structure(){
+ local evidence native_line
+ native_line=$(printf '%s\n' "$1" | awk 'NF{last=$0}END{print last}')
+ # Published decorated footer is the final nonempty line, not stale output
+ # followed by work or a composer. Exactly eight known cells, in any order.
+ if printf '%s\n' "$native_line" | grep -qiE '^[[:space:]]*(■|⬝){8}[[:space:]]+Free usage exceeded.*retrying in .+ attempt';then return 0;fi
+ evidence=$(printf '%s\n' "$1" | grep -viE '^[[:space:]]*(>|❯|›|User:|Prompt:)') || true
+ printf '%s\n' "$evidence" | grep -qiE '^[[:space:]]*(Error:[[:space:]]*)?Free usage exceeded' && printf '%s\n' "$evidence" | grep -qiE 'retrying in .+ attempt'
+}
 
-echo "harness    agents  state"
-echo "--------------------------------"
-
-# opencode: the balance lives in the workspace, and the only signal an agent
-# gives is the words "Insufficient balance" printed into its pane.
-oc_agents=$(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="opencode" {n++} END{print n+0}')
-oc_broke=0
-# Only a NON-working agent counts. The balance message stays in the pane
-# scrollback after a top-up, so matching it alone reports a solved problem as
-# live — a false positive, and the exact unvalidated-instrument failure the
-# fleet is told not to ship.
-for a in $(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="opencode" {print $1}'); do
-  st=$(printf "%s\n" "$FS" | awk -v n="$a" '$1==n{print $3}')
-  [ "$st" = "working" ] && continue
-  [ "$st" = "MISSING" ] && continue
-  if "$DROVER_BIN"/fleet read "$a" 40 2>/dev/null | grep -qi "insufficient balance"; then
-    oc_broke=$((oc_broke+1))
-  fi
-done
-if [ "$oc_broke" -gt 0 ]; then
-  printf 'opencode   %-6s OUT OF CREDITS (%s agents showing it)\n' "$oc_agents" "$oc_broke"
-  echo '           -> https://opencode.ai/workspace  — top up, then `fleet up`'
-else
-  printf 'opencode   %-6s ok\n' "$oc_agents"
-fi
-
-# codex: a usage cap prints into the pane and the agent goes idle.
-cx_agents=$(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="codex" {n++} END{print n+0}')
-cx_broke=0
-for a in $(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="codex" {print $1}'); do
-  st=$(printf "%s\n" "$FS" | awk -v n="$a" '$1==n{print $3}')
-  [ "$st" = "working" ] && continue
-  [ "$st" = "MISSING" ] && continue
-  # The banner stays in the scrollback after the limit lifts. Measured 2026-09-08:
-  # a codex seat answered a prompt normally while a six-day-old banner sat above
-  # it, and this check idled four seats for nothing. A limit is only live if the
-  # banner is the LAST thing in the pane — i.e. nothing the agent produced since.
-  pane=$("$DROVER_BIN"/fleet read "$a" 40 2>/dev/null) || true
-  if printf '%s' "$pane" | grep -qiE "usage limit|rate limit|session limit|hit your session"; then
-    banner_line=$(printf '%s\n' "$pane" | grep -niE "usage limit|rate limit|session limit|hit your session" | tail -1 | cut -d: -f1)
-    # any agent output AFTER the banner means it is stale
+# Native chooser must be the current four-line footer, with exactly one selector.
+# Match published option strings; never strip arbitrary punctuation/quoted prose.
+claude_chooser(){
+ local now; now=$(date +%s) || now=""
+ python3 -c '
+import sys,re,datetime
+lines=[s for s in sys.stdin.read(65537).splitlines() if s.strip()]
+if len(lines)!=4 or not re.fullmatch(r"\s*Enter to confirm(?:, | · )Esc to cancel\s*",lines[3]):print("NONE");sys.exit(0)
+patterns=[r"\s*(❯\s*)?1\.\s+Stop and wait for limit to reset\s*",r"\s*(❯\s*)?2\.\s+Wait here, then continue automatically at (.{1,80}?)\s*",r"\s*(❯\s*)?3\.\s+Switch to usage credits\s*"]
+matched=[re.fullmatch(p,s) for p,s in zip(patterns,lines)]
+if not all(matched) or sum(bool(m.group(1)) for m in matched)!=1:print("NONE");sys.exit(0)
+when=re.fullmatch(r"([A-Z][a-z]{2}) ([0-9]{1,2}) at ([0-9]{1,2})(?::([0-9]{2}))?(am|pm)",matched[1].group(2))
+try:
+ if not when or not re.fullmatch(r"[0-9]{1,12}",sys.argv[1]):raise ValueError()
+ now=datetime.datetime.fromtimestamp(int(sys.argv[1]))
+ month=datetime.datetime.strptime(when.group(1),"%b").month
+ hour=int(when.group(3));minute=int(when.group(4) or 0)
+ if not 1<=hour<=12:raise ValueError()
+ hour=hour%12+(12 if when.group(5)=="pm" else 0)
+ reset=datetime.datetime(now.year,month,int(when.group(2)),hour,minute)
+ print("SESSION_CAP" if reset>now else "UNKNOWN")
+except (ValueError,OverflowError,OSError):print("UNKNOWN")
+' "$now"
+}
+# Return 1 only for a valid task/baseline with no code/report progress; otherwise
+# current retry recovery is unknown. Post-dispatch is not post-current-retry.
+retry_progress(){
+ local agent=$1 tasks repo f t bean sha rp br n m
+ tasks="$FLEET_TASKS"
+ repo="${FLEET_REPO:-${DROVER_REPO:-/nonexistent}}"
+ f="$tasks/$agent"; [ -f "$f" ] || return 2
+ [ "$(wc -c < "$f")" -le 4096 ] || return 2
+ IFS=$'\t' read -r t bean sha rp < "$f" || return 2
+ case "$t" in ''|*[!0-9]*) return 2;; esac
+ [ -n "$bean" ] && [ -n "$sha" ] && [ "$sha" != none ] || return 2
+ br=$(head -c 200 "$tasks/.branches/$agent" 2>/dev/null || true);br=$(printf '%s' "$br" | tr -d '[:space:]');[ -n "$br" ] || br="fleet/$agent"
+ bounded_capture 5 256 git -C "$repo" rev-parse --verify -q "$sha^{commit}" >/dev/null || return 2
+ bounded_capture 5 256 git -C "$repo" merge-base --is-ancestor "$sha" "$br" >/dev/null || return 2
+ n=$(bounded_capture 5 16 git -C "$repo" rev-list --count --no-merges "$sha..$br" -- . ':(exclude).beans') || return 2
+ case "$n" in ''|*[!0-9]*) return 2;; esac
+ [ "$n" -eq 0 ] || return 2
+ if [ -n "${rp:-}" ] && [ -f "$rp" ]; then
+  m=$(stat -f %m "$rp" 2>/dev/null) || return 2
+  case "$m" in ''|*[!0-9]*) return 2;; esac
+  [ "$m" -lt "$t" ] || return 2
+ fi
+ return 1
+}
+# Never persist the pane, environment or native arguments. Emit only safe roster
+# identity/state/verdict fields, followed by the compatible human summaries.
+oc_agents=0;oc_broke=0;oc_cap=0;oc_unknown=0;cx_agents=0;cx_broke=0;cl_agents=0;cl_broke=0;cl_native_cap=0;cl_native_unknown=0;gk=0;ag=0;cr_dead="";silent=""
+while read -r a kind st; do
+ [ -n "${a:-}" ] || continue
+ case "$kind" in opencode)oc_agents=$((oc_agents+1));;codex)cx_agents=$((cx_agents+1));;claude)cl_agents=$((cl_agents+1));;grok)gk=$((gk+1));;agy)ag=$((ag+1));;esac
+ verdict=OK;pane="";tailpane="";read_rc=0
+ if [ "$status_valid" -eq 0 ] || [ "$st" = MISSING ] || [ "$st" = unknown ]; then
+  verdict=UNKNOWN
+ else
+  set +e
+  pane=$(bounded_fleet 5 65536 read "$a" 40);read_rc=$?
+  set -e
+  if [ "$read_rc" -ne 0 ] || [ -z "$(printf '%s' "$pane" | tr -d '[:space:]')" ]; then
+   verdict=UNKNOWN
+  else
+   tailpane=$(footer "$pane")
+   if [ "$kind" = opencode ]; then
+    if retry_structure "$tailpane"; then
+     set +e
+     retry_progress "$a"; pr=$?
+     set -e
+     if [ "$pr" -eq 1 ]; then verdict=MODEL_CAP; else verdict=UNKNOWN; fi
+    elif [ "$st" != working ] && printf '%s\n' "$tailpane" | grep -qiE '^[[:space:]]*(Error:[[:space:]]*)?Insufficient balance([[:space:][:punct:]]|$)'; then verdict=WORKSPACE_BALANCE; fi
+   fi
+   if [ "$kind" = codex ] && [ "$st" != working ] && printf '%s\n' "$pane" | grep -qiE 'usage limit|rate limit|session limit|hit your session'; then
+    banner_line=$(printf '%s\n' "$pane" | grep -niE 'usage limit|rate limit|session limit|hit your session' | tail -1 | cut -d: -f1)
     after=$(printf '%s\n' "$pane" | tail -n +$((banner_line+1)) | grep -cE '^[[:space:]]*(•|✓|└|│)') || true
-    # An IDLE seat produces nothing after the banner, so "output after it" never clears an expired limit —
-    # measured: a banner reading "try again at 12:43 PM" still idled every codex seat over an hour later.
-    # codex names its own reset time in the banner; once that time has passed, treat it as history too.
-    ta=$(printf '%s' "$pane" | tr '\n' ' ' | tr -s ' ' \
-        | grep -oE 'try again at [A-Z][a-z]{2} [0-9]{1,2}(st|nd|rd|th), [0-9]{4} [0-9]{1,2}:[0-9]{2} [AP]M' \
-        | tail -1 | sed -E 's/^try again at //; s/([0-9])(st|nd|rd|th),/\1,/')
-    ts=""; [ -n "$ta" ] && ts=$(date -j -f '%b %d, %Y %I:%M %p' "$ta" +%s 2>/dev/null)
-    [ -n "$ts" ] && [ "$ts" -le "$(date +%s)" ] && after=1
-    if [ "${after:-0}" -eq 0 ]; then cx_broke=$((cx_broke+1)); fi
+    ta=$(printf '%s' "$pane" | tr '\n' ' ' | tr -s ' ' | grep -oE 'try again at [A-Z][a-z]{2} [0-9]{1,2}(st|nd|rd|th), [0-9]{4} [0-9]{1,2}:[0-9]{2} [AP]M' | tail -1 | sed -E 's/^try again at //; s/([0-9])(st|nd|rd|th),/\1,/') || true
+    ts="";if [ -n "$ta" ];then ts=$(date -j -f '%b %d, %Y %I:%M %p' "$ta" +%s 2>/dev/null) || true;fi
+    if [ -n "$ts" ] && [ "$ts" -le "$(date +%s)" ];then after=1;fi
+    if [ "${after:-0}" -eq 0 ];then verdict=USAGE_CAP;cx_broke=$((cx_broke+1));fi
+   fi
+   if [ "$kind" = claude ];then
+    native_quota=$(printf '%s\n' "$tailpane" | claude_chooser) || native_quota=UNKNOWN
+    case "$native_quota" in
+     SESSION_CAP)verdict=SESSION_CAP;cl_native_cap=$((cl_native_cap+1));;
+     UNKNOWN)verdict=UNKNOWN;cl_native_unknown=$((cl_native_unknown+1));;
+    esac
+   fi
+   if [ "$kind" = claude ] && [ "$st" != working ];then
+    line=$(printf '%s\n' "$pane" | grep -iE 'session limit|hit your session' | tail -1) || true
+    r=$(printf '%s' "$line" | grep -oE 'resets [0-9]{1,2}(:[0-9]{2})?[ap]m' | awk '{print $2}') || true
+    if [ -n "$r" ];then
+     rs=$(date -j -f '%I:%M%p' "$(printf '%s' "$r" | sed -E 's/^([0-9]{1,2})([ap]m)$/\1:00\2/' | tr a-z A-Z)" +%s 2>/dev/null) || rs=0
+     if [ "$rs" -gt "$(date +%s)" ];then verdict=SESSION_CAP;cl_broke=$((cl_broke+1));fi
+    fi
+   fi
+   # Current working output or composer prose does not turn a stale credit
+   # banner into a dead seat. Check a non-working seat's current footer only.
+   if [ "$st" != working ] && printf '%s\n' "$tailpane" | grep -qiE "^[[:space:]]*(You're )?out of usage credits|^[[:space:]]*/usage-credits";then verdict=CREDITS;cr_dead="$cr_dead $a";fi
   fi
-done
-if [ "$cx_broke" -gt 0 ]; then
-  printf 'codex      %-6s AT USAGE LIMIT (%s agents showing it)\n' "$cx_agents" "$cx_broke"
-  echo '           -> https://chatgpt.com/codex/settings/usage'
-else
-  printf 'codex      %-6s ok\n' "$cx_agents"
-fi
-
-cl=$(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="claude" {n++} END{print n+0}')
-gk=$(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="grok" {n++} END{print n+0}')
-ag=$(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="agy" {n++} END{print n+0}')
-cl_broke=0; cl_reset=""
-for a in $(printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && $2=="claude" {print $1}'); do
-  st=$(printf "%s\n" "$FS" | awk -v n="$a" '$1==n{print $3}')
-  [ "$st" = "working" ] && continue
-  [ "$st" = "MISSING" ] && continue
-  line=$("$DROVER_BIN"/fleet read "$a" 40 2>/dev/null | grep -iE "session limit|hit your session" | tail -1 || true)
-  [ -n "$line" ] || continue
-  r=$(printf '%s' "$line" | grep -oE 'resets [0-9]{1,2}(:[0-9]{2})?[ap]m' | awk '{print $2}' || true)
-  # only count a limit whose reset time is still ahead; a stale line after the reset is not a limit
-  # a limit line without a parseable future reset time is scrollback, not a limit
-  [ -n "$r" ] || continue
-  rs=$(date -j -f '%I:%M%p' "$(echo "$r" | sed -E 's/^([0-9]{1,2})([ap]m)$/\1:00\2/' | tr a-z A-Z)" +%s 2>/dev/null || echo 0)
-  [ "$rs" -gt "$(date +%s)" ] || continue
-  cl_broke=$((cl_broke+1)); cl_reset="$r"
-done
-if [ "$cl_broke" -gt 0 ]; then
-  printf 'claude     %-6s AT SESSION LIMIT (%s agents showing it; resets %s)\n' "$cl" "$cl_broke" "$cl_reset"
-  echo '           -> wait for the reset, then RESUME each seat by name (they do not resume on their own)'
-else
-  printf 'claude     %-6s subscription\n' "$cl"
-fi
-
-# Credit exhaustion is a DIFFERENT failure from a session limit and the session-limit
-# check above cannot see it: that check requires a parseable future reset time, and the
-# credit banner has none ("You're out of usage credits. Run /usage-credits ... or /model
-# to switch models."). Measured 2026-09-08: three claude seats all sat out of credits
-# while this script printed "claude 7 subscription", and two sprint beans
-# were dispatched into dead seats and produced nothing for 48 minutes.
-# A credit-dead seat NEVER recovers on its own — it needs a top-up or a /model switch.
-cr_dead=""
-for a in $(printf "%s\n" "$FS" | awk 'NR>1 && $1 != "-" {print $1}'); do
-  "$DROVER_BIN"/fleet read "$a" 40 2>/dev/null | grep -qiE "out of usage credits|/usage-credits" || continue
-  cr_dead="$cr_dead $a"
-done
-if [ -n "$cr_dead" ]; then
-  printf 'CREDITS    %-6s OUT OF USAGE CREDITS:%s\n' "$(printf '%s' "$cr_dead" | wc -w | tr -d ' ')" "$cr_dead"
-  echo '           -> these seats are DEAD and do not recover: top up, or /model to a subscription model.'
-  echo '           -> release their beans first (fleet-track clear <agent>) or the work sits unstarted.'
-fi
-printf 'grok       %-6s subscription\n' "$gk"
-printf 'agy        %-6s subscription\n' "$ag"
-
-echo
-echo "Silent-idle check — agents that finished with no work to show:"
-printf "%s\n" "$FS" | awk 'NR>1 && $1!="-" && ($3=="done"||$3=="idle"){printf "  %s\n",$1}' | head -8
-echo "  (an agent 'done' with no report and no commit is usually a spent budget,"
-echo "   not a finished task — check its pane before re-dispatching)"
+ fi
+ if [ "$kind" = opencode ];then case "$verdict" in UNKNOWN)oc_unknown=$((oc_unknown+1));;MODEL_CAP)oc_cap=$((oc_cap+1));;WORKSPACE_BALANCE)oc_broke=$((oc_broke+1));;esac;fi
+ printf 'SEAT %s %s %s %s\n' "$a" "$kind" "$st" "$verdict"
+ if [ "$st" = done ] || [ "$st" = idle ];then silent="$silent $a";fi
+done <<< "$ROWS"
+printf 'harness    agents  state\n--------------------------------\n'
+if [ "$status_valid" -eq 0 ];then printf 'opencode   %-6s UNKNOWN (status read failed, invalid, or empty)\n' "$oc_agents";fi
+if [ "$oc_broke" -gt 0 ];then printf 'opencode   %-6s OUT OF CREDITS (%s seats showing workspace insufficient balance)\n' "$oc_agents" "$oc_broke";fi
+if [ "$oc_cap" -gt 0 ];then printf 'opencode   %-6s MODEL CAP (%s affected seats; no model override)\n' "$oc_agents" "$oc_cap";fi
+if [ "$oc_unknown" -gt 0 ] && [ "$status_valid" -eq 1 ];then printf 'opencode   %-6s UNKNOWN (%s seats: pending inspection)\n' "$oc_agents" "$oc_unknown";fi
+if [ "$oc_broke" -eq 0 ] && [ "$oc_cap" -eq 0 ] && [ "$oc_unknown" -eq 0 ] && [ "$status_valid" -eq 1 ];then printf 'opencode   %-6s ok\n' "$oc_agents";fi
+if [ "$cx_broke" -gt 0 ];then printf 'codex      %-6s AT USAGE LIMIT (%s agents showing it)\n' "$cx_agents" "$cx_broke";else printf 'codex      %-6s ok\n' "$cx_agents";fi
+if [ "$cl_broke" -gt 0 ];then printf 'claude     %-6s AT SESSION LIMIT (%s agents showing it)\n' "$cl_agents" "$cl_broke";
+elif [ "$cl_native_cap" -gt 0 ];then printf 'claude     %-6s NATIVE QUOTA (%s affected seats)\n' "$cl_agents" "$cl_native_cap";
+elif [ "$cl_native_unknown" -eq 0 ];then printf 'claude     %-6s subscription\n' "$cl_agents";fi
+if [ "$cl_native_unknown" -gt 0 ];then printf 'claude     %-6s UNKNOWN (%s native quota seats pending inspection)\n' "$cl_agents" "$cl_native_unknown";fi
+if [ -n "$cr_dead" ];then printf 'CREDITS    %-6s OUT OF USAGE CREDITS:%s\n' "$(printf '%s' "$cr_dead" | wc -w | tr -d ' ')" "$cr_dead";fi
+printf 'grok       %-6s subscription\nagy        %-6s subscription\n' "$gk" "$ag"
+printf '\nFinished/idle seats (status only; report presence not checked):\n'
+for a in $silent;do printf '  %s\n' "$a";done

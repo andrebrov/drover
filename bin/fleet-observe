@@ -113,6 +113,28 @@ HARNESS_ERR = re.compile(r'Something went wrong\. Please try again|stream closed
 SENT = f'{STATE}/observe-sent'   # key -> last alert epoch; one alert per key per 6h
 
 
+def review_landed(line):
+    """True when the SHA a REVIEW-NEEDED line names has an equivalent patch on origin/main (git cherry '-')."""
+    m = re.search(r'\b([0-9a-f]{7,40})\b', line)
+    if not m:
+        return False
+    r = subprocess.run(['git', '-C', REPO, 'cherry', 'origin/main', m.group(1), m.group(1) + '~1'],
+                       capture_output=True, text=True, timeout=30)
+    out = [l for l in r.stdout.splitlines() if l.strip()]
+    return r.returncode == 0 and len(out) == 1 and out[0].startswith('- ')
+
+
+def on_main(sha):
+    """True when sha is on origin/main OR its patch landed there under another SHA (a rebase before push).
+    Comparing raw SHAs alone false-alarmed on every rebased landing."""
+    if subprocess.run(['git', '-C', REPO, 'merge-base', '--is-ancestor', sha, 'origin/main'],
+                      capture_output=True, timeout=30).returncode == 0:
+        return True
+    r = subprocess.run(['git', '-C', REPO, 'cherry', 'origin/main', sha, sha + '^'],
+                       capture_output=True, text=True, timeout=30)
+    return r.returncode == 0 and r.stdout.strip().startswith('-')
+
+
 def alert(key, title, body):
     sent = dict(l.split('\t', 1) for l in open(SENT).read().split('\n') if '\t' in l) if os.path.exists(SENT) else {}
     if key in sent and NOW - float(sent[key]) < 6 * 3600:
@@ -168,6 +190,8 @@ def ledger():
     rows = []
     for seat in sorted(os.listdir(TASKS)) if os.path.isdir(TASKS) else []:
         f = os.path.join(TASKS, seat)
+        if seat.startswith('.') or not os.path.isfile(f):
+            continue   # .branches/ and .dispatch-locks/ live beside the task files
         parts = open(f).read().split('\t')
         bean = parts[1].strip() if len(parts) > 1 else '?'
         rows.append((seat, bean, os.path.getmtime(f)))
@@ -216,7 +240,33 @@ def board():
 
 def check():
     ag = agents()
+    if not ag:
+        # A failed or timed-out `herdr agent list` returns {}; reading it as "every seat absent" raised a stall
+        # alert for every working seat at once. An unreadable roster is no evidence: skip this tick.
+        print('herdr agent list unreadable this tick; seat checks skipped')
+        return
     off = set(open(f'{STATE}/harness-off').read().split()) if os.path.exists(f'{STATE}/harness-off') else set()
+
+    # 0. Reap owner records of finished beans. A claim is written on dispatch and nothing removed it, so most
+    #    owner files named completed or scrapped beans and finished work kept looking owned.
+    od = f'{STATE}/owner'
+    beans_dir = f'{REPO}/.beans'
+    if os.path.isdir(od) and os.path.isdir(beans_dir):
+        for b in os.listdir(od):
+            bf = next((f for f in os.listdir(beans_dir) if f.startswith(b + '-')), None)
+            st = re.search(r'^status:\s*(\S+)', open(f'{beans_dir}/{bf}', errors='ignore').read(), re.M) if bf else None
+            if not bf:
+                # the shared checkout can lag origin/main right after a push from another worktree: a bean filed
+                # minutes ago looked nonexistent and its owner was reaped. Ask main.
+                onmain = subprocess.run(['git', '-C', REPO, 'ls-tree', '--name-only', 'origin/main', '.beans/'],
+                                        capture_output=True, text=True, timeout=30).stdout
+                if f'/{b}-' in onmain:
+                    continue
+            if not bf or (st and st.group(1) in ('completed', 'scrapped')):
+                keep = f"{CFG['home']}/handoffs/owner-reaped"
+                os.makedirs(keep, exist_ok=True)
+                os.replace(f'{od}/{b}', f'{keep}/{b}')
+                print(f'owner reaped {b} ({st.group(1) if st else "no bean file"})')
 
     # 1. seats: dialogs and dead harnesses (read the screen of every non-working roster seat)
     for name, a in ag.items():
@@ -227,11 +277,19 @@ def check():
             alert(f'dialog-{name}', f'{name} is waiting on a dialog',
                   'Seat is blocked on an approval/question UI. Read it (herdr agent read) and answer it '
                   'deliberately; the observer never presses keys.')
-        if st == 'working':
-            continue
         txt = screen(name)
+        if st == 'working':
+            # a working seat is judged only by its live bottom lines (a retry/limit banner sits there while the
+            # harness reports "working"); scrollback above may hold a banner that has since cleared
+            txt = '\n'.join([l for l in txt.splitlines() if l.strip()][-3:])
+            if not any(d and re.search(p_, txt, re.I) for p_, _, d in DEAD):
+                continue
+        # A message that DISABLES a harness must be live: only the bottom lines count. A stale "account suspended"
+        # higher up the screen survived a relaunch on another model and re-disabled the harness every tick.
+        # Alert-only patterns may still match anywhere on the screen.
+        bottom = '\n'.join([l for l in txt.splitlines() if l.strip()][-6:])
         for pat, what, disable in DEAD:
-            if re.search(pat, txt, re.I):
+            if re.search(pat, bottom if disable else txt, re.I):
                 if disable and a.get('agent'):
                     with open(f'{STATE}/harness-off', 'a') as fh:
                         fh.write(a['agent'] + '\n')
@@ -266,11 +324,18 @@ def check():
             head = next((l for l in body.splitlines()[:3] if re.search(r'\b(DONE|BLOCKED|LANDED)\b', l)), '')
             verdict = head or next((l for l in reversed(body.strip().splitlines())
                                      if re.match(r'(DONE|BLOCKED)\b', l)), '')
+            if re.match(r'\W*REVIEW-NEEDED', body) and review_landed(body.splitlines()[0]):
+                # the lead reviewed and landed it, usually by cherry-pick, so the SHA is not an ancestor; an
+                # equivalent patch on origin/main is the evidence. Without this the seat sat idle and re-alerted.
+                print(f'released {seat} ({bean}: review-needed commit already on origin/main)')
+                os.remove(os.path.join(TASKS, seat)); continue
             if re.match(r'\W*REVIEW-NEEDED', body):
                 # the seat's cross-model reviewer failed and it handed the diff to the lead: it is WAITING, not
                 # free. Releasing it here dispatched new work over a slice the lead was about to approve.
                 alert(f'review-needed-{seat}-{bean}', f'{seat} needs a lead review on {bean}', body.splitlines()[0][:300])
                 continue
+            if 'BLOCKED' in verdict and bean.endswith(('-waiting', '-standby')):
+                continue   # the lead parked this seat waiting on another landing; its BLOCKED is the expected state
             if 'BLOCKED' in verdict:
                 why = next((l for l in body.splitlines() if re.match(r'\s*(HUMAN|LEAD|BLOCKED)[:\s]', l)), verdict)
                 key = f'blocked-{seat}-{bean}-' + hashlib.md5(verdict.encode()).hexdigest()[:6]
@@ -278,13 +343,23 @@ def check():
                 os.remove(os.path.join(TASKS, seat)); continue
             # A report with NO verdict line is a progress note, not a finish: releasing on it dispatched new work
             # over a seat mid-task. Research and verification reports lead with a verdict word too.
-            if not verdict and re.search(r'^\W*(HUNT|VERDICT|COMPLETE|PASSED|[0-9]+/[0-9]+ (PASS|scenarios))',
+            if not verdict and re.search(r'^\W*(HUNT|VERDICT|COMPLETE|PASSED|NOTHING TO DO|NO-?OP\b|[0-9]+/[0-9]+ (PASS|scenarios))',
                                          body, re.M | re.I):
                 verdict = 'DONE'
             if re.match(r'\W*(PARTIAL|LANDED-PARTIAL|IN PROGRESS|WIP)\b', body):
                 # PARTIAL = part landed, the rest is still this seat's work: never a release. Seats freed on PARTIAL
                 # were handed self-serve rounds and walked away from their assignments.
                 continue
+            if not verdict and body:
+                # any wording is fine when the first line names a commit that is already on origin/main
+                # (seats wrote CLOSED / NOTHING TO DO / PASSED and each was read as "no verdict" -> false stall)
+                first = body.splitlines()[0]
+                for sha in re.findall(r'\b[0-9a-f]{7,40}\b', first)[:3]:
+                    if on_main(sha):
+                        verdict = 'LANDED ' + sha
+                        break
+                if not verdict and re.match(r'\W*(CLOSED|SHIPPED|MERGED|FIXED)\b', first):
+                    verdict = 'DONE'
             if re.search(r'DONE|LANDED', verdict):
                 print(f'released {seat} ({bean}: {(verdict or (body.splitlines()[0] if body else ""))[:80]})')
                 os.remove(os.path.join(TASKS, seat)); continue
@@ -297,6 +372,13 @@ def check():
             alert(f'harness-err-{seat}-{bean}', f'{seat}: its harness API dropped the turn on {bean}',
                   'The pane ends in a harness/API error, not a question or a finish. Nudge it to continue from the last step.')
             continue
+        if bean.endswith(('-standby', '-waiting')):
+            continue   # the lead parked this seat on purpose (waiting on another bean or a proof): not a stall
+        if 'reviewer' in seat and st != 'working':
+            # A reviewer whose bean's coder is still working is waiting for a REVIEW-NEEDED, not stalled.
+            coder = next((s_ for s_, b_, _ in ledger() if b_ == bean and 'reviewer' not in s_), None)
+            if coder and ag.get(coder, {}).get('agent_status') == 'working':
+                continue
         if st != 'working' and NOW - p > STALL_MIN * 60:
             alert(f'stall-{seat}-{bean}', f'{seat} stalled on {bean}',
                   f'status={st}, no commit on {br} and no report for {int((NOW - p) / 60)} min. '

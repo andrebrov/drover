@@ -38,7 +38,7 @@ def git(*a):
 base = git('rev-list', '-1', '--before', f'{hours} hours ago', 'origin/main').stdout.strip()
 files = sorted({l for l in git('log', 'origin/main', f'--since={hours} hours ago', '--name-only', '--format=',
                                 '--', '.beans/').stdout.splitlines() if l.endswith('.md')})
-SHA = re.compile(r'\b[0-9a-f]{7,40}\b')
+SHA = re.compile(r'(?<![0-9a-fA-F])[0-9a-f]{7,40}(?![0-9a-fA-F])')   # a sha256 (64 hex) is a hash, not a commit
 bad = 0
 for f in files:
     now = git('show', f'origin/main:{f}').stdout

@@ -10,9 +10,16 @@
 # Only two things cannot lie: a commit on the agent's branch, and a report file
 # on disk. This tracks exactly those.
 #
-#   fleet-track dispatch <agent> <bean> [report-path]   record what was asked
+#   fleet-track dispatch <agent> <bean> [report-path] [branch]
 #   fleet-track check                                   what has actually landed
 #   fleet-track clear <agent>                           forget one task
+#
+# The branch is the agent's ACTUAL branch. Our per-bean branches are
+# `fleet/<agent>-<bean>`, so a check that assumes `fleet/<agent>` reads a branch
+# that does not exist: the sha comes back `none`, the code-commit count is `none`
+# and every dispatch looks abandoned after 15 minutes even when the commit and the
+# report are both on disk. The branch is therefore recorded per agent and used for
+# the sha, the code-commit count and the last-commit age.
 set -euo pipefail
 # shellcheck source=drover-env
 . "$(dirname "$0")/drover-env"
@@ -21,16 +28,70 @@ REPORTS="$FLEET_REPORTS"
 REPO="${FLEET_REPO:-${DROVER_REPO:?set DROVER_REPO (env or ~/.config/drover/config) to your project checkout}}"
 GIT=$(command -v git)
 mkdir -p "$TASKS"
+# Branch metadata lives beside the task files, never inside them: the task file stays
+# exactly four tab-separated columns because fleet-watch parses it positionally.
+# A dot-prefixed directory is also skipped by the `*` glob in check, so adding it
+# cannot change what the watcher sees.
+BRANCHES="$TASKS/.branches"
 
-sha_of() { "$GIT" -C "$REPO" rev-parse --short "fleet/$1" 2>/dev/null || echo none; }
+# A dispatch that names no branch keeps the legacy meaning, so existing callers are unaffected.
+default_branch() { printf 'fleet/%s' "$1"; }
+
+# The recorded branch, falling back to the legacy name so a task file written before the
+# fifth argument existed still resolves to something real.
+branch_of() {
+  local b
+  b=$(cat "$BRANCHES/$1" 2>/dev/null || true)
+  [ -n "$b" ] || b=$(default_branch "$1")
+  printf '%s' "$b"
+}
+
+# Pin the physical repository and worktree; inherited core.worktree must not redirect a writer.
+GIT_DIR="$REPO/.git"; GIT_WORK_TREE="$REPO"
+if [ -f "$GIT_DIR" ]; then
+  _physical=$(sed -n 's/^gitdir: //p' "$GIT_DIR")
+  case "$_physical" in /*) GIT_DIR="$_physical" ;; *) GIT_DIR="$REPO/$_physical" ;; esac
+fi
+export GIT_DIR GIT_WORK_TREE
+sha_of_branch() { "$GIT" rev-parse --short "$1" 2>/dev/null || echo none; }
+
+# Overwrite in place and atomically: write to a dot-prefixed temp file (which the `*` glob
+# in check cannot match) and rename over the target. Never truncate or clear the target
+# first — fleet-watch polls these files, and a clear-then-write window reads as "no task".
+write_atomic() {
+  local dest="$1" tmp
+  tmp=$(mktemp "$TASKS/.task.XXXXXX")
+  cat > "$tmp"
+  mv -f "$tmp" "$dest"
+}
 
 case "${1:-check}" in
   dispatch)
-    a="$2"; bean="$3"; rp="${4:-$REPORTS/$a-$bean.md}"
-    printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$bean" "$(sha_of "$a")" "$rp" > "$TASKS/$a"
-    echo "tracking $a -> $bean (branch at $(sha_of "$a"))"
+    a="$2"; bean="$3"; rp="${4:-$REPORTS/$a-$bean.md}"; br="${5:-$(default_branch "$a")}"
+    # All native dispatch writers share this lock. Optional sixth arg is exact prior TASK hash,
+    # or '-' for absence. Fail closed on CAS mismatch; never clear/truncate the prior task.
+    case "$a" in ''|*..*|*[!A-Za-z0-9_.-]*) echo "unsafe agent" >&2; exit 2 ;; esac
+    mkdir -p "$TASKS/.dispatch-locks"
+    task_lock="$TASKS/.dispatch-locks/$a"
+    mkdir "$task_lock" 2>/dev/null || exit 75
+    trap 'rmdir "$task_lock"' EXIT
+    if [ "$#" -ge 6 ]; then
+      expected="$6"; actual=-
+      [ ! -L "$TASKS/$a" ] || exit 75
+      if [ -f "$TASKS/$a" ]; then actual=$(shasum -a 256 "$TASKS/$a" | cut -d' ' -f1); fi
+      [ "$expected" = "$actual" ] || { echo "TASK changed; dispatch refused" >&2; exit 75; }
+    fi
+    # Omitting the fifth argument records the legacy branch and REPLACES any explicit branch
+    # recorded earlier. That is the specified default, kept for backward compatibility: a new
+    # bean dispatched without a branch must not silently inherit the previous bean's branch,
+    # or check would keep reading commits that belong to a different task. Callers using
+    # per-bean branches must therefore pass the branch on EVERY dispatch, including re-nudges.
+    mkdir -p "$BRANCHES"
+    printf '%s\n' "$br" | write_atomic "$BRANCHES/$a"
+    printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$bean" "$(sha_of_branch "$br")" "$rp" | write_atomic "$TASKS/$a"
+    echo "tracking $a -> $bean (branch $br at $(sha_of_branch "$br"))"
     ;;
-  clear) rm -f "$TASKS/${2:?agent}"; echo "cleared ${2}" ;;
+  clear) rm -f "$TASKS/${2:?agent}"; rm -f "$BRANCHES/${2}"; echo "cleared ${2}" ;;
   check)
     printf '%-18s %-11s %-7s %-10s %-7s %s\n' AGENT BEAN AGE CODE-COMMITS LAST-COMMIT REPORT
     printf -- '---------------------------------------------------------------\n'
@@ -39,13 +100,22 @@ case "${1:-check}" in
       a=$(basename "$f")
       IFS=$'\t' read -r t bean sha rp < "$f"
       now=$(date +%s); age=$(( (now - t) / 60 ))
-      cur=$(sha_of "$a")
+      br=$(branch_of "$a")
+      cur=$(sha_of_branch "$br")
       if [ "$cur" = "$sha" ]; then commits="none"; else
         # code commits only: bean-file commits masked an idle coder once (85 min)
-        commits=$("$GIT" -C "$REPO" rev-list --count --no-merges "$sha..fleet/$a" -- . ':(exclude).beans' 2>/dev/null || echo "?")
+        # A baseline that is missing or is not a commit cannot start a range, and the branch tip
+        # is NOT a substitute: it counts every inherited commit the branch was cut from as this
+        # agent's work (thousands of them, for an agent that shipped none).
+        # An unknown baseline is reported as unknown. Never guess one.
+        if [ "$sha" = "none" ] || ! "$GIT" -C "$REPO" rev-parse --verify -q "$sha^{commit}" >/dev/null 2>&1; then
+          commits="?"
+        else
+          commits=$("$GIT" -C "$REPO" rev-list --count --no-merges "$sha..$br" -- . ':(exclude).beans' 2>/dev/null || echo "?")
+        fi
         [ "$commits" = "0" ] && commits="beans-only"
       fi
-      lastc=$("$GIT" -C "$REPO" log -1 --format=%ct "fleet/$a" 2>/dev/null || echo "$now"); idle=$(( (now - lastc) / 60 ))
+      lastc=$("$GIT" -C "$REPO" log -1 --format=%ct "$br" 2>/dev/null || echo "$now"); idle=$(( (now - lastc) / 60 ))
       if [ -f "$rp" ]; then
         rmin=$(( (now - $(stat -f %m "$rp" 2>/dev/null || echo "$now")) / 60 ))
         report="yes (${rmin}m ago)"
@@ -57,5 +127,5 @@ case "${1:-check}" in
     echo "COMMITS=none and REPORT=none after ~15m means the dispatch did not take."
     echo "Do NOT judge by 'fleet status' — it says done while an agent is mid-turn."
     ;;
-  *) echo "usage: fleet-track dispatch <agent> <bean> [report] | check | clear <agent>"; exit 1 ;;
+  *) echo "usage: fleet-track dispatch <agent> <bean> [report] [branch] | check | clear <agent>"; exit 1 ;;
 esac

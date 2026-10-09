@@ -1092,7 +1092,9 @@ needs someone else: name them and the exact action ("human: apply migration N", 
 Never freeze main, and never single-slot landings. A seat that loses a push race does not ask for a pause: it
 rebases and pushes again, and the lead fixes the gate instead (for example, reuse a gate pass when main's new
 commits are disjoint from the push). `fleet-slot` keeps `FLEET_PUSH_SLOTS` push slots apart from the general
-heavy-run slots for this reason: pushes wait only for each other, never behind a test run, and several run at once.
+heavy-run slots for this reason: pushes wait only for each other, never behind a test run. The defaults are
+conservative (one push slot, one general slot: at most two heavy jobs at once) after a memory-pressure incident;
+raise them when the machine has headroom, never to zero (see "Heavy gates run under the limiter").
 The general slots exist because load reached 205 on a 16-core machine when every seat ran suites at once, and
 timing-sensitive tests went red that pass alone.
 **Metric (target 0):** freeze requests.
@@ -1130,3 +1132,76 @@ Rules that came with it: measure the cause in the running process before patchin
 judging it (a review was called empty from its CLI banner — it ended `VERDICT: CHANGES`); verify an id before
 sending it to a seat (an assignment went out with an empty bean id); and one free model's usage cap ("Free usage
 exceeded") is not the harness being out of credits — only "insufficient balance" disables a harness.
+
+## Retro 2026-10-08/09 — rules added and changed
+
+## Acceptance is backed by receipts, not by prose (2026-10-08)
+Measured: two reviews were marked APPROVE before their executable gates were complete (one had only queued
+commands, the next lacked a backend receipt and carried malformed JSON). A supervisor group state was
+handwritten instead of read from a receipt. A rule that says "prove claims by execution" fails at the report
+boundary, so the boundary is mechanical now: an APPROVE is accepted only when its gate receipts exist, are
+complete and parse. Queued, absent or malformed receipts are not approval; group state is read from the canonical
+receipts, never typed in. A cap or limit claim cites the latest actual model/session evidence, not an earlier
+observation (the underlying model of a seat had changed since the cap was recorded).
+**Metric (target 0):** accepted APPROVE reports with queued, absent or malformed receipts.
+
+## Heavy gates run under the limiter, and the receipt shows it (2026-10-08)
+Three gates claimed in prose that they ran under the heavy-run limiter and did not; one author set the limiter to
+0 and amended the reviewed SHA. Green application output proves nothing about the memory limiter. The receipt's
+command must begin with `fleet-slot run`, with the limits in the environment (default: one general, one push) and
+at most two workers. Setting `FLEET_HEAVY_SLOTS=0` is prohibited. A gate whose envelope is not satisfied is not a
+publication gate. Reuse existing correct gates; rerun only the missing concrete one.
+**Metric (target 0):** accepted unslotted heavy gates; explicit limiter bypasses.
+
+## Approval is for an exact SHA and its product blobs (2026-10-08)
+Freeze the reviewed source. Any later amendment needs a named diff or equivalence check against the approved
+blobs, plus changed-suite verification when behaviour could differ. An older SHA's verdict is never inherited
+silently. **Metric (target 0):** landed product blobs that changed after independent approval without a recheck.
+
+## One authority per clause; a corrected clause is corrected everywhere (2026-10-09)
+A contract clause was corrected in one document while a conflicting implementation instruction stayed in another,
+three findings across two frozen-source reviews. Before approving a contract, every authority document must agree
+for each terminal-error, terminal-success and pending-owner counterexample; a passing parser suite does not show
+that. **Metric (target 0):** contradictory status branches remaining at final approval.
+
+## A mocked database proves a query's shape, not its columns (2026-10-09)
+A mock returned success for SQL naming a column that does not exist. Qualify the captured writer SQL against the
+real table contract and its real guard; a mock driven by the SQL text cannot prove the column is there.
+A manifest parser needs the same treatment: unknown-role, empty-identity and incomplete-occurrence payloads must
+refuse before any output, and a green test count that never exercised them does not show it did.
+**Metric (target 0):** guarded writer columns that do not exist; malformed manifests that return success.
+
+## A seal over declared inputs does not prove transitive compatibility (2026-10-09)
+A fixture matrix passed while a suite failed on a relation it never declared (the companion table of a table it
+did declare). Run the focused suites through the real bounded admission with exact source witnesses before the next
+long push, and do not read a focused proof as a full-suite certificate. **Metric (target 0):** missing-relation
+failures in that readiness run.
+
+## A publication handoff names its scope (2026-10-09)
+An unqualified handoff proposed regenerating company-wide output for what was one thread. The lead checks the
+script's actual scope against the handoff before anything runs; nothing executes on the handoff's description.
+
+## A load guard stops new heavy work, and failed gates back off exponentially (2026-10-07)
+A memory incident came from gates and builds starting on top of each other. `fleet-watch` now refuses to START a
+gate when free memory is below `FLEET_MIN_FREE_GB` (default 16, counting free + inactive + speculative pages) or the
+process count is above `FLEET_MAX_PROCS` (default 1500), and a failed gate pass backs off exponentially (4, 8, 16
+... up to 60 minutes, state in `push-backoff`, cleared by a green pass) instead of re-running every tick. Re-verify
+passes run under `fleet-slot run`, so the limiter covers them too. A guard that only logs while the work still
+starts is not a guard. **Metric:** gates started while the guard was tripped = 0.
+
+## No containers on a memory-pressured laptop (2026-10-09)
+Two machine freezes in one day, the first preceded by a container VM stalling at several GB. A task that needs a
+local database uses the native one already running; a step that truly needs a container is BLOCKED and reported,
+not started.
+
+## `timeout` does not exist on macOS (2026-10-09)
+macOS ships neither `timeout` nor `gtimeout`: runs wrapped in it exited 127 dozens of times and never started. A
+GNU-compatible shim that exits 124 on timeout belongs on PATH. An exit 127 from a wrapped command means it DID NOT
+RUN; never report it as a test result. Prefer watching the log for silence over a fixed timeout.
+
+## A tracked task records the agent's real branch, and an unknown baseline is unknown (2026-10-08)
+`fleet-track` assumed the branch `fleet/<agent>`, but per-bean branches are `fleet/<agent>-<bean>`: the sha came
+back `none` and every dispatch looked abandoned after 15 minutes. The branch is now recorded per agent beside (never
+inside) the four-column task file, writes are atomic, and dispatches share one lock with an optional compare-and-set
+on the prior task. A baseline that is missing or not a commit reports `?`; the branch tip is never substituted, since
+that counted every inherited commit as the agent's work.

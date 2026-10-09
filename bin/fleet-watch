@@ -125,17 +125,34 @@ clear_dialogs(){
 # --- 4. budget --------------------------------------------------------------
 BROKE=""
 check_budget(){
-  # fleet-budget capped at 60s with a timestamped xtrace: an uncapped budget read once hung the tick, and the
-  # trace names the step that was slow. Each sub-step taking >=15s is logged as SLOW-SUB.
-  local out _b=$SECONDS
-  out=$(PS4='+$(date +%T) ' perl -e 'alarm 60; exec @ARGV' bash -x "$DROVER_BIN"/fleet-budget 2>"$STATE/budget-trace.log")
-  [ $((SECONDS-_b)) -ge 15 ] && log "SLOW-SUB fleet-budget $((SECONDS-_b))s"
-  BROKE=""
+  # fleet-budget runs under its own bounded capture (own process group, 60s deadline, 64KB cap) and an expanded
+  # shell trace must never persist panes, environment or arguments, so xtrace is off and only counts are logged.
+  # A failed or capped inspection is "pending inspection", never "no budget problem".
+  local out rc _b=$SECONDS
+  set +x
+  out=$("$DROVER_BIN"/fleet-budget --capture 60 65536 /bin/bash "$DROVER_BIN"/fleet-budget); rc=$?
+  BROKE=""; SEAT_BLOCKED=""; BUDGET_SEATS=""
   # hard off-switch: harnesses listed in state/harness-off are never dispatched to, whatever the panes say
   for h in $(cat "$STATE/harness-off" 2>/dev/null); do BROKE="$BROKE $h"; done
-  echo "$out" | grep -q "^opencode.*OUT OF CREDITS" && BROKE="$BROKE opencode" && log "BUDGET: opencode out of credits — not dispatching to it"
-  echo "$out" | grep -q "^codex.*AT USAGE LIMIT"    && BROKE="$BROKE codex"    && log "BUDGET: codex at usage limit — not dispatching to it"
-  echo "$out" | grep -q "^claude.*AT SESSION LIMIT" && BROKE="$BROKE claude"   && log "BUDGET: claude at session limit — not dispatching to it"
+  if [ "$rc" -eq 0 ]; then
+    BUDGET_SEATS=$(printf '%s\n' "$out" | awk '$1=="SEAT"{print $2,$3,$4,$5}')   # seat harness status VERDICT
+    SEAT_BLOCKED=$(printf '%s\n' "$BUDGET_SEATS" | awk '$4!="OK"{printf "%s ",$1}')
+    printf '%s\n' "$out" | grep -q "^opencode.*OUT OF CREDITS" && BROKE="$BROKE opencode" && log "BUDGET: opencode out of credits — not dispatching to it"
+    printf '%s\n' "$out" | grep -q "^opencode.*UNKNOWN" && log "BUDGET: affected seats pending inspection"
+    printf '%s\n' "$out" | grep -q "^codex.*AT USAGE LIMIT" && BROKE="$BROKE codex" && log "BUDGET: codex at usage limit — not dispatching to it"
+    printf '%s\n' "$out" | grep -q "^claude.*AT SESSION LIMIT" && BROKE="$BROKE claude" && log "BUDGET: claude at session limit — not dispatching to it"
+  else
+    log "BUDGET: inspection failed — pending inspection"
+  fi
+  printf 'budget rc=%s seats=%s blocked=%s\n' "$rc" "$(printf '%s\n' "$BUDGET_SEATS" | awk 'NF{n++}END{print n+0}')" "$(printf '%s\n' "$SEAT_BLOCKED" | awk 'NF{n++}END{print n+0}')" > "$STATE/budget-trace.log"
+  # A failed inspection invalidates the previous per-seat snapshot instead of leaving it to look current.
+  local seat_tmp
+  if [ "$rc" -eq 0 ] && [ -n "$BUDGET_SEATS" ]; then
+    seat_tmp=$(mktemp "$STATE/.budget-seat.XXXXXX")
+    if { date +%s; printf '%s\n' "$BUDGET_SEATS"; } > "$seat_tmp"; then mv -f "$seat_tmp" "$STATE/budget-seat"
+    else rm -f "$seat_tmp" "$STATE/budget-seat"; fi
+  else rm -f "$STATE/budget-seat"; fi
+  [ $((SECONDS-_b)) -ge 15 ] && log "SLOW-SUB fleet-budget $((SECONDS-_b))s"
   _b=$SECONDS; spend_guard; [ $((SECONDS-_b)) -ge 15 ] && log "SLOW-SUB spend_guard $((SECONDS-_b))s"
 }
 
@@ -784,6 +801,19 @@ route_land_conflicts(){
     log "LAND-ROUTE $b -> $seat (was ${owner:-none}): ${reason:0:80}"
   done
 }
+# Load guard: never START a gate/build/test when free memory is low or the box is crowded with processes
+# (a memory-pressure incident came from gates starting on top of each other). Free = free+inactive+speculative
+# pages. Override: FLEET_MIN_FREE_GB (default 16), FLEET_MAX_PROCS (default 1500).
+load_ok(){ local ps free procs
+  ps=$(vm_stat | awk '/page size of/{print $8}'); ps=${ps:-16384}
+  free=$(vm_stat | awk -v ps="$ps" '/Pages (free|inactive|speculative)/{gsub("\\.","",$NF); n+=$NF} END{printf "%d", n*ps/1073741824}')
+  procs=$(ps -A -o pid= | wc -l | tr -d ' ')
+  if [ "${free:-0}" -lt "${FLEET_MIN_FREE_GB:-16}" ] || [ "${procs:-0}" -gt "${FLEET_MAX_PROCS:-1500}" ]; then
+    log "LOAD-GUARD: not starting heavy work (free ${free}GB < ${FLEET_MIN_FREE_GB:-16} or procs ${procs} > ${FLEET_MAX_PROCS:-1500})"; return 1; fi; return 0; }
+# Exponential backoff between failed gate passes: $STATE/push-backoff = "<fails> <not-before-epoch>".
+# 240s, 480s, ... capped at 3600s; a green or already-pushed pass clears it.
+backoff_wait(){ local n nb; read -r n nb < "$STATE/push-backoff" 2>/dev/null || return 1; [ "$(date +%s)" -lt "${nb:-0}" ]; }
+backoff_fail(){ local n=0 d; read -r n _ < "$STATE/push-backoff" 2>/dev/null; n=$(( ${n:-0} + 1 )); d=$(( 120 * (1 << (n>5?5:n)) )); [ $d -gt 3600 ] && d=3600; echo "$n $(( $(date +%s) + d ))" > "$STATE/push-backoff"; log "BACKOFF: gate failure #$n, next attempt in ${d}s"; }
 auto_push(){
   # Push local main to origin after a land. SAFE because the DEPLOY-BOUNDARY full-suite gate
   # (fleet-verify-main) runs on a clean worktree first; on a cumulative RED we do NOT push and PAUSE
@@ -791,6 +821,8 @@ auto_push(){
   [ -f "$STATE/land-paused" ] && return 0
   [ "$(cd "$REPO" && git rev-parse --abbrev-ref HEAD 2>/dev/null)" = main ] || return 0
   [ -d "$STATE/.land-lock" ] && return 0          # a land is mid-flight — let it finish first
+  backoff_wait && return 0                        # a recent gate failure: wait out the backoff
+  load_ok || return 0                             # the machine is short of memory: do not start a gate now
   local ahead; ahead=$(cd "$REPO" && git rev-list --count origin/main..HEAD 2>/dev/null)
   [ "${ahead:-0}" -gt 0 ] || return 0
   local PK="$STATE/.push-lock"
@@ -808,7 +840,9 @@ auto_push(){
     else return 0; fi
   fi
   ( sh -c 'echo $PPID' > "$PK/pid"; cd "$REPO"
-    "$DROVER_BIN"/fleet-verify-main main >"$STATE/auto-push-verify.log" 2>&1; vrc=$?
+    # The gate is a heavy run: it takes the push slot, so it never stacks on top of other suites.
+    "$DROVER_BIN"/fleet-slot run --push -- "$DROVER_BIN"/fleet-verify-main main >"$STATE/auto-push-verify.log" 2>&1; vrc=$?
+    if [ "$vrc" -eq 0 ] || [ "$vrc" -eq 3 ]; then rm -f "$STATE/push-backoff"; else backoff_fail; fi
     if [ "$vrc" -eq 0 ]; then
       out=$(git push origin main 2>&1 | tail -4)
       if printf '%s' "$out" | grep -q "main -> main"; then
@@ -856,6 +890,9 @@ observe_tick(){
   # (a verdict line or a file:line citation). Both checkers print one line per violation; each is alerted.
   "$DROVER_BIN"/fleet-review-check --minutes 30 2>/dev/null | while read -r _ f rest; do
     "$DROVER_BIN"/fleet-alert send "empty-review-${f%:}" "empty review: ${f%:}" "${rest} — re-run the review; it does not count" >/dev/null 2>&1; done
+  # A live seat works on a fresh base: a seat hundreds of commits behind main wastes its whole assignment.
+  "$DROVER_BIN"/fleet-stale-worktree --max 300 2>/dev/null | while read -r _ seat rest; do
+    "$DROVER_BIN"/fleet-alert send "stale-base-${seat%:}" "${seat%:} works on a stale base" "${rest} — start the next bean from a fresh branch off origin/main" >/dev/null 2>&1; done
   "$DROVER_BIN"/fleet-landed-check --hours 24 2>/dev/null | while read -r _ bean rest; do
     "$DROVER_BIN"/fleet-alert send "unproven-${bean%:}" "${bean%:} marked completed without landed code" "${rest} — reopen it or record the landing commit" >/dev/null 2>&1; done
   "$DROVER_BIN"/fleet-observe 2>&1 | while read -r l; do log "OBSERVE $l"; done

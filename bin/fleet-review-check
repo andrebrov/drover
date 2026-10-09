@@ -48,6 +48,15 @@ for f in sorted(files):
         text = open(f, errors='replace').read()
     except OSError:
         continue
+    # A review still being written is not empty: reviewers redirect their output into the file and fill it at the
+    # end, so a 0-byte review was flagged the minute it started. Judge an unfinished file after 15 quiet minutes.
+    if not explicit and time.time() - os.path.getmtime(f) < 15 * 60 and len(text.strip()) < 200:
+        continue
+    # A coder's own report that merely mentions "review" in its name (...-review-fixes-...) is not a review:
+    # its first line is a report verdict.
+    heads = [l for l in text.splitlines() if l.strip() and not NOISE.match(l)][:5]
+    if any(re.match(r'\W*(?:(?:STATUS|VERDICT LINE|RESULT)\s*:\s*)?\W*(PARTIAL|DONE|LANDED|BLOCKED|NOTHING TO DO|COMPLETE|REVIEW-NEEDED)\b', h, re.I) for h in heads):
+        continue
     body = '\n'.join(l for l in text.splitlines() if l.strip() and not NOISE.match(l))
     if len(body) < 200 or not (VERDICT.search(body) or FILELINE.search(body)):
         bad += 1

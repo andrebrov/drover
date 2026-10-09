@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""fleet-stale-worktree — a live seat must work on a fresh base. Seats were found hundreds to thousands of commits
+behind main, unnoticed. For every live agent whose cwd is a git worktree of the fleet repo, print STALE when HEAD
+is more than N commits behind origin/main. Read-only; the seat itself rebases or starts a fresh branch from
+origin/main (it owns its uncommitted work).
+
+  fleet-stale-worktree [--max N]     default N=300; exit 1 when any seat is stale
+"""
+import json
+import os
+import subprocess
+import sys
+
+MAX = int(sys.argv[sys.argv.index('--max') + 1]) if '--max' in sys.argv else 300
+
+
+def drover_env():
+    """The same config every bash script sees: source drover-env (next to this file) and read it back."""
+    env = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drover-env')
+    out = subprocess.run(['bash', '-c', '. "$0"; printf "%s\\0%s\\0%s" "$DROVER_REPO" "$FLEET_STATE" "$DROVER_LEAD_SEATS"', env],
+                         capture_output=True, text=True, check=True).stdout.split('\0')
+    return out
+
+
+REPO, STATE, LEADS = drover_env()
+if not REPO:
+    sys.exit('fleet-stale-worktree: set DROVER_REPO (env or ~/.config/drover/config)')
+LEADS = set(LEADS.split())
+run = lambda *a, **k: subprocess.run(a, capture_output=True, text=True, timeout=60, **k)
+try:
+    agents = json.loads(run('herdr', 'agent', 'list').stdout)['result']['agents']
+except Exception:
+    sys.exit(0)                                   # no herdr: nothing to judge, never alert on a broken probe
+off = set(open(f'{STATE}/harness-off').read().split()) if os.path.exists(f'{STATE}/harness-off') else set()
+bad = 0
+for a in agents:
+    name, cwd = a.get('name') or '', a.get('cwd') or ''
+    if not name or name in LEADS or a.get('agent') in off or not os.path.isdir(cwd):
+        continue
+    top = run('git', '-C', cwd, 'rev-parse', '--show-toplevel').stdout.strip()
+    common = run('git', '-C', cwd, 'rev-parse', '--git-common-dir').stdout.strip()
+    if not top or os.path.realpath(os.path.join(cwd, common)) != os.path.realpath(os.path.join(REPO, '.git')):
+        continue                                  # not a worktree of the fleet repo
+    # Judge the worktree the seat ACTUALLY works in: codex seats run in per-bean worktrees while their pane cwd stays
+    # on the old base (a pane thousands of commits behind while its live worktree was current).
+    # Candidates = the pane cwd + every worktree whose branch or path names the seat; pick the most recent HEAD commit.
+    cands = {top}
+    wl = run('git', '-C', REPO, 'worktree', 'list', '--porcelain').stdout.split('\n\n')
+    for block in wl:
+        path = next((l[9:] for l in block.splitlines() if l.startswith('worktree ')), '')
+        br = next((l[7:] for l in block.splitlines() if l.startswith('branch ')), '')
+        if path and (f'fleet/{name}' in br or f'/{name}' in path or os.path.basename(path).startswith(f'fleet-{name}')):
+            cands.add(path)
+    def head_time(p):
+        t = run('git', '-C', p, 'log', '-1', '--format=%ct').stdout.strip()
+        return int(t) if t.isdigit() else 0
+    top = max(cands, key=head_time)
+    behind = run('git', '-C', top, 'rev-list', '--count', 'HEAD..origin/main').stdout.strip()
+    if behind.isdigit() and int(behind) > MAX:
+        bad += 1
+        br = run('git', '-C', top, 'branch', '--show-current').stdout.strip() or 'detached'
+        print(f'STALE {name}: {behind} commits behind origin/main on {br} ({os.path.basename(top)})')
+sys.exit(1 if bad else 0)
