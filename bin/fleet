@@ -490,6 +490,11 @@ worktree_pane() {  # <name> -> root pane of the agent's own workspace (reused if
 
 start_agent() {  # name kind pane — a fresh shell needs a moment before it is "available"
   local err args; err=$(mktemp); args=$(agent_args "$2")
+  # the seat shell (and so the agent and everything it runs) gets a per-user process ceiling and a two-worker jest
+  # default BEFORE the agent starts. ulimit only lowers; FLEET_NPROC_LIMIT=0 skips it.
+  if [ "${FLEET_NPROC_LIMIT:-1500}" != 0 ]; then
+    herdr pane run "$3" "export JEST_MAX_WORKERS=\${JEST_MAX_WORKERS:-2}; ulimit -u ${FLEET_NPROC_LIMIT:-1500}; clear" >/dev/null 2>&1; sleep 1
+  fi
   for _ in $(seq 1 30); do
     # shellcheck disable=SC2086
     if herdr agent start "$1" --kind "$2" --pane "$3" --timeout 120000 ${args:+-- $args} >/dev/null 2>"$err"; then rm -f "$err"; return 0; fi
@@ -580,6 +585,7 @@ Work ONLY in this worktree ($(cwd_of "$1")). Your branch for THIS bean is \`flee
 1b. BEFORE creating any new module, check whether it already exists. Two coders independently wrote the same new module for the same bean, with incompatible APIs, and only one could land. \`grep\` for the concept first.
 2. Implement the bean's unchecked items.${4:+ Scope from lead: $4}
 3. Verify, and keep the output — you will paste it. Run ${DROVER_BUILD:-the project build} and the tests you added or affected${DROVER_TEST:+ ($DROVER_TEST)}. A build that did not finish is not a passing build; wait for it. Grep compiler output for the real error shape (TypeScript errors start with a file path, not with the word error).
+3a. JEST RULE: run jest only as \`npx jest --runInBand --cacheDirectory /tmp/jest-cache-\$USER <files>\`. In a read-only sandbox point --cacheDirectory at a writable directory. Never run jest through \`node -e\` or patch jest internals: jest-worker forks children that re-run the inline script and fork more, without bound.
 3b. PROVE THE FIX FIRES. Revert your change, watch your new test fail, restore it, watch it pass. A test you have never seen fail is not a test. This is what caught a fail-open gate in the lead's own commit this week.
 4. This worktree may start with the human's pre-existing UNCOMMITTED changes, seeded so it builds like the main checkout. Do not review, modify, revert or commit them. Commit ONLY files you changed plus the bean file: \`git add <your files> .beans/<bean file>\` then \`git commit -m "<conventional message>"\` on branch fleet/$1-$3. You MAY \`git fetch\` and \`git merge main\` (step 0 requires it). Never git checkout/reset/stash the human's files, never commit to main, never push, never apply DB migrations, never start the dev server.
 5. Keep the bean checklist current with \`beans update $3 --body-replace-old '- [ ] ...' --body-replace-new '- [x] ...'\`.
@@ -613,6 +619,7 @@ Work ONLY in this worktree ($(cwd_of "$1")). Steps:
 1. \`beans show $4\` (requirements) and \`cat $REPORTS/$3-$4.md\` (the coder's report).
 2. With BR set to the branch you resolved above: \`git diff main...\$BR --stat\` then \`git diff main...\$BR\`. Judge against the bean's checklist and the repository's own agent rules (CLAUDE.md / AGENTS.md or equivalent).
 3. To build/test their code: \`git checkout --detach \$BR\` in THIS worktree (if git refuses because of local changes: \`git stash -u\` first (INCLUDE untracked — the pre-seeded WIP has tracked and untracked parts that only compile together; this worktree is yours alone) and \`git stash pop\` after returning with \`git checkout fleet/$1\`). Run ${DROVER_BUILD:-the project build} and the relevant tests${DROVER_TEST:+ ($DROVER_TEST)}.
+3b. JEST RULE: run jest only as \`npx jest --runInBand --cacheDirectory /tmp/jest-cache-\$USER <files>\`. In a read-only sandbox point --cacheDirectory at a writable directory. Never run jest through \`node -e\` or patch jest internals: jest-worker forks children that re-run the inline script and fork more, without bound.
 4. Write $REPORTS/$1-review-$4-by-$3.md: findings as CRITICAL/HIGH/MEDIUM/LOW, each with file:line, why it is wrong and the concrete fix; what you verified (commands + results, PASTED — a command you did not run cannot appear here); unchecked bean items the coder missed. End with exactly these three lines:
 BEAN: MET | UNMET — <checklist items not met, or "all">
 LANDABLE: YES | NO — <blocker: build|tests|rebase|schema|none>

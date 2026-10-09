@@ -1205,3 +1205,17 @@ back `none` and every dispatch looked abandoned after 15 minutes. The branch is 
 inside) the four-column task file, writes are atomic, and dispatches share one lock with an optional compare-and-set
 on the prior task. A baseline that is missing or not a commit reports `?`; the branch tip is never substituted, since
 that counted every inherited commit as the agent's work.
+
+## Never run jest via `node -e` with more than one worker (2026-10-09)
+A reviewer ran `node --experimental-vm-modules -e '<script>'` that called jest's `runCLI` with two workers.
+jest-worker forks its children with the parent's `execArgv`, which includes `-e <script>`: every worker re-ran the
+whole script, started its own workers, and the machine reached about 2,300 node processes before it was stopped.
+Fix, in layers: (1) run jest only as `npx jest --runInBand --cacheDirectory /tmp/jest-cache-$USER <files>` (or from
+a script file), and in a read-only sandbox point `--cacheDirectory` at a writable directory; (2) every seat shell
+gets `ulimit -u` and `JEST_MAX_WORKERS=2` before the agent starts (`fleet`, `FLEET_NPROC_LIMIT`, default 1500, 0
+disables), and `fleet-slot run` applies the same ceiling to each child via RLIMIT_NPROC, lower-only; (3) the coder
+and reviewer prompts state the rule; (4) `fleet-check-inline-jest-fanout` flags any prompt or script that pairs an
+inline `node -e` with `runCLI` and no single-worker setting, and has a `--self-test` (2 known-bad flagged, 2
+known-good passed). A per-user process ceiling turns an unbounded fork into EAGAIN for one process tree.
+**Metric:** node processes per user during a test run stays under the ceiling; inline-eval jest fan-outs in
+prompts/scripts = 0.

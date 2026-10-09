@@ -1,0 +1,79 @@
+#!/usr/bin/env node
+// fleet-check-inline-jest-fanout — fails when a prompt or script runs jest through `node -e` / `--eval` with more
+// than one worker.
+//
+// Why: jest-worker forks its workers with the parent's execArgv, which includes `-e <script>`. Every worker then
+// re-runs the whole script, starts its own workers, and the process count grows without bound (~2,300 node
+// processes in the incident). See docs/LESSONS.md, "Never run jest via node -e with more than one worker".
+//
+// A file is flagged when it contains BOTH an inline-eval node invocation AND `runCLI`, unless every worker setting
+// in it is 1 (maxWorkers: 1 / --runInBand / runInBand: true). A runCLI call with no worker setting is flagged too:
+// jest then defaults to many workers.
+//
+//   usage: fleet-check-inline-jest-fanout [--self-test] [path...]   (default paths: $DROVER_REPO prompts/scripts dirs
+//          if set, else the current directory)
+//   exit 0 = clean, 1 = a file can fork-bomb (or the self-test failed)
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'worktrees']);
+const SKIP_FILES = new Set([path.basename(fileURLToPath(import.meta.url))]);
+
+const INLINE_EVAL = /\bnode\b[^\n]{0,200}?\s(?:-e|--eval|-pe|-p)\b/;
+const WORKERS_ABOVE_ONE = /maxWorkers['"]?\s*[:=]\s*(?:['"]?)(?:[2-9]|\d{2,})/;
+const SINGLE_WORKER = /maxWorkers['"]?\s*[:=]\s*['"]?1\b|runInBand['"]?\s*[:=]\s*true|--runInBand|\s-i\b/;
+
+export function violation(text) {
+  if (!/\brunCLI\b/.test(text) || !INLINE_EVAL.test(text)) return null;
+  if (WORKERS_ABOVE_ONE.test(text)) return 'inline `node -e` + runCLI with maxWorkers above 1';
+  if (!SINGLE_WORKER.test(text)) return 'inline `node -e` + runCLI with no single-worker setting (jest defaults to many)';
+  return null;
+}
+
+function* walk(p) {
+  let st;
+  try { st = statSync(p); } catch { return; }
+  if (st.isDirectory()) {
+    for (const name of readdirSync(p)) {
+      if (SKIP_DIRS.has(name)) continue;
+      yield* walk(path.join(p, name));
+    }
+  } else if (st.size < 2_000_000 && !SKIP_FILES.has(path.basename(p)) && !/\.(png|jpe?g|gif|woff2?|ttf|pdf|zip|bundle)$/i.test(p)) {
+    yield p;
+  }
+}
+
+function selfTest() {
+  const cases = [
+    [`node --experimental-vm-modules -e 'require("jest").runCLI({ maxWorkers: 2, runTestsByPath: true }, [])'`, true],
+    [`node -e "require('jest').runCLI({ runTestsByPath: true }, [])"`, true],
+    [`node --experimental-vm-modules -e 'require("jest").runCLI({ maxWorkers: 1 }, [])'`, false],
+    [`NODE_OPTIONS=--experimental-vm-modules npx jest --runInBand --cacheDirectory /tmp/c file.test.ts`, false],
+  ];
+  let failed = 0;
+  for (const [text, shouldFlag] of cases) {
+    if ((violation(text) !== null) !== shouldFlag) { failed++; console.error(`self-test FAILED (expected ${shouldFlag ? 'flag' : 'pass'}): ${text}`); }
+  }
+  if (failed) process.exit(1);
+  console.log('self-test ok: 2 known-bad flagged, 2 known-good passed');
+}
+
+const args = process.argv.slice(2);
+if (args.includes('--self-test')) { selfTest(); process.exit(0); }
+const given = args.filter((a) => !a.startsWith('--'));
+const targets = given.length ? given : [process.env.DROVER_REPO || '.'];
+const hits = [];
+for (const t of targets) {
+  for (const file of walk(t)) {
+    let text;
+    try { text = readFileSync(file, 'utf8'); } catch { continue; }
+    const why = violation(text);
+    if (why) hits.push(`${file}: ${why}`);
+  }
+}
+if (hits.length) {
+  console.error(`[fleet-check-inline-jest-fanout] ${hits.length} file(s) can fork-bomb the machine:\n${hits.join('\n')}`);
+  process.exit(1);
+}
+console.log('[fleet-check-inline-jest-fanout] ok');

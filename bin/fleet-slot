@@ -20,10 +20,17 @@ same pool wait for each other. 0 disables the limiter.
 
 A child started by `run` gets FLEET_SLOT_HELD=<slot>; a nested `fleet-slot run` sees it and runs directly,
 so a gate that calls a script that also takes a slot never deadlocks waiting on itself.
+
+Every child under `run` also gets a per-user process ceiling (RLIMIT_NPROC, set in the child before exec) and a
+two-worker jest default (JEST_MAX_WORKERS=2 unless already set), on all three call paths. The ceiling is
+FLEET_NPROC_LIMIT (default 1500; 0 disables) and only ever LOWERS the limit: cap = min(existing hard limit, value).
+A runaway fork then fails with EAGAIN instead of taking the machine down (see docs/LESSONS.md, "Never run jest
+via node -e with more than one worker").
 """
 import fcntl
 import json
 import os
+import resource
 import subprocess
 import sys
 import time
@@ -41,6 +48,22 @@ DIR = state_dir()
 N = int(os.environ.get('FLEET_HEAVY_SLOTS', '2'))
 P = int(os.environ.get('FLEET_PUSH_SLOTS', '1'))
 LOG = os.path.join(DIR, 'log.jsonl')
+NPROC = int(os.environ.get('FLEET_NPROC_LIMIT', '1500'))
+
+
+def _cap_nproc():
+    """Runs in the child before exec. Lower only: never raises an existing hard limit."""
+    if NPROC <= 0:
+        return
+    _, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+    cap = NPROC if hard == resource.RLIM_INFINITY else min(NPROC, hard)
+    resource.setrlimit(resource.RLIMIT_NPROC, (cap, cap))
+
+
+def guarded_call(cmd, env=None, **kw):
+    env = dict(os.environ if env is None else env)
+    env.setdefault('JEST_MAX_WORKERS', '2')
+    return subprocess.call(cmd, env=env, preexec_fn=_cap_nproc, **kw)
 
 
 def log(ev, **kw):
@@ -110,12 +133,12 @@ def main(argv):
             print('fleet-slot run: no command', file=sys.stderr)
             return 2
         if N <= 0 or os.environ.get('FLEET_SLOT_HELD'):
-            return subprocess.call(rest)          # disabled, or already under a slot: never deadlock on re-entry
+            return guarded_call(rest)          # disabled, or already under a slot: never deadlock on re-entry
         fd, i = acquire(push)
         t0 = time.time()
         try:
             # the child inherits the lock fd: killing this wrapper does not free the slot while the run goes on
-            rc = subprocess.call(rest, env=dict(os.environ, FLEET_SLOT_HELD=str(i)), pass_fds=(fd,))
+            rc = guarded_call(rest, env=dict(os.environ, FLEET_SLOT_HELD=str(i)), pass_fds=(fd,))
         finally:
             log('release', slot=i, secs=int(time.time() - t0))
         return rc

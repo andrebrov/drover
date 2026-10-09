@@ -229,7 +229,8 @@ scripts call each other by absolute path, so only your interactive shell is affe
 | `fleet-scoreboard` | What shipped vs what's stuck: landed/pushed today, approved-awaiting-land, in-review, integrity drift. The metric that isn't utilization. |
 | `fleet-landed-check` | Every bean that became `completed` on origin/main in the window must name a SHA on origin/main, or have a code-changing commit there that names it (or say `Landed: none — <reason>`). Prints `UNPROVEN`; the observer tick alerts on each. `--hours N`. |
 | `fleet-review-check` | A review artifact counts only with a verdict word or a file:line reference after CLI banner noise is dropped. Prints `EMPTY`; the observer tick alerts on each. `--minutes N`. Known-good/bad cases: `eval/eval-checkers.sh`. |
-| `fleet-slot` | flock-based limit on concurrent heavy runs: `run [--push] -- <cmd>`, `hold`, `held`, `status`. `FLEET_PUSH_SLOTS` parallel push slots, separate from the general slots; the child inherits the lock, a crashed holder is released by the kernel. |
+| `fleet-slot` | flock-based limit on concurrent heavy runs: `run [--push] -- <cmd>`, `hold`, `held`, `status`. `FLEET_PUSH_SLOTS` parallel push slots, separate from the general slots; the child inherits the lock, a crashed holder is released by the kernel. Each child also gets a lower-only per-user process ceiling (`FLEET_NPROC_LIMIT`) and `JEST_MAX_WORKERS=2`. |
+| `fleet-check-inline-jest-fanout` | Fails when a prompt or script runs jest through `node -e` with more than one worker (a fork bomb). `[--self-test] [path...]`; exit 1 on a hit. |
 | `fleet-completed-audit` | List beans `completed` on main whose code isn't actually landed. `--count` for the cached number. |
 | `fleet-unblock` | Triage the held (`noop-held`) pile: un-hold finished beans, keep date-gated ones, digest lead/human decisions, re-dispatch the rest with a re-examine brief. `--dry-run`. |
 | `fleet-ghost-reap` | Return in-progress beans that no fleet state names back to `todo`, naming commits already on main. Refuses on an unreadable board. `--dry-run`. |
@@ -284,6 +285,7 @@ values as `${VAR:-value}` so an environment variable still wins. See [`examples/
 | `DROVER_SELF_SERVE` | empty | Harnesses whose idle seats self-serve per `docs/self-serve-playbook.md` (e.g. `opencode`). |
 | `DROVER_OWNED_AREAS` | empty | `area:owner-seat` pairs: areas one seat owns alone. Every self-serve prompt sent to another seat says never to take a bean there. |
 | `FLEET_HEAVY_SLOTS`, `FLEET_PUSH_SLOTS` | `5`, `4` | `fleet-slot`: general heavy-run slots are 2..N (`0` disables the limiter); push slots are separate and parallel. |
+| `FLEET_NPROC_LIMIT` | `1500` | Per-user process ceiling for each `fleet-slot run` child and each seat shell started by `fleet` (`ulimit -u`); lower-only; `0` disables. |
 | `DROVER_MIGRATIONS_STATUS` | empty | Command printing `PENDING <n>_<name>` per unapplied migration; `fleet-observe` alerts hourly on any not in `state/migrations-held`. |
 | `DROVER_HOME` | `~/.local/share/drover` | Queue, inbox, tasks, briefs, reports, snapshots, watcher state, logs. |
 | `DROVER_WORKTREES` | `~/.herdr/worktrees/<repo name>` | Where herdr puts seat worktrees. |
