@@ -27,24 +27,31 @@ case "$a" in
     fi ;;
 esac
 
-# LANDING GATE: in publish-mode=direct a seat may not announce DONE/PARTIAL/READY while its branch carries bean-named commits that are not
-# on the main branch by subject (measured: over half of seat reports named commits that were not landed an hour later). The refusal is
-# delivered to the lead as BLOCKED (the watcher re-prompts the seat) and the seat gets exit 7 with the exact steps. BLOCKED and CHANGES are
-# always allowed. Escape hatch for a genuine reason (a decision, a dependency): FLEET_UNLANDED_OK="<reason>", recorded in the summary.
+# LANDING GATE. In publish-mode=direct a seat may not announce DONE/PARTIAL/READY while THIS BEAN's commits on its current branch (any branch except
+# main) are not on origin/main (whole subject or patch; fleet-branch-landed <branch> <bean>). Other beans' commits are not checked.
+# The refusal is delivered to the lead as BLOCKED but keeps what the seat wanted: "[wanted DONE] UNLANDED ..." and the report path. Exit 7 tells the seat the steps.
+# Exit 2 from the checker (cannot determine) never blocks: the report goes out marked "[landing unverified]". A waiver (FLEET_UNLANDED_OK="<reason>") is per call,
+# goes into the summary AND into $FLEET_REPORTS/unlanded-waivers.log with the subjects it covers, so a waived loss is visible, not silent.
 if [ "$(cat "$DROVER_PUBLISH_MODE_FILE" 2>/dev/null || echo direct)" = direct ] && { [ "$state" = DONE ] || [ "$state" = PARTIAL ] || [ "$state" = READY ]; }; then
-  case "$(git branch --show-current 2>/dev/null)" in fleet/*)
-    if unl=$("$DROVER_BIN/fleet-branch-landed" HEAD 2>/dev/null); then :; else
-      if [ -n "${FLEET_UNLANDED_OK:-}" ]; then summary="$summary [UNLANDED: ${FLEET_UNLANDED_OK}]"
+  cur_branch=$(git branch --show-current 2>/dev/null || true)
+  if [ -n "$cur_branch" ] && [ "$cur_branch" != main ] && [ "$cur_branch" != master ]; then
+    lrc=0; unl=$("$DROVER_BIN/fleet-branch-landed" HEAD "$bean" 2>/dev/null) || lrc=$?     # under set -e a bare unl=$(...) with rc 1 would abort the whole script silently
+    if [ "$lrc" = 2 ]; then summary="$summary [landing unverified: fleet-branch-landed could not determine]"
+    elif [ "$lrc" = 1 ]; then
+      n=$(printf '%s\n' "$unl" | sed 1d | wc -l | tr -d ' ')
+      if [ -n "${FLEET_UNLANDED_OK:-}" ]; then
+        summary="$summary [UNLANDED WAIVED: ${FLEET_UNLANDED_OK}]"
+        mkdir -p "$FLEET_REPORTS"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$a" "$bean" "$FLEET_UNLANDED_OK" "$(printf '%s' "$unl" | sed 1d | tr '\n' ';' | cut -c1-400)" >> "$FLEET_REPORTS/unlanded-waivers.log"
       else
-        n=$(printf '%s\n' "$unl" | sed 1d | wc -l | tr -d ' ')
-        ts=$(date +%s); printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$a" "$bean" BLOCKED "UNLANDED: $n bean commit(s) not on the main branch by subject, land them first: $(printf '%s' "$unl" | sed 1d | head -2 | tr '\n' ';' | cut -c1-200)" "$report" > "$INBOX/$ts-$a-$bean.msg"
-        { echo "fleet-done: REFUSED $state: $n commit(s) of yours are not on the main branch (by subject):"; printf '%s\n' "$unl" | sed 1d | head -8 | sed 's/^/  - /'
+        ts=$(date +%s); printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$a" "$bean" BLOCKED "[wanted $state] UNLANDED: $n commit(s) of $bean not on origin/main: $(printf '%s' "$unl" | sed 1d | head -2 | tr '\n' ';' | cut -c1-200) | $summary" "$report" > "$INBOX/$ts-$a-$bean.msg"
+        { echo "fleet-done: REFUSED $state: $n commit(s) of $bean are not on origin/main (whole subject or patch):"; printf '%s\n' "$unl" | sed 1d | head -8 | sed 's/^/  - /'
           echo "Land them now: git fetch origin; git rebase --onto origin/main <your base>;${DROVER_TESTDB_UP:+ eval \"\$($DROVER_TESTDB_UP)\";} git push origin HEAD:main (retry up to 3x if main moved); prove: git log origin/main --grep=$bean."
-          echo "Then run fleet-done again. If a commit must NOT land, set FLEET_UNLANDED_OK=\"<reason>\" and say so in the report. (Delivered to the lead as BLOCKED.)"; } >&2
+          echo "Then run fleet-done again. If a commit must NOT land: FLEET_UNLANDED_OK=\"<reason>\" (logged in unlanded-waivers.log). Delivered to the lead as BLOCKED with your intended state."; } >&2
         exit 7
       fi
-    fi ;;
-  esac
+    fi
+  fi
 fi
 
 ts=$(date +%s)

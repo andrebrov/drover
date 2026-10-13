@@ -580,7 +580,7 @@ coder_prompt() {  # name kind bean scope
   cat <<P
 You are $1, the $2 CODER on a fleet team. Team lead = \`lead\` (a Claude session); the human is not watching you. Your job: bean $3.
 Work ONLY in this worktree ($(cwd_of "$1")). Your branch for THIS bean is \`fleet/$1-$3\` — one branch per BEAN, forked from current main. The lead puts you on it before you start; run \`git branch --show-current\` and confirm it before step 0. Steps:
-0. START ON CURRENT MAIN. \`git fetch origin; git merge main --no-edit\` — merge LOCAL \`main\`, not \`origin/main\`. origin can be stale when a landing has not been pushed (measured 2026-09-06: origin/main was 7 commits behind local main, and four agents truthfully reported REBASED against the wrong target). Measured 2026-09-06: 20 of 20 fleet branches contained none of main, several 400+ commits behind. A stale branch reviews code that will never ship as reviewed, and its merge DELETES work that landed after it diverged — one branch would have removed 652 lines including 399 of a test file. If the merge conflicts, resolve it now, not at landing time.
+0. START ON CURRENT ORIGIN/MAIN. \`git fetch origin; git merge origin/main --no-edit\` (fleet assign already cut your branch from origin/main, so this is normally a no-op). NEVER merge local \`main\`: it carries commits origin lacks and conflicts on AGENTS.md on every dispatch (a seat sat 5 h on that conflict). If a merge conflicts anyway: \`git merge --abort\`, then \`git rebase --onto origin/main <your base>\` replaying only your own commits; never leave a merge half-done.
 1. \`beans show $3\` — read it fully. Follow the repository's own agent rules (CLAUDE.md / AGENTS.md or equivalent). If a pm or architect has written requirements for this bean, they are in $REPORTS — build to those, and say so if you disagree rather than quietly building something else.
 1b. BEFORE creating any new module, check whether it already exists. Two coders independently wrote the same new module for the same bean, with incompatible APIs, and only one could land. \`grep\` for the concept first.
 2. Implement the bean's unchecked items.${4:+ Scope from lead: $4}
@@ -640,6 +640,7 @@ cmd_assign() {
   local bean=$1 coder=${2:-} scope=${3:-} kind bf prev pb pbf pst
   [ -n "$coder" ] || coder=$(pick_least coder assign)
   refuse_dispatch "$coder" "$bean"
+  if [ "${FLEET_DRY_RUN:-0}" = 1 ]; then echo "DRY RUN: would assign $bean to $coder (scope: ${scope:-none}); nothing was prepared, written or sent"; return 0; fi
   # Orphaned-review guard. Reassigning a seat that just reported on a DIFFERENT bean silently
   # strands that work: the report exists, the bean is still open, and no reviewer was ever
   # routed. Measured 2026-09-08 — a finished bean sat landable and unreviewed for an hour
@@ -681,7 +682,7 @@ cmd_assign() {
     # origin/main, so the bean file exists and the tree is clean.
     # Already on this bean's branch = the seat is mid-work; never park that. Never touch the shared checkout.
     if [ "$cur" != "$bbranch" ] && [ "$(cd "$wt" && pwd -P)" != "$(cd "$FLEET_ROOT" && pwd -P)" ]; then
-      "$DROVER_BIN/fleet-prep" "$coder" "$bean" "$wt" >&2 || echo "NOTE: fleet-prep failed for $coder; it stays on '$cur'" >&2
+      "$DROVER_BIN/fleet-prep" "$coder" "$bean" "$wt" >&2 || { echo "fleet assign: fleet-prep failed for $coder ($bean): NOT dispatching (a seat on the wrong branch is how a 5 h stall started)" >&2; exit 3; }
     fi
   fi
   bf="$BRIEFS/assign-$coder-$bean.txt"
@@ -693,7 +694,7 @@ cmd_assign() {
   # returns before the agent has taken the message and the turn is silently
   # dropped; measured 2026-09-07, six of six parallel dispatches lost.
   # Dispatch SERIALLY for the same reason — parallel `&` loses prompts.
-  herdr agent prompt "$coder" "New bean: read $bf and follow it exactly. It assigns you $bean. Merge main first: git merge main --no-edit" --wait --until working --until done --until blocked --timeout 100000 | jq -r --arg b "$bean" '"\(.result.agent.name) <- \($b): \(.result.agent.agent_status)"'
+  herdr agent prompt "$coder" "New bean: read $bf and follow it exactly. It assigns you $bean. Start from origin/main: git fetch origin; git merge origin/main --no-edit (never local main; on conflict git merge --abort and rebase your own commits onto origin/main)" --wait --until working --until done --until blocked --timeout 100000 | jq -r --arg b "$bean" '"\(.result.agent.name) <- \($b): \(.result.agent.agent_status)"'
   # The lead's manual `fleet assign` wrote ONLY the ledger, while the watcher's
   # auto-dispatch writes the ledger AND the task file. fleet-track and the
   # reaper both read the TASK FILE, so a hand-assigned seat looked stale to

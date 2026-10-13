@@ -1,22 +1,30 @@
 #!/usr/bin/env bash
-# fleet-branch-landed [branch] — prints the subjects of bean-named, non-merge commits on <branch> (default HEAD) that are NOT on the
-# main branch BY SUBJECT. By subject, never by SHA: a rebase changes the SHA, so `merge-base --is-ancestor <old sha>` reports landed
-# work as missing. Exit 0 = everything landed (or nothing to land); exit 1 = something is unlanded.
-# On exit 1 the first line is "AGE <minutes>" (age of the OLDEST unlanded commit), then one subject per line.
-# Runs in the current directory's repository unless FLEET_LANDED_REPO names one. (`fleet-landed-check` is the other tool: it audits
-# COMPLETED beans; this one audits a BRANCH.)
+# fleet-branch-landed [branch] [bean] — bean-named, non-merge commits on <branch> (default HEAD) that are NOT on origin/main.
+# v3: a commit counts as landed if its WHOLE subject is on origin/main (exact line, last 21 days) OR its patch is on origin/main (git cherry:
+# survives a reworded subject or a rebase). Never matched by SHA ancestry (a rebase changes the SHA) and never by a truncated subject (two
+# commits can share a prefix). Any git failure is UNKNOWN (exit 2), never "landed". [bean] limits the check to subjects naming that bean.
+# Exit 0 = all landed or nothing to land; 1 = unlanded (stdout: "AGE <min of the oldest> NEWEST <min of the newest>" then the subjects);
+# 2 = could not determine (stderr says why). Runs in the current directory's repository unless FLEET_LANDED_REPO names one.
+# (`fleet-landed-check` is the other tool: it audits COMPLETED beans; this one audits a BRANCH.)
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/drover-env"
-br="${1:-HEAD}"; repo="${FLEET_LANDED_REPO:-.}"
-g() { git -C "$repo" "$@"; }
-g fetch -q origin main 2>/dev/null || true
-miss=(); oldest=0; now=$(date +%s)
-while IFS=$'\t' read -r ct subj; do
+br="${1:-HEAD}"; bean="${2:-}"
+[ -z "${FLEET_LANDED_REPO:-}" ] || cd "$FLEET_LANDED_REPO" 2>/dev/null || { echo "fleet-branch-landed: cannot cd to $FLEET_LANDED_REPO" >&2; exit 2; }
+git rev-parse --git-dir >/dev/null 2>&1 || { echo "fleet-branch-landed: not a git repository" >&2; exit 2; }
+git fetch -q origin main 2>/dev/null || { echo "fleet-branch-landed: git fetch origin main failed" >&2; exit 2; }
+git rev-parse -q --verify origin/main >/dev/null || { echo "fleet-branch-landed: no origin/main" >&2; exit 2; }
+git rev-parse -q --verify "$br" >/dev/null || { echo "fleet-branch-landed: unknown ref $br" >&2; exit 2; }
+subjects=$(mktemp) cherry=$(mktemp); trap 'rm -f "$subjects" "$cherry"' EXIT
+git log origin/main --since="21 days ago" --no-merges --format=%s > "$subjects" || { echo "fleet-branch-landed: git log origin/main failed" >&2; exit 2; }
+git cherry origin/main "$br" 2>/dev/null | awk '{print $1" "$2}' > "$cherry"     # '+ <sha>' = patch not upstream, '- <sha>' = patch upstream
+miss=(); oldest=0; newest=999999; now=$(date +%s)
+while IFS=$'\t' read -r sha ct subj; do
   [ -z "$subj" ] && continue
   case "$subj" in wip:*|Merge*) continue;; esac
-  printf '%s' "$subj" | grep -qE "$DROVER_BEAN_RE" || continue          # base noise (commits that name no bean) is not this seat's work
-  if [ -z "$(g log origin/main -F --grep="${subj:0:70}" --format=%h -1 2>/dev/null)" ]; then
-    miss+=("$subj"); a=$(( (now-ct)/60 )); [ "$a" -gt "$oldest" ] && oldest=$a
-  fi
-done < <(g log origin/main.."$br" --no-merges --format=$'%ct\t%s' 2>/dev/null)
+  printf '%s' "$subj" | grep -qE "$DROVER_BEAN_RE" || continue                  # base noise (commits that name no bean) is not this seat's work
+  [ -n "$bean" ] && ! printf '%s' "$subj" | grep -qF "$bean" && continue
+  grep -qxF -- "$subj" "$subjects" && continue                                  # whole subject landed
+  grep -q "^- $sha" "$cherry" && continue                                       # patch landed under another subject/sha
+  miss+=("$subj"); a=$(( (now-ct)/60 )); [ "$a" -gt "$oldest" ] && oldest=$a; [ "$a" -lt "$newest" ] && newest=$a
+done < <(git log origin/main.."$br" --no-merges --format=$'%H\t%ct\t%s') || { echo "fleet-branch-landed: git log branch range failed" >&2; exit 2; }
 [ ${#miss[@]} -eq 0 ] && exit 0
-echo "AGE $oldest"; printf '%s\n' "${miss[@]}"; exit 1
+echo "AGE $oldest NEWEST $newest"; printf '%s\n' "${miss[@]}"; exit 1

@@ -1333,3 +1333,29 @@ main branch an hour later. Reminders did not hold; each of these can fail and ac
 - **Checks that can fail:** `fleet-branch-landed <branch>` (exit 1 + subjects), `fleet-done` exit 7, refill log `NUDGE`, `fleet-preflight`.
   Tests: `tests/landing-gate.test.sh` (20 checks, three mutants fail it). **Metric:** reports with claimed subjects missing after an hour
   (56% measured, target < 15%); unlanded bean commits older than 60 minutes (target 0).
+
+## Critique round (2026-10-13): what two independent audits of the lead's own tooling found
+23 defects in the cadence tools: the landing check called commits landed on a shared 70-character subject prefix; the stuck check would
+have pressed Esc on a 40-minute build; the prep script could overwrite an ignored file; preflight said healthy when its own checks failed;
+the dry-run environment variable did nothing; and a daemon called a function nobody defined (a refactor dropped `stuck_check` while its call
+site stayed, so it raised NameError every five minutes and the stuck alarm never fired). One production outage was caused by deploying a
+judge-provider swap after fake-client tests only: both providers returned 400/422 on every call and every render failed closed. All of it is
+fixed and covered by `tests/cadence-tools.test.sh` (21 cases; 13 of them fail on the previous versions of the tools).
+- **Run the REAL path locally before any deploy that touches an external API.** Fake-client unit tests prove the code matches the code. Every
+  client of an external API ships with (a) one real-call check recorded in the report (status, latency, answer count) and (b) a contract
+  test that pins the shape the vendor accepted, re-verified by a real call whenever it changes. A two-minute call with a real key and a real
+  input found both defects the fakes had blessed.
+- **A fail-closed gate needs an alarm that is not the gate.** With both judges "unavailable", every option scored 0/10 and the loop retried
+  more options; nothing said "both judges are down". When a fail-closed path fires on every request, fail the job with the reason code (not
+  a low score) and let the stage timing show the failing stage in the first round.
+- **Tools get tests before they get rules.** A rule that cites a tool nobody has watched work (a landing audit, a stuck check) is a claim.
+  Each tool ships with a test that has a known-bad and a known-good input and is shown to fail against the previous version. A cheap static
+  check catches a whole class: every function a daemon calls is defined (the test runs it against the broken version and it fails).
+- **A pipe hides an exit code.** `cmd | tail && break` retried nothing; `unl=$(cmd)` under `set -e` aborts the script silently on exit 1. Use
+  `if cmd; then ...` or `x=$(cmd) || rc=$?`, and never put a command whose status matters on the left of a pipe.
+- **Failure is unknown, not clean.** A git failure in a landing check exits 2 (unknown); an audit that did not complete leaves no `.ok`
+  stamp, and preflight reads a missing or stale stamp as DEAD; an unreadable production version is DEAD, not "within window".
+- **Unlanded does not mean uncounted.** `unlanded-waivers.log` lists every waived commit with its reason and subjects; read it at each standup.
+- **Loops are restarted, not fed.** The stuck check flags a seat that reports `working` while its worktree has not changed for 45 minutes and
+  presses Esc once per signature; the refill daemon never feeds a flagged seat. The operator restarts the session (a screen that repeats one
+  line for 45 minutes has exhausted its context).

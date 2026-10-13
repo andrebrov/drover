@@ -9,7 +9,7 @@ $FLEET_BRIEFS/queue/NNN-assign-<bean>.txt. fleet-refill hands that to an idle se
   fleet-feed             queue what is due; prints one line per bean queued
 Env: FEED_COOLDOWN_MIN (default 90)  FEED_MAX_QUEUE (default 12)  DROVER_FOCUS_BEANS  DROVER_FEED_FOCUS (words in the brief)
 """
-import datetime as dt, glob, os, re, subprocess, sys, time
+import datetime as dt, fcntl, glob, os, re, subprocess, sys, time
 
 
 def drover_env():
@@ -41,6 +41,11 @@ def git(*a):
 
 os.makedirs(Q, exist_ok=True)
 os.makedirs(C, exist_ok=True)
+_lk = open(f"{E['FLEET_BRIEFS']}/.feed.lock", 'a')
+try:
+    fcntl.flock(_lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    raise SystemExit(0)                                    # two feeds at once double-queued the same bean
 if not os.path.exists(FOCUS):
     raise SystemExit(0)                                    # no focus list = nothing to feed
 subprocess.run(['git', '-C', REPO, 'fetch', '-q', 'origin', 'main'], capture_output=True, timeout=90)
@@ -67,8 +72,16 @@ except OSError:
     pass
 files = git('ls-tree', '-r', '--name-only', 'origin/main', '.beans/').split('\n')
 n = 100
+seen_focus = set()
 for b in [l.strip() for l in open(FOCUS) if BEAN.fullmatch(l.strip())]:
+    if b in seen_focus:
+        continue
+    seen_focus.add(b)
     if b in queued or b in recent:
+        continue
+    # a seat that committed on this bean in the last 6 h owns it: the cooldown expiring must not release it to a second seat
+    act = git('for-each-ref', '--format=%(committerdate:unix)', f'refs/heads/fleet/*-{b}').split()
+    if any(x.isdigit() and now - int(x) < 6 * 3600 for x in act):
         continue
     f = next((x for x in files if f'/{b}--' in x), None)
     if not f:
@@ -77,7 +90,20 @@ for b in [l.strip() for l in open(FOCUS) if BEAN.fullmatch(l.strip())]:
     m = re.search(r'^status:\s*(\S+)', t, re.M)
     if not m or m.group(1) not in ('todo', 'in-progress'):
         continue
-    body = re.split(r'^#+\s*.*(?:LEAD|FOUNDER)[^\n]*\n', t, flags=re.M | re.I)[0]   # drop everything from a LEAD/FOUNDER heading on
+    # drop only the LEAD/FOUNDER section: resume at the next heading of the same or a higher level (items after it still count)
+    body_lines = []
+    skip_level = None
+    for ln in t.split('\n'):
+        mh = re.match(r'^(#+)\s*(.*)$', ln)
+        if mh:
+            lvl = len(mh.group(1))
+            if skip_level is not None and lvl <= skip_level:
+                skip_level = None
+            if skip_level is None and re.search(r'LEAD|FOUNDER', mh.group(2), re.I):
+                skip_level = lvl
+        if skip_level is None:
+            body_lines.append(ln)
+    body = '\n'.join(body_lines)
     open_n = len(re.findall(r'^\s*- \[ \]', body, re.M))
     if open_n == 0:
         continue

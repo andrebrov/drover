@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# fleet-prep <seat> <bean> [worktree] — put a seat's worktree on fleet/<seat>-<bean> before it is briefed.
-#   * leftover work in the tree is PARKED on a wip/<seat>-<time> branch (a commit: nothing is discarded)
+# fleet-prep <seat> <bean> [worktree] — park a seat's leftover work, then put the worktree on fleet/<seat>-<bean>.
+#   * leftover work is PARKED on a unique wip/<seat>-<stamp> branch (a commit: nothing is discarded) PLUS a backup directory holding the
+#     staged and the unstaged diff separately and a copy of every IGNORED file that the target branch also tracks (a branch switch would
+#     overwrite those silently)
 #   * an existing fleet/<seat>-<bean> branch is RESUMED, never reset (a reset to origin/main orphaned READY commits)
 #   * otherwise a new branch is cut from origin/main, so the bean file exists and the merge is clean
-#   * the shared checkout (DROVER_REPO) is refused: no seat works there
-# `fleet assign` calls this; run it by hand to recover a seat that reported BLOCKED on a dirty tree.
+#   * the switch uses --no-overwrite-ignore: a collision STOPS the dispatch (exit 3) instead of overwriting; a missing bean file is exit 4
+#   * the shared checkout (DROVER_REPO) is refused
+# `fleet assign` calls this and does NOT dispatch when it fails; run it by hand to recover a seat that reported BLOCKED on a dirty tree.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/drover-env"
 [ $# -ge 2 ] || { echo "usage: fleet-prep <seat> <bean> [worktree]" >&2; exit 64; }
@@ -14,11 +17,21 @@ seat=$1 bean=$2; wt=${3:-$DROVER_WORKTREES/fleet-$seat}
 git -C "$DROVER_REPO" fetch -q origin main
 cd "$wt"
 [ "$(pwd -P)" != "$(cd "$DROVER_REPO" && pwd -P)" ] || { echo "refusing: $wt is the shared checkout" >&2; exit 2; }
+tgt="fleet/$seat-$bean"; base=origin/main; git show-ref --verify -q "refs/heads/$tgt" && base="$tgt"
+stamp=$(date +%Y%m%d%H%M%S)-$$
 if [ -n "$(git status --porcelain)" ]; then
-  w=wip/$seat-$(date +%Y%m%d%H%M); git switch -q -c "$w"
-  git add -A; git -c core.hooksPath=/dev/null commit -q --no-verify -m "wip: $seat leftover before $bean (parked by fleet-prep)"
-  echo "parked WIP on $w"
+  w="wip/$seat-$stamp"; bak="$DROVER_HOME/prep-backups/$seat-$stamp"; mkdir -p "$bak"
+  git diff --cached > "$bak/index.patch" 2>/dev/null || true; git diff > "$bak/worktree.patch" 2>/dev/null || true   # staged and unstaged kept separately
+  git status --porcelain --ignored | awk '/^!! /{print substr($0,4)}' | while read -r f; do                          # ignored files the target tracks
+    git cat-file -e "$base:$f" 2>/dev/null && [ -f "$f" ] && { mkdir -p "$bak/ignored/$(dirname "$f")"; cp -p "$f" "$bak/ignored/$f"; }
+  done || true
+  git switch -q -c "$w"; git add -A; git -c core.hooksPath=/dev/null commit -q --no-verify -m "wip: $seat leftover before $bean (parked by fleet-prep; backup $bak)"
+  echo "parked WIP on $w; index/worktree patches and ignored files in $bak"
 fi
-if git show-ref --verify -q "refs/heads/fleet/$seat-$bean"; then git switch -q "fleet/$seat-$bean"; else git switch -q -c "fleet/$seat-$bean" origin/main; fi
-ls .beans/"${bean}"--* >/dev/null 2>&1 || { echo "fleet-prep: no bean file for $bean on this branch" >&2; exit 1; }
+if git show-ref --verify -q "refs/heads/$tgt"; then
+  git switch -q --no-overwrite-ignore "$tgt" || { echo "fleet-prep: switch to $tgt would overwrite ignored files; stopped (exit 3)" >&2; exit 3; }
+else
+  git switch -q --no-overwrite-ignore -c "$tgt" origin/main || { echo "fleet-prep: switch would overwrite ignored files; stopped (exit 3)" >&2; exit 3; }
+fi
+ls .beans/"${bean}"--* >/dev/null 2>&1 || { echo "fleet-prep: bean file for $bean not found on $tgt" >&2; exit 4; }
 echo "$seat ready on $(git branch --show-current) @ $(git rev-parse --short HEAD)"

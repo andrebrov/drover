@@ -15,6 +15,9 @@ Only seats whose role is coder or reviewer are refilled; a seat with a recent be
 harness (DROVER_REFILL_SKIP_HARNESSES: a harness whose quota is exhausted swallows queue items) are never sent work.
 Never sends faster than COOLDOWN per seat, never below MIN_FREE_GB of free disk. Reads only names/cwds, never argv.
 
+Stuck seats: every 5 minutes a seat reported `working` whose worktree (HEAD + status) has not changed for REFILL_STUCK_MIN (45)
+minutes is flagged (alerts/stuck.txt, Esc once per signature) and never fed. Only one instance runs (a file lock).
+
 Liveness: each tick has a 600 s SIGALRM watchdog (a loop once went silent for 1h43m with no error and no restart) and a
 heartbeat line is logged every 10 ticks; fleet-cred-check treats a log older than 10 minutes as DEAD.
 
@@ -23,7 +26,7 @@ heartbeat line is logged every 10 ticks; fleet-cred-check treats a log older tha
 Env: REFILL_POLL (60) REFILL_IDLE_POLLS (4) REFILL_COOLDOWN (900) REFILL_MIN_FREE_GB (30) REFILL_MAX_SENDS (4)
      REFILL_MAX_WAITERS (8) REFILL_SOFT_POLLS (12) REFILL_HUNTS REFILL_FEED_EVERY (300) REFILL_TICK_LIMIT (600)
 """
-import glob, hashlib, json, os, re, signal, subprocess, sys, time
+import fcntl, glob, hashlib, json, os, re, signal, subprocess, sys, time
 
 
 def drover_env():
@@ -52,6 +55,8 @@ SKIP_HARNESS = set(E['DROVER_REFILL_SKIP_HARNESSES'].split())
 CODERS = [n for n, h in ROSTER if n.rsplit('-', 1)[-1] == 'coder' and n not in DEDICATED and h not in SKIP_HARNESS]
 REVIEWERS = [n for n, h in ROSTER if n.rsplit('-', 1)[-1] in ('reviewer', 'analyst') and n not in DEDICATED and h not in SKIP_HARNESS]
 SEATS = CODERS + REVIEWERS
+SEATS_ALL = [n for n, h in ROSTER if n.rsplit('-', 1)[-1] in ('coder', 'reviewer', 'analyst') and n not in DEDICATED]   # stuck detection covers every seat, even on a skipped harness
+STUCK_MIN = int(os.environ.get('REFILL_STUCK_MIN', '45'))   # `working` with no change in its worktree this long = stuck, not working
 SEATS += [x for x in os.environ.get('REFILL_EXTRA_SEATS', '').split(',') if x]   # test hook only
 
 POLL = int(os.environ.get('REFILL_POLL', '60'))
@@ -94,11 +99,32 @@ def log(msg):
     print(line, flush=True)
 
 
+class Watchdog(BaseException):
+    """Raised by the tick alarm. A BaseException so no `except Exception` inside a helper can swallow it."""
+
+
 def run(cmd, timeout=20):
+    """Run a command in its own process group; on timeout kill the WHOLE group (a child's children used to survive and pile up)."""
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
     except Exception as e:
         return subprocess.CompletedProcess(cmd, 1, '', str(e))
+    try:
+        out, err = p.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except Exception:
+            pass
+        out, err = p.communicate()
+        return subprocess.CompletedProcess(cmd, 124, out or '', (err or '') + ' [timeout]')
+    except Watchdog:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except Exception:
+            pass
+        raise
 
 
 def load():
@@ -171,57 +197,135 @@ def next_item(kind, seat, st, light=False):
     return f'HUNT #{n} {cls} / {area}' + (' [light]' if light else ''), body
 
 
-def mid_task(seat):
-    """A quiet screen is not idle. A seat whose branch carries a bean-named commit not on origin/main, the newest younger than
-    DROVER_MID_TASK_MIN, is mid-task: it is never fed new work (the daemon once pulled seats off unfinished work because their screens were quiet)."""
+def _check(wt, bean=''):
+    """fleet-branch-landed run inside a seat worktree -> (rc, oldest_min, newest_min, subjects)."""
+    r = run(['bash', '-c', f'cd "{wt}" && "{BIN}/fleet-branch-landed" HEAD {bean}'], timeout=60)
+    lines = r.stdout.splitlines()
+    old = new_ = 0
+    subs = []
+    if r.returncode == 1 and lines and lines[0].startswith('AGE'):
+        m = re.match(r'AGE (\d+) NEWEST (\d+)', lines[0])
+        old, new_ = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+        subs = lines[1:]
+    return r.returncode, old, new_, subs
+
+
+def mid_task(seat, st=None):
+    """A quiet screen is not idle: a seat whose branch has bean-named commits NOT on origin/main (whole subject or patch, never SHA ancestry), the
+    newest under DROVER_MID_TASK_MIN old, is mid-task and is never fed new work. Cached per HEAD sha for 5 minutes so the loop stays cheap."""
     wt = f'{WORKTREES}/fleet-{seat}'
     if not os.path.isdir(wt):
         return False
-    r = run(['git', '-C', wt, 'log', 'origin/main..HEAD', '--no-merges', '--format=%ct %s'], timeout=15)
-    now = time.time()
-    for l in r.stdout.splitlines():
-        t, _, subj = l.partition(' ')
-        if t.isdigit() and now - int(t) < MID_TASK_S and re.search(BEAN_RE, subj) and not subj.startswith('wip:'):
-            return True
-    return False
+    head = run(['git', '-C', wt, 'rev-parse', 'HEAD'], timeout=10).stdout.strip()
+    cache = st.setdefault('mt', {}) if st is not None else {}
+    c = cache.get(seat)
+    if c and c['head'] == head and time.time() - c['at'] < 300:
+        return c['v']
+    rc, old, newest, subs = _check(wt)
+    v = (rc == 1 and newest < MID_TASK_S // 60)
+    if st is not None:
+        cache[seat] = {'head': head, 'at': time.time(), 'v': v}
+    return v
 
 
-def landing_audit(st, now):
-    """Every fleet/<seat>-<bean> branch (3 days) whose newest unlanded bean-named commit is NUDGE_MIN+ minutes old and not on the main branch
-    by subject gets ONE nudge per branch tip; the same branches at ALERT_MIN+ minutes are written to alerts/unlanded.txt."""
+def landing_audit(st, now, dry=False):
+    """Every fleet/<seat>-<bean> branch (14 days) with bean commits not on origin/main (whole subject or patch):
+    - STAGNANT (newest unlanded commit ALERT_MIN+ minutes old) -> alert, oldest first; a seat still committing is not escalated;
+    - older than 14 days -> archive candidate, never DEAD;
+    - nudged ONLY if the seat is currently on that branch, is not mid-task, at most one nudge per seat per 60 min, one per branch tip, and a
+      failed send is not recorded as delivered;
+    - a branch the checker cannot determine (rc 2) leaves the audit INCOMPLETE: no .ok stamp, so fleet-preflight reports it stale, not clean."""
     if not REPO:
         return
     out = run(['git', '-C', REPO, 'for-each-ref', '--format=%(refname:short) %(committerdate:unix)', 'refs/heads/fleet/'], timeout=30).stdout.splitlines()
     nudged = st.setdefault('nudged', {})
-    alerts = []
-    env = dict(os.environ, FLEET_LANDED_REPO=REPO)
+    seat_nudge = st.setdefault('seat_nudge', {})
+    rows = []
+    incomplete = False
     for line in out:
         br, _, ts = line.partition(' ')
         m = re.match(r'fleet/(.+)-(' + BEAN_RE + r')$', br)
-        if not m or not ts.isdigit() or now - int(ts) > 3 * 86400:
+        if not m or not ts.isdigit() or now - int(ts) > 14 * 86400:
             continue
         seat, bean = m.groups()
-        tip = run(['git', '-C', REPO, 'log', '-1', '--format=%h', br], timeout=15).stdout.strip()
-        try:
-            c = subprocess.run([f'{BIN}/fleet-branch-landed', br], capture_output=True, text=True, timeout=60, env=env)
-        except Exception:
+        r = run(['bash', '-c', f'cd "{REPO}" && "{BIN}/fleet-branch-landed" "{br}" {bean}'], timeout=60)
+        if r.returncode == 0:
             continue
-        if c.returncode == 0:
+        if r.returncode != 1:
+            incomplete = True
+            log(f'landing audit: cannot determine {br} (rc={r.returncode})')
             continue
-        lines = c.stdout.splitlines()
-        age = int(lines[0].split()[1]) if lines and lines[0].startswith('AGE') else 0
-        subs = lines[1:]
-        if age >= ALERT_MIN:
-            alerts.append(f'{br}: {len(subs)} unlanded, oldest {age} min')
-        if age >= NUDGE_MIN and nudged.get(br) != tip and seat in SEATS and not mid_task(seat):
-            msg = (f'LANDING AUDIT: {len(subs)} commit(s) of {bean} on {br} are not on the main branch by subject (oldest {age} min), e.g. "{subs[0][:80]}". '
-                   f'Land the green ones now (git fetch; git rebase --onto origin/main <base>;' + (f' eval "$({TESTDB_UP})";' if TESTDB_UP else '') +
-                   f' git push origin HEAD:main; prove git log origin/main --grep={bean}); then fleet-done. If one must not land, say why in the report.')
-            rr = run([f'{BIN}/fleet', 'followup', seat, msg], timeout=60)
+        lines = r.stdout.splitlines()
+        mm = re.match(r'AGE (\d+) NEWEST (\d+)', lines[0]) if lines else None
+        old, newest = (int(mm.group(1)), int(mm.group(2))) if mm else (0, 0)
+        rows.append((old, newest, br, seat, bean, lines[1:]))
+    rows.sort(reverse=True)
+    alerts = [f'{br}: {len(subs)} unlanded, oldest {old} min, newest {newest} min' for old, newest, br, seat, bean, subs in rows if newest >= ALERT_MIN]
+    for old, newest, br, seat, bean, subs in rows:
+        if newest < NUDGE_MIN or seat not in SEATS:
+            continue
+        tip = run(['git', '-C', REPO, 'rev-parse', '--short', br], timeout=10).stdout.strip()
+        cur = run(['git', '-C', f'{WORKTREES}/fleet-{seat}', 'branch', '--show-current'], timeout=10).stdout.strip()
+        if cur != br or nudged.get(br) == tip or now - seat_nudge.get(seat, 0) < 3600 or mid_task(seat, st):
+            continue
+        msg = (f'LANDING AUDIT: {len(subs)} commit(s) of {bean} on {br} are not on origin/main (oldest {old} min, newest {newest} min), e.g. "{subs[0][:80]}". '
+               f'Land the green ones now (git fetch; git rebase --onto origin/main <base>;' + (f' eval "$({TESTDB_UP})";' if TESTDB_UP else '') +
+               f' git push origin HEAD:main; prove git log origin/main --grep={bean}); then fleet-done. If one must not land, say why in the report.')
+        if dry:
+            log(f'DRY nudge {seat} {bean}')
+            continue
+        rr = run([f'{BIN}/fleet', 'followup', seat, msg], timeout=60)
+        if rr.returncode == 0:
             nudged[br] = tip
-            log(f'NUDGE {seat} {bean}: {len(subs)} unlanded, {age} min' + ('' if rr.returncode == 0 else f' (send failed rc={rr.returncode})'))
-    os.makedirs(f'{STATE_DIR}/alerts', exist_ok=True)
-    open(f'{STATE_DIR}/alerts/unlanded.txt', 'w').write('\n'.join(alerts) + ('\n' if alerts else ''))
+            seat_nudge[seat] = now
+            log(f'NUDGE {seat} {bean}: {len(subs)} unlanded, newest {newest} min')
+        else:
+            log(f'NUDGE FAILED {seat} {bean} rc={rr.returncode}')
+    if dry:
+        return
+    d = f'{STATE_DIR}/alerts'
+    os.makedirs(d, exist_ok=True)
+    open(f'{d}/unlanded.txt', 'w').write('\n'.join(alerts) + ('\n' if alerts else ''))
+    if not incomplete:
+        open(f'{d}/unlanded.txt.ok', 'w').write(str(int(now)))
+
+
+def stuck_check(st, now, dry=False):
+    """A seat that herdr reports `working` but whose worktree (HEAD + git status) has not changed for STUCK_MIN minutes is stuck, not working
+    (a seat once sat 5 h in a "Let me go. Let me run." loop on an unresolved merge while the status said working). Alert, and send Esc ONCE per
+    signature. Flagged seats are written to alerts/stuck.txt and are never fed new work (a looping seat is restarted, not fed). The .ok stamp says
+    the check completed; fleet-preflight treats a missing or old stamp as DEAD."""
+    alerts = []
+    sig = st.setdefault('sig', {})
+    for seat in SEATS_ALL:
+        v = seat_view(seat)
+        if v is None or v[0] != 'working':
+            sig.pop(seat, None)
+            continue
+        wt = f'{WORKTREES}/fleet-{seat}'
+        if not os.path.isdir(wt):
+            continue
+        h = run(['git', '-C', wt, 'rev-parse', 'HEAD'], timeout=10).stdout.strip()
+        d = run(['git', '-C', wt, 'status', '--porcelain'], timeout=20).stdout
+        merging = run(['git', '-C', wt, 'rev-parse', '-q', '--verify', 'MERGE_HEAD'], timeout=10).returncode == 0
+        cur = hashlib.sha1((h + d).encode()).hexdigest()
+        old = sig.get(seat)
+        if not old or old['sig'] != cur:
+            sig[seat] = {'sig': cur, 'since': now, 'acted': False}
+            continue
+        mins = (now - old['since']) / 60
+        if mins >= STUCK_MIN:
+            alerts.append(f'{seat}: working {mins:.0f} min with no change in its worktree' + (' (UNRESOLVED MERGE)' if merging else ''))
+            if not old['acted'] and not dry:
+                run(['herdr', 'agent', 'send-keys', seat, 'esc'], timeout=15)
+                old['acted'] = True
+                log(f'STUCK {seat}: {mins:.0f} min no worktree change' + (' with an unresolved merge' if merging else '') + '; sent Esc')
+    if dry:
+        return
+    d = f'{STATE_DIR}/alerts'
+    os.makedirs(d, exist_ok=True)
+    open(f'{d}/stuck.txt', 'w').write('\n'.join(alerts) + ('\n' if alerts else ''))
+    open(f'{d}/stuck.txt.ok', 'w').write(str(int(now)))
 
 
 def reap_ghosts(dry):
@@ -259,26 +363,35 @@ def tick(dry):
     if free_gb < MIN_FREE_GB:
         log(f'DISK GUARD: only {free_gb:.1f} GB free (< {MIN_FREE_GB}): no new work sent')
         return
+    if now - st.get('stuck', 0) > 300:
+        st['stuck'] = now
+        try:
+            stuck_check(st, now, dry)
+        except Exception as e:
+            log(f'stuck check error: {e!r}')
     if now - st.get('audit', 0) > AUDIT_EVERY:           # landing audit: finished work must reach the main branch; nudge the owner once per tip, escalate later
         st['audit'] = now
         try:
-            landing_audit(st, now)
+            landing_audit(st, now, dry)
         except Exception as e:
             log(f'landing audit error: {e!r}')
     if now - st.get('pre', 0) > PRE_EVERY:              # the silent dependencies, each a check that can fail (mode vs lander, credentials, production lag)
         st['pre'] = now
-        r = run([f'{BIN}/fleet-preflight'], timeout=90)
-        dead = [l for l in r.stdout.splitlines() if l.startswith('DEAD')]
-        os.makedirs(f'{STATE_DIR}/alerts', exist_ok=True)
-        open(f'{STATE_DIR}/alerts/preflight.txt', 'w').write('\n'.join(dead) + ('\n' if dead else ''))
-        for l in dead:
-            log('PREFLIGHT ' + l[:200])
+        r = run([f'{BIN}/fleet-preflight'], timeout=120)
+        if r.returncode in (0, 1) and not dry:
+            dead = [l for l in r.stdout.splitlines() if l.startswith('DEAD')]
+            os.makedirs(f'{STATE_DIR}/alerts', exist_ok=True)
+            open(f'{STATE_DIR}/alerts/preflight.txt', 'w').write('\n'.join(dead) + ('\n' if dead else ''))
+            for l in dead:
+                log('PREFLIGHT ' + l[:200])
+        elif r.returncode not in (0, 1):
+            log(f'PREFLIGHT could not run (rc={r.returncode}); previous alerts kept')
     r = run([f'{BIN}/fleet-batch'])                    # group fix items by area so one seat fixes, tests and pushes a whole group once
     if r.returncode != 0:
         log(f'fleet-batch failed rc={r.returncode}: {r.stderr.strip()[:150]}')
     if now - st.get('feed', 0) > FEED_EVERY:           # nobody works when the lead is away: restock the queue from the focus beans
         st['feed'] = now
-        r = run([f'{BIN}/fleet-feed'], timeout=150)
+        r = run([f'{BIN}/fleet-feed'], timeout=150) if not dry else subprocess.CompletedProcess([], 0, '', '')
         if r.stdout.strip():
             log('fleet-feed: ' + r.stdout.strip().replace('\n', '; ')[:300])
         if r.returncode != 0:
@@ -292,10 +405,17 @@ def tick(dry):
         pins = {l.split()[0] for l in open(PINS_FILE) if l.strip() and not l.startswith('#')}
     except OSError:
         pass
+    stuck_seats = set()
+    try:
+        stuck_seats = {l.split(':')[0] for l in open(f'{STATE_DIR}/alerts/stuck.txt') if ':' in l}
+    except OSError:
+        pass
     for seat in SEATS:
         if seat in pins:
             continue
-        if mid_task(seat):
+        if seat in stuck_seats:
+            continue          # a seat the stuck check flagged is looping, not idle: never feed it (restart it)
+        if mid_task(seat, st):
             log(f'HOLD {seat}: unlanded bean commits in the last {MID_TASK_S // 60} min (mid-task, not idle)')
             continue
         v = seat_view(seat)
@@ -342,10 +462,18 @@ def tick(dry):
 def main():
     dry = '--dry-run' in sys.argv
     once = '--once' in sys.argv
+    lockdir = os.path.dirname(STATE)
+    os.makedirs(lockdir, exist_ok=True)
+    lock = open(f'{lockdir}/refill.lock', 'a')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print('fleet-refill: another instance holds the lock; exiting')   # two ticks lost state and collided on the temp file
+        sys.exit(0)
     log(f'start poll={POLL}s idle_polls={IDLE_POLLS} cooldown={COOLDOWN}s dry={dry} seats={len(SEATS)}')
 
     def _wd(signum, frame):
-        raise TimeoutError(f'tick watchdog: a tick ran longer than {TICK_LIMIT} s')
+        raise Watchdog(f'tick watchdog: a tick ran longer than {TICK_LIMIT} s')
     signal.signal(signal.SIGALRM, _wd)
     n = 0
     while True:

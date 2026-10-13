@@ -1,42 +1,65 @@
 #!/usr/bin/env bash
 # fleet-preflight — the conditions the fleet silently depends on, each a check that can fail. Exit 1 if any is DEAD.
 # Run hourly (fleet-refill does, every 10 min), at the start and end of the day, and before every deploy.
-#   * publish mode vs lander state: the mode file says how seats publish; "lander" with no installed+enabled lander means seats were
-#     told not to push to a tool that does not run; "direct" with the enable marker present means the pre-push hook refuses their pushes
-#   * fleet-cred-check (credentials, daemon heartbeat, keychain)
-#   * unlanded work: a seat branch holding bean commits not on the main branch (by subject) for > 60 min, from fleet-refill's landing audit
-#   * production lag: the deployed commit (DROVER_PROD_VERSION_URL) may not trail the main branch by code commits older than
-#     DROVER_PROD_LAG_MIN minutes: landed code that is not deployed is a stall, not a plan
+#   * publish mode vs lander state: "lander" with no installed+enabled lander means seats were told not to push to a tool that does not run;
+#     "direct" with the enable marker present means the pre-push hook refuses their pushes
+#   * fleet-cred-check (credentials, daemon heartbeat, keychain), run ONCE
+#   * production lag (DROVER_PROD_VERSION_URL): the deployed commit is read as JSON (the first "sha" key); a failed fetch, an unreadable version or a
+#     commit missing from the local object database is DEAD, never "within window"; the lag is measured from when the undeployed difference was FIRST
+#     OBSERVED (not from the commit's date, which says nothing about when it became deployable)
+#   * unlanded work and stuck seats: read from the alert files fleet-refill writes, and only if the audit that wrote them COMPLETED recently
+#     (a stamp file next to each): a dead or failing audit must read as DEAD, not as an empty (clean) file
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/drover-env"
-bad=0
+bad=0; ST="$FLEET_STATE"; mkdir -p "$ST/alerts"
 ok(){ echo "ok    $*"; }; dead(){ echo "DEAD  $*"; bad=1; }
-mode=$(cat "$DROVER_PUBLISH_MODE_FILE" 2>/dev/null || echo direct)
-marker="$FLEET_STATE/batch-land-enabled"
+mtime(){ stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+mode=$(cat "$DROVER_PUBLISH_MODE_FILE" 2>/dev/null || echo direct); marker="$ST/batch-land-enabled"
 case "$mode" in
   lander)
-    if [ -f "$marker" ] && [ -x "$DROVER_BIN/fleet-batch-land" ]; then ok "publish-mode=lander and the lander is installed+enabled"
-    else dead "publish-mode=lander but the lander is not installed/enabled: seats were told not to push (set direct: echo direct > $DROVER_PUBLISH_MODE_FILE)"; fi ;;
+    if [ -f "$marker" ] && [ -x "$DROVER_BIN/fleet-batch-land" ]; then ok "publish-mode=lander, lander installed+enabled"
+    else dead "publish-mode=lander but the lander is not installed/enabled (echo direct > $DROVER_PUBLISH_MODE_FILE)"; fi ;;
   direct)
-    if [ ! -f "$marker" ]; then ok "publish-mode=direct (seats land their own commits)"
+    if [ ! -f "$marker" ]; then ok "publish-mode=direct"
     else dead "publish-mode=direct but $marker exists: the pre-push hook refuses seat pushes"; fi ;;
   *) dead "publish-mode '$mode' is neither direct nor lander" ;;
 esac
-"$DROVER_BIN/fleet-cred-check" 2>&1 | grep -E "^(DEAD|WARN)"; "$DROVER_BIN/fleet-cred-check" >/dev/null 2>&1 || bad=1
+out=$("$DROVER_BIN/fleet-cred-check" 2>&1); rc=$?; printf '%s\n' "$out" | grep -E "^(DEAD|WARN)"; [ $rc -ne 0 ] && bad=1
 if [ -n "$DROVER_PROD_VERSION_URL" ] && [ -n "${DROVER_REPO:-}" ]; then
-  git -C "$DROVER_REPO" fetch -q origin main 2>/dev/null
-  prod=$(curl -s --max-time 10 "$DROVER_PROD_VERSION_URL" | grep -o '"sha" *: *"[a-f0-9]*"' | head -1 | grep -o '[a-f0-9]\{7,\}')
-  if [ -z "$prod" ]; then dead "production version unreadable ($DROVER_PROD_VERSION_URL)"; else
-    paths=(); [ -z "$DROVER_CODE_PATHS_LAG" ] || paths=(-- $DROVER_CODE_PATHS_LAG)
-    n=$(git -C "$DROVER_REPO" log "$prod..origin/main" --no-merges --format=%s "${paths[@]}" 2>/dev/null | wc -l | tr -d ' ')
-    old=$(git -C "$DROVER_REPO" log "$prod..origin/main" --no-merges --format=%ct "${paths[@]}" 2>/dev/null | tail -1)
-    if [ "${n:-0}" -gt 0 ] && [ -n "$old" ] && [ $(( $(date +%s) - old )) -gt $(( DROVER_PROD_LAG_MIN * 60 )) ]; then
-      dead "production ${prod:0:7} lags origin/main by $n code commits, oldest $(( ($(date +%s)-old)/60 )) min old: deploy or say why not"
-    else ok "production ${prod:0:7} within window ($n undeployed code commits)"; fi
+  if ! git -C "$DROVER_REPO" fetch -q origin main 2>/dev/null; then dead "git fetch origin main failed: cannot compare production with main"
+  else
+    prod=$(curl -s --max-time 10 "$DROVER_PROD_VERSION_URL" | python3 -c '
+import sys, json
+def find(o):
+    if isinstance(o, dict):
+        if isinstance(o.get("sha"), str): return o["sha"]
+        for v in o.values():
+            r = find(v)
+            if r: return r
+    return None
+try: print(find(json.load(sys.stdin)) or "")
+except Exception: pass' 2>/dev/null)
+    if [ -z "$prod" ]; then dead "production version unreadable or not JSON ($DROVER_PROD_VERSION_URL)"
+    elif ! git -C "$DROVER_REPO" cat-file -e "$prod^{commit}" 2>/dev/null; then dead "production sha ${prod:0:7} is not in the local object database: cannot compare"
+    else
+      paths=(); [ -z "$DROVER_CODE_PATHS_LAG" ] || paths=(-- $DROVER_CODE_PATHS_LAG)
+      if ! lines=$(git -C "$DROVER_REPO" log "$prod..origin/main" --no-merges --format=%h "${paths[@]}" 2>/dev/null); then dead "git log $prod..origin/main failed: cannot compare"
+      else
+        n=$(printf '%s' "$lines" | grep -c . || true); first="$ST/prod-lag-first-seen"
+        if [ "${n:-0}" -eq 0 ]; then rm -f "$first"; ok "production ${prod:0:7} matches main (0 undeployed code commits)"
+        else
+          [ -f "$first" ] && [ "$(cut -d' ' -f1 "$first")" = "${prod:0:7}" ] || echo "${prod:0:7} $(date +%s)" > "$first"
+          age=$(( ($(date +%s) - $(cut -d' ' -f2 "$first")) / 60 ))
+          if [ "$age" -gt "$DROVER_PROD_LAG_MIN" ]; then dead "production ${prod:0:7} has lagged origin/main for $age min ($n undeployed code commits): deploy or say why not"
+          else ok "production ${prod:0:7} lags $n code commits for $age min (< $DROVER_PROD_LAG_MIN)"; fi
+        fi
+      fi
+    fi
   fi
 fi
-# finished work must reach the main branch: any seat branch holding bean commits not on it by subject for > 60 min (written by the refill landing audit)
-if [ -s "$FLEET_STATE/alerts/unlanded.txt" ]; then
-  n=$(wc -l < "$FLEET_STATE/alerts/unlanded.txt" | tr -d ' ')
-  dead "$n seat branch(es) hold bean commits not on the main branch for > 60 min: $(head -3 "$FLEET_STATE/alerts/unlanded.txt" | tr '\n' ';' | cut -c1-240)"
-else ok "no seat branch holds bean commits unlanded for > 60 min"; fi
+fresh(){ local f="$1" label="$2" maxm="$3"
+  [ -f "$f.ok" ] || { dead "$label: no completed audit on record"; return; }
+  [ $(( ( $(date +%s) - $(mtime "$f.ok") ) / 60 )) -gt "$maxm" ] && { dead "$label: last completed audit is stale (> $maxm min)"; return; }
+  if [ -s "$f" ]; then dead "$label: $(head -3 "$f" | tr '\n' ';' | cut -c1-240)"; else ok "$label: none"; fi; }
+fresh "$ST/alerts/unlanded.txt" "seat branches with bean commits unlanded > 60 min" 30
+fresh "$ST/alerts/stuck.txt" "seats working with no change > 45 min" 20
 exit $bad
