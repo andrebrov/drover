@@ -98,4 +98,16 @@ assert open(f'{sys.argv[3]}/alerts/stuck.txt').read() == ''
 P
 mkdir -p "$T/wts"; git worktree add -q "$T/wts/fleet-s-coder" -b w-stuck main
 expect "refill stuck_check: flags a 'working' seat with no worktree change, sends Esc once, clears when it changes, stamps .ok" 0 python3 "$T/stucktest.py" "$BIN/fleet-refill" "$T/wts/fleet-s-coder" "$T/state"
+# ---------------- injection: a branch NAME is data. git accepts $(...) in ref names; the landing audit must not execute it
+git worktree add -q "$T/wts/fleet-s-coder" -b w-inj main 2>/dev/null || true
+git branch 'fleet/s$(touch${IFS}INJECTED)-bean-zzzz' main
+cat > "$T/injtest.py" <<'P'
+import importlib.machinery, importlib.util, os, sys, time
+os.environ['DROVER_ROSTER'] = 's-coder:claude'
+l = importlib.machinery.SourceFileLoader('fr', sys.argv[1]); m = importlib.util.module_from_spec(importlib.util.spec_from_loader('fr', l)); l.exec_module(m)
+m.STATE_DIR = sys.argv[2]; m.REPO = sys.argv[3]
+os.chdir(sys.argv[4]); m.landing_audit({}, time.time(), dry=True)
+P
+mkdir -p "$T/injcwd"; ( cd "$T/injcwd" && python3 "$T/injtest.py" "$BIN/fleet-refill" "$T/state2" "$W" "$T/injcwd" >/dev/null 2>&1 )
+if [ -e "$T/injcwd/INJECTED" ] || [ -e "$W/INJECTED" ]; then bad "refill landing_audit: a branch name with \$(...) was EXECUTED"; else ok "refill landing_audit: a branch name with \$(...) is data, not code"; fi
 echo; echo "passed=$pass failed=$failn"; rm -rf "$T"; [ $failn = 0 ]

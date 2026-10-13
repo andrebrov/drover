@@ -103,10 +103,10 @@ class Watchdog(BaseException):
     """Raised by the tick alarm. A BaseException so no `except Exception` inside a helper can swallow it."""
 
 
-def run(cmd, timeout=20):
+def run(cmd, timeout=20, cwd=None):
     """Run a command in its own process group; on timeout kill the WHOLE group (a child's children used to survive and pile up)."""
     try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, cwd=cwd)
     except Exception as e:
         return subprocess.CompletedProcess(cmd, 1, '', str(e))
     try:
@@ -199,7 +199,8 @@ def next_item(kind, seat, st, light=False):
 
 def _check(wt, bean=''):
     """fleet-branch-landed run inside a seat worktree -> (rc, oldest_min, newest_min, subjects)."""
-    r = run(['bash', '-c', f'cd "{wt}" && "{BIN}/fleet-branch-landed" HEAD {bean}'], timeout=60)
+    # argv + cwd, never a shell string: the bean and the path come from ref names and config, and a ref name may contain $(...) or backticks
+    r = run([f'{BIN}/fleet-branch-landed', 'HEAD'] + ([bean] if bean else []), timeout=60, cwd=wt)
     lines = r.stdout.splitlines()
     old = new_ = 0
     subs = []
@@ -248,7 +249,7 @@ def landing_audit(st, now, dry=False):
         if not m or not ts.isdigit() or now - int(ts) > 14 * 86400:
             continue
         seat, bean = m.groups()
-        r = run(['bash', '-c', f'cd "{REPO}" && "{BIN}/fleet-branch-landed" "{br}" {bean}'], timeout=60)
+        r = run([f'{BIN}/fleet-branch-landed', br, bean], timeout=60, cwd=REPO)    # argv, not a shell string: a ref name may contain $(...)
         if r.returncode == 0:
             continue
         if r.returncode != 1:
