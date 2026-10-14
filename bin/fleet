@@ -581,6 +581,7 @@ check_beans() {
 coder_prompt() {  # name kind bean scope
   cat <<P
 You are $1, the $2 CODER on a fleet team. Team lead = \`lead\` (a Claude session); the human is not watching you. Your job: bean $3.
+Role rules (short, read first): $SKILLS_SRC/roles/coder.md
 Work ONLY in this worktree ($(cwd_of "$1")). Your branch for THIS bean is \`fleet/$1-$3\` — one branch per BEAN, forked from current main. The lead puts you on it before you start; run \`git branch --show-current\` and confirm it before step 0. Steps:
 0. START ON CURRENT ORIGIN/MAIN. \`git fetch origin; git merge origin/main --no-edit\` (fleet assign already cut your branch from origin/main, so this is normally a no-op). NEVER merge local \`main\`: it carries commits origin lacks and conflicts on AGENTS.md on every dispatch (a seat sat 5 h on that conflict). If a merge conflicts anyway: \`git merge --abort\`, then \`git rebase --onto origin/main <your base>\` replaying only your own commits; never leave a merge half-done.
 1. \`beans show $3\` — read it fully. Follow the repository's own agent rules (CLAUDE.md / AGENTS.md or equivalent). If a pm or architect has written requirements for this bean, they are in $REPORTS — build to those, and say so if you disagree rather than quietly building something else.
@@ -617,6 +618,7 @@ Lead scope given to the coder (judge against THIS, not the raw bean text): $scop
 lead's to resolve and the lead re-verifies against current main before every merge. Say LANDABLE: YES when the
 work is sound and name the base you tested. Raise a blocker only for a defect in the work, a conflict you
 actually hit while cherry-picking the NAMED commits onto a detached main, or a proof that is missing.
+Role rules (short, read first): $SKILLS_SRC/roles/reviewer.md
 Work ONLY in this worktree ($(cwd_of "$1")). Steps:
 1. \`beans show $4\` (requirements) and \`cat $REPORTS/$3-$4.md\` (the coder's report).
 2. With BR set to the branch you resolved above: \`git diff main...\$BR --stat\` then \`git diff main...\$BR\`. Judge against the bean's checklist and the repository's own agent rules (CLAUDE.md / AGENTS.md or equivalent).

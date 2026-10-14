@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""fleet-rules-sync — one source for always-on coding rules, generated into each harness's rules directory, with a drift check.
+
+    fleet-rules-sync [--src DIR] [--dst DIR]            regenerate DST from SRC
+    fleet-rules-sync --check [--src DIR] [--dst DIR]    exit 1 and name every difference; writes nothing
+
+SRC holds `*.mdc` rules (front matter + body, the format an editor-side rules directory uses); DST gets one `<name>.md` per source with the front
+matter dropped and a header naming the source. A hand edit of a generated copy, a missing copy or an orphan copy fails --check, so run it from the
+build or the pre-commit hook and the copies cannot drift. Defaults: $DROVER_REPO/.cursor/rules -> $DROVER_REPO/.grok/rules (override with --src/--dst
+or DROVER_RULES_SRC / DROVER_RULES_DST). Rules named by DROVER_RULES_SKIP_PREFIX (default `tessl__`, i.e. installed by a package manager) are not mirrored.
+"""
+import os
+import re
+import sys
+
+
+def arg(name, default):
+    return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
+
+
+repo = os.environ.get('DROVER_REPO', '.')
+src = arg('--src', os.environ.get('DROVER_RULES_SRC', os.path.join(repo, '.cursor/rules')))
+dst = arg('--dst', os.environ.get('DROVER_RULES_DST', os.path.join(repo, '.grok/rules')))
+skip = os.environ.get('DROVER_RULES_SKIP_PREFIX', 'tessl__')
+src_label = os.path.relpath(src, repo) if os.path.isabs(src) and src.startswith(os.path.abspath(repo)) else src
+
+
+def generated(name, mdc):
+    body = re.sub(r'\A---\n.*?\n---\n', '', mdc, count=1, flags=re.S)
+    return f'<!-- Source: {src_label}/{name}.mdc — keep in sync when updating the source rules -->\n\n' + body.lstrip('\n')
+
+
+def expected():
+    out = {}
+    for f in sorted(os.listdir(src)):
+        if f.endswith('.mdc') and not (skip and f.startswith(skip)):
+            out[f[:-4] + '.md'] = generated(f[:-4], open(os.path.join(src, f)).read())
+    return out
+
+
+def differences(exp):
+    found = [f for f in os.listdir(dst) if f.endswith('.md')] if os.path.isdir(dst) else []
+    problems = []
+    for f, text in exp.items():
+        p = os.path.join(dst, f)
+        if not os.path.exists(p):
+            problems.append(f'missing {dst}/{f}')
+        elif open(p).read() != text:
+            problems.append(f'{dst}/{f} differs from its source {src}/{f[:-3]}.mdc')
+    problems += [f'{dst}/{f} has no source in {src}' for f in found if f not in exp]
+    return problems
+
+
+if not os.path.isdir(src):
+    sys.exit(f'fleet-rules-sync: source directory {src} does not exist')
+exp = expected()
+if '--check' in sys.argv:
+    problems = differences(exp)
+    if problems:
+        print('fleet-rules-sync: the generated rule copies drifted from their source (edit the source, then run fleet-rules-sync):', file=sys.stderr)
+        for p in problems:
+            print(f'  - {p}', file=sys.stderr)
+        sys.exit(1)
+    print(f'fleet-rules-sync: {len(exp)} copies match their source')
+else:
+    os.makedirs(dst, exist_ok=True)
+    for f, text in exp.items():
+        open(os.path.join(dst, f), 'w').write(text)
+    print(f'fleet-rules-sync: wrote {len(exp)} copies to {dst}')
