@@ -413,6 +413,8 @@ cmd_status() {
       | [(.name // "-"), .agent, .agent_status, .pane_id, (.cwd|split("/")|last), "(not on roster)"] | @tsv' <<<"$live" \
       | awk -F'\t' '{printf "%-18s %-9s %-8s %-7s %-24s %s\n",$1,$2,$3,$4,$5,$6}'
   herdr integration status --outdated-only 2>/dev/null | sed 's/^/integration outdated: /' || true
+  # seat questions waiting for a decision (fleet-answer <id> <choice>); never typed into a pane
+  "$DROVER_BIN/fleet-ask" --open 2>/dev/null || true
   return $rc
 }
 

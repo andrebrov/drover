@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# fleet-ask — see lib/fleet_qa.py in the drover checkout ($DROVER_SRC).
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+FLEET_QA_PROG=fleet-ask exec python3 "$DROVER_SRC/lib/fleet_qa.py" "$@"
