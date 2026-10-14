@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# fleet-dispatch — the one dispatch tool; it cannot hide ready work. See lib/fleet_dispatch.py for the rules.
+#   fleet-dispatch [--dry-run]
+# shellcheck source=drover-env
+. "$(dirname "$0")/drover-env"
+export DROVER_PINS_FILE DROVER_LEAD_SEATS DROVER_REFILL_DEDICATED DROVER_BEAN_RE DROVER_BIN FLEET_REPORTS
+export FLEET_ROOT="${DROVER_REPO:-}"
+[ -n "$FLEET_ROOT" ] || unset FLEET_ROOT
+exec python3 "$DROVER_SRC/lib/fleet_dispatch.py" "$@"
