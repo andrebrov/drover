@@ -33,35 +33,7 @@ minute; and each of those failures now has a guard (a spend cap, a no-op detecto
 
 ## The loop
 
-```
-   beans list --ready (on main)
-            |  top_up_queue
-            v
-   +---->  queue/  <epoch>-<bean>  <------------------------------+
-   |        |  refill: a free coder, harness not broke,           |  requeue: dead seat,
-   |        |  bean on main and ready, not owned by another coder |  failed dispatch
-   |        v                                                     |
-   |   CODER seat  --  own worktree, branch fleet/<coder>-<bean> --+
-   |        |  fleet-done <me> <bean> DONE | BLOCKED
-   |        v
-   |    inbox/  -->  drain_inbox
-   |        |   DONE with unchecked items -> PARTIAL -> back to the same coder (3x -> lead)
-   |        |   BLOCKED                   -> state/blocked (lead reads it)
-   |        |   DONE                      -> one review, on a DIFFERENT harness
-   |        v
-   |   REVIEWER seat  --  cherry-picks the named commits onto a detached main, builds, tests
-   |        |  fleet-done <me> <bean> CHANGES | DONE (verdict APPROVE)
-   |        v
-   |    drain_inbox
-   |        |   CHANGES -> followup to the coder, ahead of anything in the queue --+
-   |        |   APPROVE -> state/approved/<bean>: held out of the queue           |
-   |        v                                                                     |
-   |   LAND  the lead — or, with DROVER_AUTOLAND=1, fleet-land-bean:              |
-   |        cherry-pick the bean's own branch into an ISOLATED worktree,          |
-   |        gate (typecheck + related tests), fast-forward LOCAL main. Then       |
-   |        fleet-verify-main (full build+suite on a clean tree) -> push origin.  |
-   +--------------------------------------------------------------- coder <------+
-```
+<img width="2430" height="1376" alt="drover_flow" src="https://github.com/user-attachments/assets/6a220bbc-31dc-4280-b49b-967a1f930012" />
 
 By default landing stays with the human lead — the only party that re-verifies against current main, runs
 migrations, and pushes. Set `DROVER_AUTOLAND=1` and the watcher does it: `fleet-land-bean` lands each
