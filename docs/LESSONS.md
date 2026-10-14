@@ -1359,3 +1359,84 @@ fixed and covered by `tests/cadence-tools.test.sh` (21 cases; 13 of them fail on
 - **Loops are restarted, not fed.** The stuck check flags a seat that reports `working` while its worktree has not changed for 45 minutes and
   presses Esc once per signature; the refill daemon never feeds a flagged seat. The operator restarts the session (a screen that repeats one
   line for 45 minutes has exhausted its context).
+
+## Outcome ownership: one owner per task, end to end (2026-10-13)
+Measured on two kinds of work with the same fleet. A start-up speedup: 2 strong seats, 3 assignments, 6 landings in 0.6 h. A judge-provider swap
+plus a speed task: 9 seats, 36 assignments, first landing after 3.3 h, last after 13.9 h, broken in production for 6 h, a second defect found at
+hour 14. The difference was not effort. Nobody owned the OUTCOME ("an email renders, passes the gate and is faster in production"), hand-offs cost
+hours, the lead relayed between seats, and nothing ran the real path before a deploy.
+- **One owner per task.** The owner builds it, runs the real path locally, lands it, deploys it through the deploy tool and verifies it after the
+  deploy. The lead sets priority and answers decisions; it does not relay between seats or integrate.
+- **No slicing across seats when the work touches one pipeline or one shared contract** (a function or type with three or more importers, a schema,
+  a prompt or rubric, an API request shape). One seat, one change. Slicing is for work that is truly independent: disjoint files, each slice
+  builds and passes alone on the main branch.
+- **Strong seats own anything with conflicts, contracts or an external API.** Cheaper harnesses take reviews and one-commit slices (3 of 158
+  assignments showed code in an hour).
+- **Every deploy goes through the deploy tool, never the bare script:** credentials check, an acceptance probe (the real judges and the real gate
+  on a fixture, a fraction of a cent), the reconcile repeated until production contains the probed commit, a health check, one log line. Skipping
+  the probe needs a stated reason. A task that changes a pipeline ships or updates its probe in the same change.
+- **Landed means deployed within the hour for urgent tasks;** preflight is DEAD when production lags the main branch for 90 minutes.
+- **Measure every four hours** (landings, active and idle seats, unlanded branches, BLOCKED share, production lag, render timings). Targets: first
+  landing within an hour of assignment, at most four assignments per landed task, BLOCKED share under 25%, production lag under 90 minutes.
+- **Briefs carry no git mechanics.** The landing paragraph is generated from the publish mode; throwaway worktrees per assignment remove the
+  stale-state class.
+- **The lead's attention is a budget.** While an urgent task runs the lead works only on it. Retros, tooling and cleanups run after it is verified
+  or are delegated to one owner.
+
+## Push gates: a pool of three, never one at a time, never unlimited (2026-10-13)
+Seven unthrottled push gates ran at once, each a full build plus the related tests: load 40-80 on 16 cores, each gate 30-40 minutes, and nothing
+landed for 45 minutes while the main branch did not move. One slot is the opposite failure: every push waits behind the slowest. `fleet-slot` now
+defaults `FLEET_PUSH_SLOTS` to 3 (a fourth gate waits for a free slot; `0` removes the limit; the general pool is separate). Metric: gate wall-time
+median under 15 minutes at the next scoreboard.
+- **Build reuse after a disjoint rebase (approved the same night, after first being declined).** A push that loses the race rebases over main
+  commits. When none of those commits touches a file the push touches or anything those files import (conservative: any package or lockfile,
+  tsconfig, migration, template or snapshot, or shared type barrel change forces a full run), the gate reuses BOTH the previous green build and the
+  previous test pass for that tree. The accepted risk: a cross-file type break can slip through. The red-main tripwire (30 minutes) catches it and the
+  author seat fixes it first. A push that loses a race still rebases and pushes again, one attempt at a time; no pause of other seats, no gate skip.
+
+## Never say "no ready work" without the board count (2026-10-14)
+For six hours the lead reported "no ready work" three times while `beans list --ready` held 150 coder beans. A hand-written shell filter dropped
+every bean without a checklist (58 of them), a hand-kept "recently tried" list excluded valid beans, and four seats sat on stale pins. The rule:
+any "nothing to dispatch" statement carries `board_ready=N dispatchable=M` and the top exclusion reasons, from `fleet-dispatch`. The tool reads the
+main-branch beans, excludes each bean for a NAMED reason (on a working seat's branch, skip-listed, pinned to a busy seat, recently blocked,
+architect-first, every open item gated, all items checked), treats a bean with no checklist as dispatchable, checks that the counts add up, and never
+prints "no work". Pins expire when the bean completes or the seat finished. The check that can fail: dispatchable=0 while board_ready>0 with no
+reason histogram is a lead error.
+- **Two defects found by using it.** A first version excluded any bean with a `fleet/<seat>-<bean>` branch of a working seat, which hid 62 beans: the
+  seat had moved on and only its OLD branches remained, so "working on it" means the branch the seat has checked out now. And a report that began
+  `# <bean> (<seat>) — BLOCKED …` and ended in prose was not read as blocked, so the bean was sent again: a blocked report is recognised by BLOCKED in
+  its last line or in its first three lines (heading, `Verdict:`).
+
+## A seat built for one purpose gets nothing else (2026-10-14)
+A seat dedicated to one bean (a proof of concept with its own credentials and review) was handed unrelated beans by the generic queue. Rule: a
+single-purpose seat is excluded from dispatch by name (`DROVER_DISPATCH_EXCLUDE`, or `DROVER_REFILL_DEDICATED`), and it waits when its own bean has
+nothing a coder can run. Generalised: any seat whose environment, credentials or review chain is special-purpose is a named exclusion, not a
+convention the lead has to remember.
+
+## What was worth borrowing from a second fleet runner (2026-10-14)
+A comparison against another multi-agent runner found four mechanisms that remove a recurring class of failure; each was built and tested here.
+- **Questions and decisions are files, not keystrokes.** Seven answers typed into seat panes in one day: one invalid key, one missing pane. A seat
+  now writes a question file with its options and ends its turn; `fleet-answer` records the decision once (O_EXCL, a second answer is refused),
+  appends it to the bean and wakes the seat with a prompt. `fleet status` lists open questions with their age.
+- **Reports carry exit codes.** The biggest recurring defect class was a report claiming more than ran (VERIFIED while the push was still in the
+  gate, a stale review). `fleet-done --check NAME=EXIT` (repeatable), `--sha` and a fixed `--status` vocabulary: a DONE without passing build and
+  test checks, with a failing check, or claiming landed with a sha that is not an ancestor of the main branch is announced as PARTIAL with the
+  reason. The gate is opt-in per call, or fleet-wide with `FLEET_DONE_STRICT=1`, so seats that predate it keep working.
+- **Narrow bean access.** A seat may not delete a bean file and may not mark one completed before a SHA it names is an ancestor of the main
+  ref. `fleet-bean-guard` judges only the beans the push carries, at the pushed blob. Its first version resolved the range `A..B` as one revision,
+  which prints both ends, so the completion check passed on nothing; the tip is resolved on its own.
+- **Short role briefs.** One 40-line role file per role (coder, reviewer, architect, lead) with only the rules that still fire; generated seat
+  briefs start with a pointer to it. Guidance that must exist in several harness directories has ONE source, generated into the others, and a
+  drift check that fails on a hand edit, a missing copy or an orphan.
+
+## Retro rules, 2026-10-13 evening
+- **A red tripwire is fixed by its author seat first, and the lead lands a missing commit within 15 minutes.** The alert names the first bad commit
+  and its seat. A push is not "done" if the tripwire turns red on it. Metric: minutes the main branch is red per day.
+- **Tests never read machine-local paths** (a home directory, a reports directory). A fixture lives in the repository. One such test refused every
+  push for two hours. Check: grep for those paths in test directories finds nothing.
+- **The lead writes an hourly standup from the five-minute check, and a retro when a class repeats twice.** Metric: "no standup" or "agents idle"
+  questions from the operator = 0.
+- **Pins expire.** The five-minute check removes a pin whose seat is done or idle and whose bean has no open item for it. Metric: done seats
+  holding a pin = 0.
+- **A lead command with a glob or a list runs inside a heredoc script or a script file,** including one-liners with a wildcard: an unmatched
+  glob under a shell with `nomatch` aborts the command, and it repeated five times.

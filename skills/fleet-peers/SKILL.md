@@ -59,7 +59,10 @@ breaking it cost the fleet real hours; the dated evidence is in drover's `docs/L
 4. Commit, then write the report with the SHAs and the PASTED build and test output. A command you did not
    run cannot appear in it. Name EVERY commit the bean needs; the set must pass on a detached main.
 5. Announce:
-   `fleet-done <your-name> <bean> DONE|BLOCKED|CHANGES "<one line: what changed, landable or not>" <report>`
+   `fleet-done <your-name> <bean> DONE|BLOCKED|CHANGES "<one line: what changed, landable or not>" <report> --check build=<exit> --check test=<exit>`
+   - Pass the REAL exit codes of what you ran. A DONE without a passing build and test check, with a failing check, or with `--status landed`
+     and a `--sha` that is not an ancestor of the main branch is announced as PARTIAL with the reason. `--status` is one of: started implemented
+     review-pass review-fail blocked-access needs-human failed landed.
    - A coder's DONE with unchecked `- [ ]` items in the bean is downgraded to PARTIAL and comes straight
      back to you. Finish the items, or for an item only the human can do write `HUMAN: <why>` and announce BLOCKED.
    - BLOCKED says exactly what unblocks you ("needs the human to pick an owner", "migration not applied").
@@ -71,6 +74,20 @@ breaking it cost the fleet real hours; the dated evidence is in drover's `docs/L
    DONE <report path>
    ```
    `REBASED: NO` means the work is not finished.
+
+## Ask the lead by file, never in the terminal
+- Run `fleet-ask <you> <bean> "<question>" [option ...]`, note the printed id and END YOUR TURN. The lead answers with `fleet-answer <id> ...`; you
+  are woken by a prompt that carries the decision (also appended to the bean). One answer per question; do not re-ask, do not wait in the pane.
+- You may not delete a bean file or mark a bean completed before a SHA it names is an ancestor of the main branch; the pre-push bean guard
+  refuses both.
+- Your role brief is short: `skills/roles/<role>.md`. Read it first; it holds only the rules that still fire.
+
+## One owner per task
+- The seat that owns a task builds it, runs the real path locally (with the real key for an external API), lands it, deploys it through the deploy
+  tool and verifies it. Do not hand your next step to another seat; if the work touches one shared contract or pipeline it is not sliced across seats.
+- Push gates run at most three at a time (`fleet-slot`); a fourth waits for a slot. Never serialise pushes to one and never run them unlimited.
+- A seat dedicated to one purpose receives nothing else. The lead never says "no ready work" without the `fleet-dispatch` line
+  `board_ready=N dispatchable=M`.
 
 ## What happens next (fleet-watch)
 - **Coder DONE** → one reviewer on a different harness gets your branch. Re-announcing DONE does not add a second.
