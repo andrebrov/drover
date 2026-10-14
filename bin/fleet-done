@@ -2,7 +2,7 @@
 # fleet-done — an AGENT calls this the moment it finishes. It is the push half
 # of the fleet's reporting: the lead no longer polls, it waits.
 #
-#   fleet-done <agent> <bean> <DONE|BLOCKED|CHANGES> "<one-line summary>" [report-path]
+#   fleet-done <agent> <bean> <DONE|BLOCKED|CHANGES> "<one-line summary>" [report-path] [--check NAME=EXIT]... [--sha SHA] [--status S]
 #
 # Writes one line into $FLEET_INBOX. The lead (or fleet-watch) blocks on that
 # directory (fleet-wait) instead of reading panes or trusting `fleet status`,
@@ -12,6 +12,18 @@ set -euo pipefail
 . "$(dirname "$0")/drover-env"
 INBOX="$FLEET_INBOX"
 mkdir -p "$INBOX"
+# Evidence flags. fleet-done <agent> <bean> <state> "<summary>" [report] [--check NAME=EXIT]... [--sha SHA] [--status S]
+# Flags may sit anywhere; positionals keep their order. Giving any flag, or FLEET_DONE_STRICT=1, turns on the evidence gate below.
+pos=(); checks=(); sha=""; vstatus=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) checks+=("${2:?--check NAME=EXIT}"); shift 2 ;;
+    --sha) sha="${2:?--sha SHA}"; shift 2 ;;
+    --status) vstatus="${2:?--status S}"; shift 2 ;;
+    *) pos+=("$1"); shift ;;
+  esac
+done
+set -- "${pos[@]+"${pos[@]}"}"
 a="${1:?agent}"; bean="${2:?bean}"; state="${3:?DONE|BLOCKED|CHANGES}"; summary="${4:-}"; report="${5:-}"
 # A coder's DONE with unchecked checklist items is not DONE: downgrade to PARTIAL so the watcher
 # sends it back to the same coder instead of spending a reviewer round on "items still open".
@@ -26,6 +38,41 @@ case "$a" in
       if [ "${un:-0}" -gt 0 ]; then state=PARTIAL; summary="unchecked items: $un — $summary"; echo "fleet-done: $bean has $un unchecked checklist item(s) → announced as PARTIAL, not DONE" >&2; fi
     fi ;;
 esac
+
+# EVIDENCE GATE. A report may not claim more than ran. Fixed status vocabulary for --status; DONE needs build and test checks with
+# exit 0; a landed claim needs --sha to be an ancestor of origin/main. Anything short of that is announced as PARTIAL with the reason, never
+# as DONE. Opt-in per call (any flag) or fleet-wide with FLEET_DONE_STRICT=1, so seats that predate the flags keep working until the lead flips it.
+if [ -n "$vstatus" ]; then
+  case "$vstatus" in started|implemented|review-pass|review-fail|blocked-access|needs-human|failed|landed) ;; *) echo "fleet-done: unknown --status '$vstatus' (started implemented review-pass review-fail blocked-access needs-human failed landed)" >&2; exit 2 ;; esac
+fi
+if [ "${#checks[@]}" -gt 0 ] || [ -n "$sha" ] || [ -n "$vstatus" ] || [ "${FLEET_DONE_STRICT:-0}" = 1 ]; then
+  why=""; have_build=""; have_test=""
+  for c in "${checks[@]+"${checks[@]}"}"; do
+    case "$c" in *=*) ;; *) echo "fleet-done: --check needs NAME=EXIT, got '$c'" >&2; exit 2 ;; esac
+    cn="${c%%=*}"; ce="${c#*=}"
+    case "$ce" in ''|*[!0-9]*) echo "fleet-done: --check exit code must be a number, got '$c'" >&2; exit 2 ;; esac
+    if [ "$ce" != 0 ]; then why="$why check $cn exited $ce;"; continue; fi
+    case "$(printf '%s' "$cn" | tr 'A-Z' 'a-z')" in build) have_build=1 ;; test|tests) have_test=1 ;; esac
+  done
+  if [ "$state" = DONE ] || [ "$vstatus" = review-pass ] || [ "$vstatus" = landed ]; then
+    [ -n "$have_build" ] || why="$why no passing build check (--check build=0);"
+    [ -n "$have_test" ] || why="$why no passing test check (--check test=0);"
+  fi
+  if [ "$vstatus" = landed ]; then
+    if [ -z "$sha" ]; then why="$why LANDED claimed without --sha;"
+    else
+      git fetch -q origin 2>/dev/null || true
+      git merge-base --is-ancestor "$sha" origin/main 2>/dev/null || why="$why LANDED claimed but $sha is not an ancestor of origin/main;"
+    fi
+  fi
+  if [ -n "$why" ] && { [ "$state" = DONE ] || [ -n "$vstatus" ]; } && [ "$state" != BLOCKED ]; then
+    [ "$state" = DONE ] && state=PARTIAL
+    summary="[downgraded:$why] $summary"; echo "fleet-done: announced as $state, not as claimed —$why" >&2
+  fi
+  [ -n "$vstatus" ] && summary="[status=$vstatus] $summary"
+  [ "${#checks[@]}" -gt 0 ] && summary="$summary [checks: ${checks[*]}]"
+fi
+
 
 # LANDING GATE. In publish-mode=direct a seat may not announce DONE/PARTIAL/READY while THIS BEAN's commits on its current branch (any branch except
 # main) are not on origin/main (whole subject or patch; fleet-branch-landed <branch> <bean>). Other beans' commits are not checked.
