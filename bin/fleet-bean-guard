@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""fleet-bean-guard — the two prose rules seats keep breaking, as a pre-push gate.
+
+    fleet-bean-guard <repo> <main-ref> <range>...        exit 0 = allow the push, 1 = refuse it, 2 = misuse
+
+"Never delete a bean on a branch" and "mark a bean completed only when the fix SHA is an ancestor of the main ref" are both written in every
+fleet's instructions and both get broken: a seat deletes a bean file (the board loses the work's record) or flips `status: completed` before
+the fix it names has landed (the board says done, the main branch does not). Neither shows in a diff review: both look like an ordinary
+bean edit. This gate judges ONLY the beans the push carries, at the pushed blob: a check over the whole working directory would refuse pushes
+that have nothing to do with a stale file in someone's checkout.
+
+A SHA "named in the bean" is any hex token (7-40 chars) that git resolves to a commit. A bean also carries ids, dates and counts, so a token
+is only a candidate when it resolves; the rule is satisfied by ANY resolved token that is an ancestor of the main ref.
+
+A range is `A..B` (or one rev): its tip is the right side. `git rev-parse A..B` prints BOTH ends, so resolving the range itself would give a
+two-line "rev", every `git show <rev>:<path>` would fail and the completion check would pass on nothing; the tip is resolved on its own.
+Wire it into a pre-push hook with examples/pre-push-bean-guard.sh. Beans live in $DROVER_BEANS_DIR (default .beans).
+"""
+import os
+import re
+import subprocess
+import sys
+
+BEANS_DIR = os.environ.get('DROVER_BEANS_DIR', '.beans').strip('/')
+HEX = re.compile(r'[0-9a-f]{7,40}')
+
+
+def status_of(text):
+    m = re.search(r'^status:[ \t]*(.+?)[ \t]*$', text or '', re.M)
+    return re.sub(r'''^['"]|['"]$''', '', m.group(1)) if m else None
+
+
+def sha_tokens(text):
+    seen = []
+    for t in HEX.findall(text or ''):
+        if t not in seen:
+            seen.append(t)
+    return seen
+
+
+def judge(deleted, completed):
+    errors = [f'a seat may not delete a bean: {p}' for p in deleted]
+    for path, candidates, ancestors in completed:
+        if ancestors:
+            continue
+        errors.append(f'status: completed with no landed SHA: {path}' + (
+            f' ({len(candidates)} SHA token(s) named, none is an ancestor of the main ref)' if candidates
+            else ' (names no SHA that resolves to a commit)'))
+    return errors
+
+
+def main(argv):
+    if len(argv) < 3:
+        print('[pre-push] fleet-bean-guard: usage <repo> <main-ref> <range>...', file=sys.stderr)
+        return 2
+    repo, main_ref, ranges = argv[0], argv[1], argv[2:]
+
+    def git(*args):
+        r = subprocess.run(['git', '-C', repo, *args], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr)
+        return r.stdout
+
+    def resolves(rev):
+        try:
+            return git('rev-parse', '--verify', '-q', rev).strip()
+        except RuntimeError:
+            return None
+
+    def is_ancestor(sha, of):
+        return subprocess.run(['git', '-C', repo, 'merge-base', '--is-ancestor', sha, of], capture_output=True).returncode == 0
+
+    main_sha = resolves(f'{main_ref}^{{commit}}')
+    if not main_sha:
+        print(f'[pre-push] bean guard: the main ref {main_ref} does not resolve, so the completion check cannot run')
+        print('[pre-push] fix: git fetch origin')
+        print('[pre-push] push refused')
+        return 1
+    bean = re.compile('^' + re.escape(BEANS_DIR) + r'/.*\.md$')
+    deleted, completed = [], []
+    for rng in ranges:
+        try:
+            gone = git('diff', '--diff-filter=D', '--name-only', rng, '--', BEANS_DIR + '/')
+            touched = git('diff', '--diff-filter=d', '--name-only', rng, '--', BEANS_DIR + '/')
+        except RuntimeError:
+            continue   # an unreadable range is refused elsewhere, not waved through here
+        deleted += [p for p in gone.split('\n') if bean.match(p)]
+        tip = resolves(rng.split('..')[-1])
+        if not tip:
+            continue
+        for p in touched.split('\n'):
+            if not bean.match(p):
+                continue
+            try:
+                text = git('show', f'{tip}:{p}')
+            except RuntimeError:
+                continue
+            if status_of(text) != 'completed':
+                continue
+            cands = [t for t in sha_tokens(text) if resolves(f'{t}^{{commit}}')]
+            completed.append((p, cands, [t for t in cands if is_ancestor(t, main_sha)]))
+    errors = judge(deleted, completed)
+    if not errors:
+        return 0
+    print('[pre-push] a seat may not delete a bean, and may not mark one `completed` before the fix it names is on main:')
+    for e in errors:
+        print(f'  {e}')
+    print('[pre-push] fix: restore the bean file (git checkout -- <path>), or name a SHA that is an ancestor of the main ref, then push again')
+    print('[pre-push] push refused')
+    return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
