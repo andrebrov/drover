@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""fleet-rulebook - the FLEET-PEERS.md sections that apply to one bean, verbatim (bean-vrfo).
+  fleet-rulebook <bean> [--title TITLE] [--paths a,b,...]     prints the sections for the brief
+Without --title/--paths the bean is read from main in $FLEET_ROOT: its title, and the repository
+paths its body cites. Jev is asked one Noul per `##` section, all in one request, whether the rule
+applies to a bean with that title touching those paths. A section is kept when its probability
+reaches its tuned threshold (per section, else the policy default), when the policy lists it as
+always-on, or when it was added or edited since tuning. The kept sections are printed verbatim in file order, under a header naming the full
+file, which stays where it is.
+It only prints text for a brief (and appends one line to $FLEET_STATE/rulebook.jsonl). It never
+pushes, lands, applies a migration or answers a dialog, and nothing it prints gates an action.
+The bean text is agent output: it only chooses which rules to show, and every doubt shows more.
+Fails safe to the whole rulebook: Jev unavailable, no or unqualified policy, a prompt that no longer
+matches the tuned policy, FLEET_RULEBOOK=off, or any error. An unreadable rulebook prints nothing
+and exits 2. The API key is read from ~/.config/typesafe/api_key (or TYPESAFE_API_KEY) in-process."""
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1] / "lib"))
+from fleet_config import configure
+config=configure(export=__name__=="__main__")
+from fleet_usage import gate as _fleet_gate
+from fleet_beans import MAX_PATHS, REDACT, bean_from_main, extract_paths
+_fleet_gate(_fleet_sys.argv, __file__)
+
+import hashlib, json, os, re, sys, time, urllib.request
+from datetime import datetime
+
+URL = "https://api.typesafe.ai/v1/systemone"
+QUESTION = ("Does this team rule apply to the coding task in the state (its bean title and the repository paths it "
+            "is expected to touch), so that the agent doing the task has to follow it? Rule:\n")
+MAX_RULE = 1200
+MAX_TITLE = 300
+MAX_PATHS_CHARS = 1200
+PREAMBLE = "(preamble)"
+
+
+def parse_sections(text):
+    """Split on `## ` headings outside code fences. The texts rejoin to the file byte for byte."""
+    out, cur, fenced = [], [], False
+    key = PREAMBLE
+    for line in text.splitlines(keepends=True):
+        if line.startswith("```"):
+            fenced = not fenced
+        if not fenced and line.startswith("## "):
+            if cur:
+                out.append((key, "".join(cur)))
+            key, cur = line[3:].strip(), []
+        cur.append(line)
+    if cur:
+        out.append((key, "".join(cur)))
+    seen, sections = {}, []
+    for i, (key, body) in enumerate(out):
+        seen[key] = seen.get(key, 0) + 1
+        sections.append({"i": i, "key": key if seen[key] == 1 else "%s #%d" % (key, seen[key]), "text": body})
+    return sections
+
+
+def question_text(section):
+    return QUESTION + section["text"].strip()[:MAX_RULE]
+
+
+def question_sha(section):
+    return hashlib.sha256(question_text(section).encode()).hexdigest()[:16]
+
+
+def section_sha(section):
+    """Hashes the whole section, not the truncated question: an edit past MAX_RULE is still a rule Jev was never
+    tuned on, so the section must be kept."""
+    return hashlib.sha256((QUESTION + section["text"]).encode()).hexdigest()[:16]
+
+
+def prompt_sha():
+    blob = json.dumps({"q": QUESTION, "rule": MAX_RULE, "title": MAX_TITLE, "paths": [MAX_PATHS, MAX_PATHS_CHARS]},
+                      sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def project_state(title, paths, summary=""):
+    """What leaves the machine: the title and the paths, redacted. The summary is never sent."""
+    clean = lambda s: re.sub(r"\s+", " ", REDACT.sub("", s or "")).strip()
+    return {"bean_title": clean(title)[:MAX_TITLE],
+            "touched_paths": clean(", ".join(paths))[:MAX_PATHS_CHARS]}
+
+
+def read_key():
+    key = config.get("TYPESAFE_API_KEY", "").strip()
+    if key:
+        return key
+    return open(os.path.expanduser("~/.config/typesafe/api_key")).read().strip()
+
+
+def ask_jev(state, sections, timeout=15.0, opener=urllib.request.urlopen):
+    """{'ok': True, 'p': {section key: probability}} or {'ok': False, 'reason'}. Never raises."""
+    try:
+        key = read_key()
+    except OSError:
+        return {"ok": False, "reason": "missing_secret"}
+    if not key:
+        return {"ok": False, "reason": "missing_secret"}
+    qids = {"q%02d" % i: s["key"] for i, s in enumerate(sections)}
+    questions = {q: {"type": "noul", "instructions": question_text(s)} for q, s in zip(qids, sections)}
+    body = json.dumps({"state": state, "model": "jev-latest", "questions": questions}).encode()
+    req = urllib.request.Request(URL, data=body, headers={"Authorization": "Bearer " + key,
+                                                          "Content-Type": "application/json"})
+    try:
+        answers = json.load(opener(req, timeout=timeout))["answers"]
+        p = {qids[q]: float(answers[q]["noul"]) for q in qids}
+        # A malformed probability must not decide whether a rule is shown; NaN fails the range check too.
+        if not all(0.0 <= v <= 1.0 for v in p.values()):
+            return {"ok": False, "reason": "invalid_response"}
+        return {"ok": True, "p": p}
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "reason": "invalid_response"}
+    except Exception:
+        return {"ok": False, "reason": "transport_error"}
+
+
+def select(sections, judgement, policy):
+    """Pure. -> (kept sections in file order, basis). Every doubt keeps everything."""
+    if not judgement.get("ok"):
+        return sections, "full:jev_unavailable:" + judgement.get("reason", "unknown")
+    if not policy:
+        return sections, "full:no_policy"
+    if not policy.get("qualified"):
+        return sections, "full:policy_not_qualified"
+    if policy.get("prompt_sha") != prompt_sha():
+        return sections, "full:prompt_changed_since_tuning"
+    try:
+        t = float(policy.get("threshold", 0.0))
+        per = {k: float(v) for k, v in (policy.get("thresholds") or {}).items()}
+    except (AttributeError, TypeError, ValueError):
+        return sections, "full:policy_invalid"
+    # json.load accepts NaN, and a NaN threshold would silently drop its rule.
+    if not all(0.0 <= v <= 1.0 for v in [t, *per.values()]):
+        return sections, "full:policy_invalid"
+    always, tuned = set(policy.get("always") or ()), policy.get("tuned") or {}
+    kept = [s for s in sections
+            if s["key"] in always or tuned.get(s["key"]) != section_sha(s)
+            or judgement["p"].get(s["key"], 1.0) >= per.get(s["key"], t)]
+    return kept, "selected"
+
+
+def render(kept, peers_path, basis):
+    if basis == "selected":
+        head = ("## Fleet rules for this bean\n\nThese %d sections of %s were selected for this bean and are copied "
+                "verbatim. The full rulebook stays at that path: read the section you need when the work goes "
+                "outside what these cover." % (len(kept), peers_path))
+    else:
+        head = ("## Fleet rules for this bean\n\nThe rulebook could not be narrowed (%s), so all of %s follows."
+                % (basis, peers_path))
+    parts = []
+    for section in sorted(kept, key=lambda s: s["i"]):
+        text = section["text"]
+        if config.get("FLEET_LESSONS_ANNOTATE") == "1":
+            try:
+                import fleet_lessons
+                ids = fleet_lessons.ids_for_rule(section["key"])
+            except Exception:
+                ids = []
+            if ids and text.startswith("## "):
+                lines = text.splitlines(keepends=True)
+                lines[0] = lines[0].rstrip("\n") + " [" + ",".join(ids) + "]\n"
+                text = "".join(lines)
+        parts.append(text)
+    return head + "\n\n" + "".join(parts).rstrip("\n") + "\n"
+
+
+def load_policy(path):
+    try:
+        return json.load(open(path))
+    except (OSError, ValueError):
+        return None
+
+
+def default_policy_path():
+    """The repo layout (bin/../rulebook/policy.json), else the installed copy install.sh writes."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    repo = os.path.join(here, "..", "rulebook", "policy.json")
+    if os.path.exists(repo):
+        return repo
+    return os.path.join(config["DROVER_HOME"],"rulebook/policy.json")
+
+
+def parse_args(argv):
+    if len(argv) < 2 or not re.fullmatch(r"[A-Za-z0-9_.-]+", argv[1]) or argv[1].startswith("."):
+        return None
+    opts, rest = {"bean": argv[1]}, argv[2:]
+    while rest:
+        flag = rest.pop(0)
+        if flag not in ("--title", "--paths") or not rest:
+            return None
+        opts[flag[2:]] = rest.pop(0)
+    return opts
+
+
+def main(argv):
+    opts = parse_args(argv)
+    if opts is None:
+        print(__doc__, file=sys.stderr)
+        return 64
+    bean = opts["bean"]
+    peers_path = config.get("FLEET_RULEBOOK_PEERS", config.get("DROVER_RULES", os.path.join(config["DROVER_CONFIG_DIR"],"PEERS.md")))
+    try:
+        sections = parse_sections(open(peers_path).read())
+    except OSError:
+        return 2
+    started = time.monotonic()
+    try:
+        title, paths = opts.get("title"), None
+        if "paths" in opts:
+            paths = [p.strip() for p in opts["paths"].split(",") if p.strip()]
+        if title is None or paths is None:
+            root = config.get("FLEET_ROOT", config.get("DROVER_REPO", os.getcwd()))
+            btitle, body = bean_from_main(root, bean)
+            title = btitle if title is None else title
+            paths = extract_paths(body) if paths is None else paths
+        policy = load_policy(config.get("FLEET_RULEBOOK_POLICY", default_policy_path()))
+        if config.get("FLEET_RULEBOOK", "on") == "off":
+            judgement = {"ok": False, "reason": "switched_off"}
+        elif not title:
+            judgement = {"ok": False, "reason": "no_bean_title"}
+        else:
+            judgement = ask_jev(project_state(title, paths), sections)
+        kept, basis = select(sections, judgement, policy)
+    except Exception:
+        kept, basis = sections, "full:error"
+    out = render(kept, peers_path, basis)
+    sys.stdout.write(out)
+    try:
+        state_dir = config.get("FLEET_STATE", config["FLEET_STATE"])
+        os.makedirs(state_dir, exist_ok=True)
+        rec = {"at": datetime.now().isoformat(timespec="seconds"), "bean": bean, "basis": basis,
+               "selected": len(kept), "sections": len(sections), "chars": len(out),
+               "kept_chars": sum(len(s["text"]) for s in kept),
+               "full_chars": sum(len(s["text"]) for s in sections), "kept": [s["key"] for s in kept],
+               "latency_ms": int((time.monotonic() - started) * 1000)}
+        with open(os.path.join(state_dir, "rulebook.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except Exception:
+        sys.exit(2)

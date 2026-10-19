@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""fleet-stale-jobs — production jobs the backend itself reports as stopped, each mapped to an open bean (retro 2026-10-18 rule 1).
+
+The backend prints `[Error Tracking] {"message":"job \\"X\\" has not completed a run started since <ISO> ...` at every watchdog tick
+(jobScheduler.ts checkStaleness). Nobody read it: sample-daily-job drafted nothing for a week. This reads those lines, keeps the
+latest per job, drops jobs younger than 24 h, and names the open bean that mentions the job. A stale job with no bean is UNOWNED.
+
+  fleet-stale-jobs [--hours N] [--min-age-hours H] [--log-file F] [--beans-json F] [--repo DIR] [--now ISO]
+
+Exit 0: no stale job, or every stale job has an owner. 1: an unowned stale job. 2: could not measure (never a pass).
+Read-only: CloudWatch Logs query + `beans query` over .beans as origin/main has them (fetched; --repo, default $FLEET_REPO or\n~/IdeaProjects/project), never the cwd's.
+"""
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1] / "lib"))
+from fleet_config import configure
+config=configure(export=__name__=="__main__")
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
+
+import datetime as dt, json, os, re, subprocess, sys, tempfile, time
+
+GROUP = config.get('FLEET_JOBS_LOG_GROUP', config.get('DROVER_PROD_LOG_GROUP', ''))
+REPO = config.get('FLEET_REPO', config.get('DROVER_REPO',os.getcwd()))
+# The bean that asks for this sweep names every job; it must not count as their owner.
+NOT_AN_OWNER = set(config.get('DROVER_JOB_SWEEP_BEANS', '').split())
+LINE = re.compile(r'job \\?"([a-z0-9][a-z0-9-]*)\\?" has not completed a run started since (\d{4}-\d\d-\d\dT[\d:.]+Z)')
+
+
+def parse_stale(lines, now, min_age_hours=24.0):
+    """{job: age_hours} for jobs whose last started run is older than min_age_hours; the newest report per job wins."""
+    last = {}
+    for line in lines:
+        m = LINE.search(line)
+        if not m:
+            continue
+        started = dt.datetime.fromisoformat(m.group(2).replace('Z', '+00:00'))
+        last[m.group(1)] = max(started, last.get(m.group(1), started))
+    ages = {j: (now - s).total_seconds() / 3600 for j, s in last.items()}
+    return {j: a for j, a in ages.items() if a >= min_age_hours}
+
+
+def owners(job, beans):
+    """Open beans whose title or body names the job (whole-token match, so `echo` does not own `sample-daily-job`)."""
+    token = re.compile(r'(?<![a-z0-9-])' + re.escape(job) + r'(?![a-z0-9-])', re.I)
+    return sorted(b['id'] for b in beans
+                  if b['id'] not in NOT_AN_OWNER and b.get('status') not in ('completed', 'scrapped')
+                  and token.search(f"{b.get('title', '')}\n{b.get('body', '')}"))
+
+
+def report(stale, beans):
+    """(markdown lines, unowned job names)."""
+    out, unowned = [], []
+    for job, age in sorted(stale.items(), key=lambda kv: -kv[1]):
+        own = owners(job, beans)
+        if not own:
+            unowned.append(job)
+        out.append(f"- {job}: stale {age / 24:.1f} d — " + (', '.join(own) if own else 'UNOWNED'))
+    return out, unowned
+
+
+def cloudwatch_lines(hours):
+    if not GROUP: raise RuntimeError('no log group configured')
+    end = int(time.time())
+    query = ('fields @message | filter @message like /has not completed a run started since/ '
+             '| sort @timestamp desc | limit 2000')
+    qid = subprocess.run(['aws', 'logs', 'start-query', '--log-group-name', GROUP, '--start-time', str(end - int(hours * 3600)),
+                          '--end-time', str(end), '--query-string', query, '--query', 'queryId', '--output', 'text'],
+                         capture_output=True, text=True, timeout=60, check=True).stdout.strip()
+    for _ in range(100):
+        r = json.loads(subprocess.run(['aws', 'logs', 'get-query-results', '--query-id', qid, '--output', 'json'],
+                                      capture_output=True, text=True, timeout=60, check=True).stdout)
+        if r['status'] == 'Complete':
+            return [f['value'] for row in r['results'] for f in row if f['field'] == '@message']
+        if r['status'] in ('Failed', 'Cancelled', 'Timeout'):
+            break
+        time.sleep(3)
+    raise RuntimeError('log query did not complete')
+
+
+def open_beans(repo):
+    """Open beans as origin/main has them, whatever the cwd: a seat's worktree can be days behind (UNOWNED false alarms)."""
+    git = lambda *a: subprocess.run(['git', '-C', repo, *a], capture_output=True, check=True, timeout=120)
+    git('fetch', '-q', 'origin', 'main')
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = git('archive', 'origin/main', '.beans', '.beans.yml').stdout
+        subprocess.run(['tar', '-x', '-C', tmp], input=archive, check=True, timeout=60)
+        q = '{ beans(filter: { excludeStatus: ["completed", "scrapped"] }) { id title body status } }'
+        return json.loads(subprocess.run(['beans', '--config', f'{tmp}/.beans.yml', '--beans-path', f'{tmp}/.beans', 'query', '--json', q],
+                                         cwd=tmp, capture_output=True, text=True, timeout=120, check=True).stdout)['beans']
+
+
+def main(argv):
+    def opt(name, default=None):
+        return argv[argv.index(name) + 1] if name in argv else default
+    now = dt.datetime.fromisoformat(opt('--now').replace('Z', '+00:00')) if opt('--now') else dt.datetime.now(dt.timezone.utc)
+    try:
+        lines = open(opt('--log-file')).read().splitlines() if opt('--log-file') else cloudwatch_lines(float(opt('--hours', 6)))
+        beans = json.load(open(opt('--beans-json'))) if opt('--beans-json') else open_beans(opt('--repo', REPO))
+    except Exception as e:  # unmeasured is not a pass
+        print(f'- UNMEASURED: {type(e).__name__}')
+        return 2
+    stale, = [parse_stale(lines, now, float(opt('--min-age-hours', 24)))]
+    out, unowned = report(stale, beans)
+    red, off = ('\033[31m', '\033[0m') if sys.stdout.isatty() else ('', '')
+    print('\n'.join(l.replace('UNOWNED', f'{red}UNOWNED{off}') for l in out) if out else '- none')
+    return 1 if unowned else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""One Jev call for a changed fleet pane: a state Choice over allowlisted features.
+
+Reads {"pane_text": "..."} on stdin and writes a compact JSON result. This
+classifier only advises the observer. It cannot confirm a push or complete a
+task; origin/main ancestry remains a separate mechanical check.
+"""
+
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1] / "lib"))
+from fleet_config import configure
+config=configure(export=__name__=="__main__")
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
+
+import json
+import os
+import re
+import sys
+import urllib.request
+
+
+STATES = {
+    "working": "The current turn is actively progressing: a spinner, tool execution, streaming output, or a live background operation. A queued follow-up question alone does not mean it stopped.",
+    "waiting_on_question": "A question, approval, or selection UI is currently awaiting a human response. The agent is not still actively running its turn.",
+    "provider_error": "The current attempt cannot proceed because of a provider, authentication, network, quota, billing, or session error. Ignore older error text if newer output shows recovery.",
+    "stuck_loop": "The current attempt is repeatedly retrying or waiting without new progress, and is neither an ordinary long-running command nor a human question.",
+    "finished": "The turn ended and the agent is at an idle input prompt or a completed-result screen. An older error in scrollback does not override a newer completion.",
+}
+STATE_QUESTION = (
+    "You are given a STRUCTURED FEATURE SET extracted from a coding agent's "
+    "terminal pane. No pane text is included, by design. "
+    "live_activity names the current activity ('working', "
+    "'waiting_background_terminal', 'thinking', 'exploring', 'streaming') or is "
+    "null when nothing is running. composer_present means an idle input prompt is "
+    "visible. completion_lines_from_end counts lines up from the bottom of the "
+    "pane to a turn-completion marker. question_ui_present with question_kind "
+    "'queued' means a question is waiting in a queue while the agent may still be "
+    "working; 'blocking' means the agent is stopped on it. error_signature and "
+    "error_lines_from_end locate the most recent known error class. "
+    "push_claim_marker says the visible pane claims a push. *_lines_from_end are "
+    "measured from the LAST line, so 1 is the bottom. tail_line_classes lists the "
+    "class of each of the final lines, oldest first. "
+    "Use the OFFSETS, not just presence: a marker far from the bottom is stale "
+    "scrollback and must not override newer evidence. Choose one state."
+)
+MIN_CONFIDENCE = 0.82  # conservative pilot value; historical calibration is still blocked
+# The key name may carry an environment-style prefix or suffix, because
+# AWS_SECRET_ACCESS_KEY= and OPENAI_API_KEY= are the shapes that actually reach a
+# pane. Requiring the keyword to butt against the separator missed both.
+SECRET = re.compile(
+    # Authorization consumes the scheme AND its credential: redacting only
+    # "Authorization: Basic" would leave the base64 secret in the tail.
+    r"(?i)\bauthorization\s*[:=]\s*(?:bearer|basic|token|digest)?\s*[\"']?[^\s,'\";]+|"
+    # Credentials embedded in a connection URL (postgres://user:pass@host).
+    r"\b[a-z][a-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@|"
+    r"\b[A-Za-z0-9_.-]*(?:api[_-]?key|token|password|secret|credential|authorization)"
+    # The key may be quoted, as it is in JSON and YAML config echoed to a pane:
+    # {"password":"hunter2"} must not slip through on the closing quote.
+    r"[A-Za-z0-9_.-]*[\"']?\s*[:=]\s*"
+    r"(?:['\"]?)[^\s,'\";]{5,}|\b(?:sk-|ghp_|gho_|github_pat_|xox[abp]-|AKIA)[A-Za-z0-9_\-]{8,}"
+)
+# Labels whose elapsed timer advances on its own. A pane is support evidence
+# once per state, not once per second, so the timer is erased before panes are
+# counted as distinct. This rule must stay identical to the observer's
+# pane_fingerprint; test-pane-judge-calibration asserts the two agree.
+LIVE_ACTIVITY = re.compile(
+    r"\b(Working|Waiting for background terminal|Thinking|Exploring|Streaming)"
+    # Seconds are optional when an hour or minute component is present: a pane
+    # parked on a long job renders "3h 04m", not "3h 04m 11s".
+    r" \((\d+h\s*)?(\d+m\s*)?(\d+s)?(?=\s*(?:•|\)))"
+)
+TOKEN_COUNTER = re.compile(r"[⠁-⣿]*\s*Running [\d.]+[kKmM]? tokens")
+
+
+
+
+# --- Egress allowlist (bean-s2hd) -------------------------------------------
+# No pane TEXT is sent. Features are derived from the pane, but every value is
+# drawn from these closed vocabularies or is a count or an offset, so the payload
+# has a fixed alphabet. A credential cannot appear because no code path copies
+# pane text into the request, so there is nothing for a denylist to miss.
+LIVE_ACTIVITY_CLASS = {
+    "Working": "working",
+    "Waiting for background terminal": "waiting_background_terminal",
+    "Thinking": "thinking",
+    "Exploring": "exploring",
+    "Streaming": "streaming",
+}
+ELAPSED_BUCKETS = ("under_1m", "1m_to_10m", "10m_to_1h", "over_1h")
+QUESTION_KINDS = ("blocking", "queued", None)
+# Error signatures are the classes the retired regex observer keyed on, so the
+# features provably cover every known-bad shape it was built to catch.
+ERROR_SIGNATURES = {
+    "usage_limit": (r"usage limit|monthly spending limit|rate limit exceeded|"
+                    r"hit your [a-z ]{0,12}limit|weekly limit|out of credits|buy more credits"),
+    "account_suspended": r"is suspended|account suspended",
+    "signin_required": r"please sign in again|access token could not be refreshed|unauthorized",
+    "billing": r"payment required|card declined|insufficient funds",
+    # Named for what was actually seen on a seat, not for a guess: a generic
+    # error marker is its own class, and "schema not found" is distinct.
+    "quota_exceeded": r"quota exceeded|insufficient_quota|exceeded your current quota|"
+                      r"you (?:have )?hit your [a-z ]{0,12}limit|out of credits|buy more credits",
+    "build_failure": r"error: [A-Za-z]*(?:TS\d{4}|build)[\s\S]{0,40}|"
+                      r"npm ERR!|TypeScript error|build failed|compilation (?:failed|error)",
+    "error_marker": r"✖\s*Error|(?<![\w])Error:",
+    "schema_error": r"schema ['\"]?[\w-]+['\"]? not found|schema .* not installed",
+    "command_failed": r"Failed \(exit \d+\)|npm ERR!|fatal:",
+}
+PUSH_CLAIM = (r"\bpush(?:ed|ing)?\b|\blanded\b|\bancestry\b|"
+              r"\bpush(?:ed)?\b[^.\n]{0,30}?\borigin/main\b|"
+              r"\borigin/main\b[^.\n]{0,30}?\bpush(?:ed)?\b")
+PUSH_TARGET_OTHER = r"\b(?:branch|feature[- ]branch|pr|head)\b"
+# "not pushed" and "pushed" are opposite answers to the Noul, so the negation is
+# a feature rather than a detail the classifier has to notice in prose.
+# Must span the same verbs PUSH_CLAIM matches, or "No changes landed on
+# origin/main" reads as a positive claim.
+PUSH_NEGATED = (r"\b(?:not|never|no|none|nothing|n't)\b[^.\n]{0,40}?"
+                r"\b(?:pushed?|landed|origin/main|ancestry)\b|unpushed|"
+                r"push (?:failed|rejected|denied)|failed to push|"
+                r"push (?:was|were) (?:failed|rejected|denied)|could ?n[o']t push|did not push")
+COMPLETION = r"Worked for \d+[hms]"
+# A push phrase can be the agent's own claim or text pasted from a task brief.
+# The Noul is told to reject the latter, so the distinction has to be a feature
+# rather than something the classifier could only judge from prose.
+PUSH_CONTEXT = {"recap": r"Recap|↳|Summary", "task_brief": r"task brief|brief|instruction"}
+# "Have the changes been pushed?" is the seat ASKING, not claiming. Without this
+# the same features answer both, and an asking seat raises a false claim alert.
+PUSH_ASKED = r"\b(?:have|has|had|did|does|do|should|can|could|is|are|was|were)\b[^?\n]{0,40}\bpushed\b[^?\n]*\?|\bpushed\b[^?\n]{0,20}\?"
+# "will be pushed" is an intention. The retained raw-text payload carried the
+# tense to Jev; a feature set must carry it explicitly or it raises a false
+# push-claim alert for a push that has not happened.
+PUSH_INTENDED = (r"\b(?:will|would|shall|should|can|could|may|might|going to|to be)\b"
+                 r"[^.\n]{0,24}?\bpush(?:ed)?\b|\bnext:?\s*push\b")
+# An instruction TO the agent is not a claim BY it. "Please push to origin/main"
+# asked of the seat is the opposite of "Pushed to origin/main" reported by it.
+PUSH_INSTRUCTED = (r"^\s*(?:please\s+)?(?:push|re-?push|force-?push)\b|"
+                   r"\b(?:please|you should|you must|go ahead and|now)\s+(?:\w+\s+){0,2}push\b")
+COMPOSER_GLYPH = r"^\s*[›❯>]\s*\S"
+QUESTION_BLOCKING = (r"Question \d+ of \d+|How should I proceed\?|"
+                     r"Enter[:\s]*(?:to\s+)?(?:select|submit|confirm)|^\s*[❯>]\s*\d+\.\s")
+QUESTION_QUEUED = r"Queued follow-up|\?\s*\d+\s*question|⌥\+↑ to answer|to answer$"
+
+LINE_CLASSES = (
+    "live_activity", "composer", "completion", "question_ui", "error_signature",
+    "push_claim", "token_counter", "other", "blank",
+)
+FEATURE_VOCABULARIES = {
+    "live_activity": tuple(sorted(set(LIVE_ACTIVITY_CLASS.values()))),
+    "push_claim_context": tuple(sorted(PUSH_CONTEXT)) + ("agent_output",),
+    "push_claim_target": ("origin_main", "other", "unknown"),
+    "elapsed_bucket": ELAPSED_BUCKETS,
+    "question_kind": ("blocking", "queued"),
+    "error_signature": tuple(sorted(ERROR_SIGNATURES)),
+}
+FEATURE_KEYS = (
+    "line_count", "live_activity", "live_activity_lines_from_end", "elapsed_bucket",
+    "composer_present",
+    "completion_lines_from_end", "question_ui_present", "question_kind",
+    "question_lines_from_end", "error_signature", "error_lines_from_end",
+    "push_claim_marker", "push_claim_lines_from_end", "push_claim_negated",
+    "push_claim_context", "push_claim_interrogative", "push_claim_intended",
+    "push_claim_instructed", "push_claim_target", "tail_line_classes",
+)
+
+
+def _line_class(text):
+    if not text.strip():
+        return "blank"
+    if LIVE_ACTIVITY.search(text) or TOKEN_COUNTER.search(text):
+        return "live_activity"
+    if re.search(COMPLETION, text):
+        return "completion"
+    if re.search(QUESTION_QUEUED, text) or re.search(QUESTION_BLOCKING, text):
+        return "question_ui"
+    if any(re.search(pattern, text, re.I) for pattern in ERROR_SIGNATURES.values()):
+        return "error_signature"
+    if re.search(PUSH_CLAIM, text, re.I):
+        return "push_claim"
+    if re.search(COMPOSER_GLYPH, text):
+        return "composer"
+    return "other"
+
+
+def _elapsed_bucket(activity_match):
+    """Bucket the timer from the LIVE_ACTIVITY match that already captured it."""
+    def part(index):
+        found = re.search(r"\d+", activity_match.group(index) or "")
+        return int(found.group()) if found else 0
+
+    hours = part(2)
+    minutes = part(3)
+    seconds = part(4)
+    total = hours * 3600 + minutes * 60 + seconds
+    if total < 60:
+        return "under_1m"
+    if total < 600:
+        return "1m_to_10m"
+    if total < 3600:
+        return "10m_to_1h"
+    return "over_1h"
+
+
+def _push_asked(lines):
+    for line in reversed(lines):
+        if re.search(PUSH_CLAIM, line, re.I):
+            return bool(re.search(PUSH_ASKED, line, re.I))
+    return False
+
+
+def _push_intended(lines):
+    for line in reversed(lines):
+        if re.search(PUSH_CLAIM, line, re.I):
+            return bool(re.search(PUSH_INTENDED, line, re.I))
+    return False
+
+
+def _push_target(lines):
+    """Where the push went. Only origin/main is the DONE signal this watches."""
+    for line in reversed(lines):
+        if not re.search(PUSH_CLAIM, line, re.I):
+            continue
+        if re.search(r"origin/main", line, re.I):
+            return "origin_main"
+        if re.search(PUSH_TARGET_OTHER, line, re.I):
+            return "other"
+        return "unknown"
+    return "unknown"
+
+
+def _push_instructed(lines):
+    for line in reversed(lines):
+        if re.search(PUSH_CLAIM, line, re.I):
+            return bool(re.search(PUSH_INSTRUCTED, line, re.I))
+    return False
+
+
+def _push_context(lines):
+    """Where the nearest push phrase sits: the agent's own recap, or pasted text."""
+    for index, line in enumerate(reversed(lines)):
+        if not re.search(PUSH_CLAIM, line, re.I):
+            continue
+        window = " ".join(lines[max(0, len(lines) - index - 2):len(lines) - index + 1])
+        for name, pattern in PUSH_CONTEXT.items():
+            if re.search(pattern, window, re.I):
+                return name
+        return "agent_output"
+    return None
+
+
+def _last_offset(lines, pattern, flags=re.I):
+    for offset, line in enumerate(reversed(lines)):
+        if re.search(pattern, line, flags):
+            return offset + 1
+    return None
+
+
+def extract_features(pane_text):
+    """The complete, closed description of a pane that may leave this host.
+
+    Only the booleans, bucketed ages, marker offsets and line classes below are
+    produced. No substring of the pane is copied into the result, so there is no
+    credential, prompt, figure, path, email or customer name to leak, and no
+    denylist that could miss one.
+    """
+    lines = pane_text.splitlines()
+    features = {key: None for key in FEATURE_KEYS}
+    features["line_count"] = len(lines)
+    last_content = next((line for line in reversed(lines) if line.strip()), "")
+    features["composer_present"] = bool(re.search(COMPOSER_GLYPH, last_content))
+
+    for offset, line in enumerate(reversed(lines), start=1):
+        activity = LIVE_ACTIVITY.search(line)
+        if activity:
+            features["live_activity"] = LIVE_ACTIVITY_CLASS[activity.group(1)]
+            features["live_activity_lines_from_end"] = offset
+            features["elapsed_bucket"] = _elapsed_bucket(activity)
+            break
+
+    features["completion_lines_from_end"] = _last_offset(lines, COMPLETION, 0)
+    features["push_claim_lines_from_end"] = _last_offset(lines, PUSH_CLAIM)
+    features["push_claim_marker"] = features["push_claim_lines_from_end"] is not None
+    features["push_claim_context"] = _push_context(lines)
+    features["push_claim_interrogative"] = _push_asked(lines)
+    features["push_claim_intended"] = _push_intended(lines)
+    features["push_claim_instructed"] = _push_instructed(lines)
+    features["push_claim_target"] = _push_target(lines)
+    negated_at = _last_offset(lines, PUSH_NEGATED)
+    features["push_claim_negated"] = (negated_at is not None and
+                                      (features["push_claim_lines_from_end"] is None or
+                                       negated_at <= features["push_claim_lines_from_end"]))
+
+    queued = _last_offset(lines, QUESTION_QUEUED)
+    blocking = _last_offset(lines, QUESTION_BLOCKING)
+    if queued is None and blocking is None:
+        features["question_kind"] = None
+        features["question_ui_present"] = False
+    else:
+        # Smaller offset is nearer the bottom, i.e. NEWER. The most recent
+        # question UI is the one the seat is actually sitting on.
+        if queued is None:
+            nearest, kind = blocking, "blocking"
+        elif blocking is None:
+            nearest, kind = queued, "queued"
+        else:
+            nearest, kind = (queued, "queued") if queued <= blocking else (blocking, "blocking")
+        features["question_kind"] = kind
+        features["question_ui_present"] = True
+        features["question_lines_from_end"] = nearest
+
+    for offset, line in enumerate(reversed(lines), start=1):
+        for name, pattern in ERROR_SIGNATURES.items():
+            if re.search(pattern, line, re.I):
+                features["error_signature"] = name
+                features["error_lines_from_end"] = offset
+                break
+        if features["error_signature"]:
+            break
+
+    features["tail_line_classes"] = [_line_class(line) for line in lines[-12:]]
+    return features
+
+
+def redact(text):
+    return SECRET.sub("[REDACTED]", text)
+
+
+def stable_pane(text):
+    """Pane content with self-advancing counters removed.
+
+    Only the elapsed timer after a live-activity label and the token counter are
+    erased. "Worked for 2h 6m 11s" is left alone: it is what marks a turn
+    finished, and erasing it would make a finished pane look identical to a
+    working one.
+    """
+    stable = LIVE_ACTIVITY.sub(lambda m: f"{m.group(1)} (TIME", text)
+    return TOKEN_COUNTER.sub("Running COUNT tokens", stable)
+
+
+def egress_features(pane_text):
+    """The complete payload body allowed to leave this host.
+
+    A structured feature set, not a scrubbed string: there is no intermediate
+    text to sanitise, so a caller cannot reintroduce one by building its own
+    payload. Kept as a named seam because the benchmark used to build its own.
+    """
+    return extract_features(pane_text)
+
+
+def jev(payload):
+    with open(os.path.expanduser("~/.config/typesafe/api_key"), encoding="utf-8") as handle:
+        key = handle.read().strip()
+    if not key:
+        raise ValueError("empty TypeSafe key")
+    request = urllib.request.Request(
+        "https://api.typesafe.ai/v1/systemone",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=6) as response:
+        return json.load(response)["answers"]
+
+
+def classify(pane_text, ask=jev):
+    unknown = {"state": "unknown", "confidence": 0.0, "reason": "invalid_or_empty_pane"}
+    if not isinstance(pane_text, str) or not pane_text.strip():
+        return unknown
+    payload = {
+        "model": "jev-latest",
+        "state": {"pane_features": egress_features(pane_text)},
+        "questions": {
+            "state": {"type": "choice", "instructions": STATE_QUESTION, "criteria": STATES},
+        },
+    }
+    try:
+        answers = ask(payload)
+        state = answers["state"]["choice"]
+        confidence = answers["state"]["confidence"]
+        if state not in STATES or isinstance(confidence, bool) or not isinstance(confidence, (int, float)) \
+                or not 0 <= confidence <= 1:
+            raise ValueError("invalid Jev answer")
+    except Exception:
+        return {**unknown, "reason": "jev_unavailable_or_invalid"}
+    if confidence < MIN_CONFIDENCE:
+        return {"state": "unknown", "confidence": confidence, "reason": "low_confidence"}
+    return {"state": state, "confidence": confidence, "reason": "jev_choice"}
+
+
+def main():
+    try:
+        pane = json.load(sys.stdin)["pane_text"]
+    except (KeyError, TypeError, ValueError):
+        pane = ""
+    print(json.dumps(classify(pane), sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

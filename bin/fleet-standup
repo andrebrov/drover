@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 # fleet-standup — one bounded screen: agent states, new reports (headline only),
 # review verdicts since the last standup. Never prints report bodies.
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 set +u
 # shellcheck source=drover-env
 . "$(dirname "$0")/drover-env"
-mkdir -p "$DROVER_HOME"
+mkdir -p "$DROVER_HOME" "$FLEET_REPORTS"
+OUT="$FLEET_REPORTS/standup-$(date +%Y%m%d-%H%M%S).md"
+exec 3>&1
+exec >"$OUT"
+ownership=0 board=0 stale=0
 MARK="$DROVER_HOME/.standup-mark"
 SINCE_ARGS=(); [ -f "$MARK" ] && SINCE_ARGS=(-newer "$MARK")
 echo "== agents =="
@@ -19,3 +29,22 @@ find "$FLEET_REPORTS" -maxdepth 1 -name '*.md' "${SINCE_ARGS[@]}" -mmin -720 2>/
   fi
 done
 touch "$MARK"
+
+echo '== Current ownership =='
+"$DROVER_BIN/fleet-claims-audit" --repo "${DROVER_REPO:-$PWD}" || ownership=$?
+echo '== Production migrations (watcher inventory) =='
+if [ -n "${DROVER_MIGRATIONS_DIR:-}" ]; then python3 "$DROVER_SRC/lib/fleet_pending_migrations.py" report --state "$FLEET_STATE"; else echo 'UNAVAILABLE: no migrations inventory configured'; fi
+echo '== Production stale jobs =='
+if [ -n "${DROVER_STALE_JOBS_COMMAND:-}" ]; then
+  PGOPTIONS="${PGOPTIONS:-} -c default_transaction_read_only=on" bash -c "$DROVER_STALE_JOBS_COMMAND" || stale=$?
+else echo 'UNAVAILABLE: no application stale-job command configured'; fi
+echo '== Scoreboard (stamped measurement) =='
+latest=$(ls -t "$FLEET_REPORTS"/measure/*.json 2>/dev/null | head -1)
+python3 "$DROVER_SRC/lib/fleet_stamp.py" read "${latest:-/nonexistent}" 21600 "$DROVER_BIN/fleet-measure" landings_4h unlanded_branches_60m stuck_seats prod_lag_commits || board=$?
+echo '== Lessons =='
+"$DROVER_BIN/fleet-lessons" standup
+cat "$OUT" >&3
+printf '%s\n' "$OUT" >&3
+[ "$ownership" -eq 0 ] || exit "$ownership"
+[ "$stale" -eq 0 ] || exit "$stale"
+[ "$board" -eq 0 ] || exit 3

@@ -6,6 +6,12 @@ origin/main (it owns its uncommitted work).
 
   fleet-stale-worktree [--max N]     default N=300; exit 1 when any seat is stale
 """
+
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1]/"lib"))
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
 import json
 import os
 import subprocess
@@ -35,7 +41,7 @@ off = set(open(f'{STATE}/harness-off').read().split()) if os.path.exists(f'{STAT
 bad = 0
 for a in agents:
     name, cwd = a.get('name') or '', a.get('cwd') or ''
-    if not name or name in LEADS or a.get('agent') in off or not os.path.isdir(cwd):
+    if a.get('agent_status') not in ('working','blocked') or not name or name in LEADS or a.get('agent') in off or not os.path.isdir(cwd):
         continue
     top = run('git', '-C', cwd, 'rev-parse', '--show-toplevel').stdout.strip()
     common = run('git', '-C', cwd, 'rev-parse', '--git-common-dir').stdout.strip()

@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Review-cycle detection (bean-hkvd): alert the lead when a bean's review rounds keep
+finding the SAME defect class in new words — a cycle that looks productive.
+
+  fleet-cycle-detect <bean> [--reports-dir DIR] [--dry-run]
+
+Reads the bean's review reports (fleet-reports files naming the bean and "review"),
+ordered by time. A ROUND is one submission: consecutive reports reviewing the same coder's
+attempt (the `-by-<coder>` suffix) of the same commit (named in the report header) are one round with their findings combined — several
+reviewers agreeing on one submission is consensus, not a cycle. For each window of three consecutive rounds
+it asks Jev (TypeSafe systemone, one `noul` question) whether a finding in the latest
+round is the same KIND of defect as a finding in each of the two rounds before it —
+wording does not matter, that is the point. A window is only asked when every round in
+it carries a live finding: a round whose only findings are LOW notes in an APPROVE
+verdict (a disclosed deferral) or that has none breaks a streak, deterministically.
+The first window at or above the tuned threshold (cycle-detect/policy.json, tuned on the
+labelled baseline) prints the alert and sends ONE lead alert (`fleet-alert send`,
+once per bean, ever: a sent marker persists in the state dir) with the architectural
+question. The alert carries the bean id and round numbers only — never review prose or a report
+file name, which are agent-written and forwarded into the lead's prompt. Each window is scored
+once and its score kept in the state dir, so a rerun cannot re-roll Jev's noise. It never scraps, pushes, lands,
+applies a migration or answers a dialog: report text is agent output (untrusted), so the
+result only ALERTS. Jev unavailable, a prompt changed since tuning, or a policy whose held-out
+measurement did not earn `"qualified": true` (then Jev is not even asked unless --dry-run):
+no alert, and the reason is printed. The Jev key is read inside the process, never in argv.
+
+Exit 0 on a readable bean; 64 on bad input.
+"""
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1] / "lib"))
+from fleet_config import configure
+config=configure(export=__name__=="__main__")
+from fleet_usage import gate as _fleet_gate
+from fleet_review_reports import parse_report, redact, reports_for, reviewed_commit, rounds_of
+_fleet_gate(_fleet_sys.argv, __file__)
+
+import hashlib
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_POLICY = os.path.join(HERE, "..", "cycle-detect", "policy.json")
+URL = "https://api.typesafe.ai/v1/systemone"
+
+MAX_TITLE = 200
+
+QUESTION = (
+    "Three consecutive code-review rounds of one task are given, oldest first, each as its verdict and its findings. "
+    "Does at least one finding in the LATEST round describe the same KIND of defect as a finding in EACH of the two "
+    "earlier rounds — the same underlying problem (fixing its root cause would have prevented the others), even when "
+    "worded differently, about different lines, or presented as new? A pending founder or operator step, or a "
+    "disclosed deferral, is not a defect.")
+def prompt_sha():
+    return hashlib.sha256(QUESTION.encode()).hexdigest()[:16]
+
+
+def live_findings(round_):
+    """The findings a round can carry a class with: a LOW note in an approving verdict is a disclosed deferral."""
+    return [(sev, t) for sev, t in round_["findings"] if not (round_["verdict"] == "APPROVE" and sev == "LOW")]
+
+
+def live(round_):
+    return bool(live_findings(round_))
+
+
+def window_state(rounds):
+    return {"rounds": [{"verdict": r["verdict"] or "UNKNOWN",
+                        "findings": ["%s: %s" % (sev, redact(t)[:MAX_TITLE]) for sev, t in live_findings(r)]}
+                       for r in rounds]}
+
+
+def read_key():
+    key = config.get("TYPESAFE_API_KEY", "").strip()
+    if key:
+        return key
+    return open(os.path.expanduser("~/.config/typesafe/api_key")).read().strip()
+
+
+def ask_jev(state, timeout=15.0, opener=urllib.request.urlopen):
+    """{'ok': True, 'p': float} or {'ok': False, 'reason'}. Never raises."""
+    try:
+        key = read_key()
+    except OSError:
+        return {"ok": False, "reason": "missing_secret"}
+    if not key:
+        return {"ok": False, "reason": "missing_secret"}
+    body = json.dumps({"state": state, "model": "jev-latest",
+                       "questions": {"same_class": {"type": "noul", "instructions": QUESTION}}}).encode()
+    req = urllib.request.Request(URL, data=body, headers={"Authorization": "Bearer " + key,
+                                                          "Content-Type": "application/json"})
+    try:
+        p = float(json.load(opener(req, timeout=timeout))["answers"]["same_class"]["noul"])
+        if not (math.isfinite(p) and 0.0 <= p <= 1.0):  # NaN would pass any threshold: reject
+            return {"ok": False, "reason": "invalid_response"}
+        return {"ok": True, "p": p}
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "reason": "invalid_response"}
+    except Exception:
+        return {"ok": False, "reason": "transport_error"}
+
+
+def averaged(ask, samples):
+    """Jev's answer for one window varies run to run (measured: up to 0.10); the mean of `samples` answers is
+    what is compared to the threshold. Any failed sample makes the window unavailable."""
+    def ask_mean(state):
+        ps = []
+        for _ in range(max(1, samples)):
+            a = ask(state)
+            if not a.get("ok"):
+                return a
+            ps.append(a["p"])
+        return {"ok": True, "p": sum(ps) / len(ps)}
+    return ask_mean
+
+
+def remembered(ask, path, samples):
+    """Each window is scored once, ever: its averaged p is recorded under the bean's state and reused, so a live
+    detector that re-reads history on every run does not give Jev's noise a fresh chance at an old window (and it
+    scores exactly what the held-out eval scored). Failures are not recorded."""
+    try:
+        with open(path) as f:
+            seen = json.load(f)
+    except (OSError, ValueError):
+        seen = {}
+
+    def ask_once(state):
+        key = hashlib.sha256((prompt_sha() + "#%d#" % samples + json.dumps(state, sort_keys=True)).encode()).hexdigest()
+        if key in seen:
+            return {"ok": True, "p": seen[key]}
+        answer = ask(state)
+        if answer.get("ok"):
+            seen[key] = answer["p"]
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(seen, f)
+            os.replace(tmp, path)
+        return answer
+    return ask_once
+
+
+def first_cycle(rounds, threshold, ask=ask_jev):
+    """rounds: [{'verdict', 'findings': [(severity, title)]}] in time order. Returns
+    {'round': i (1-based), 'p', 'evidence'} for the first qualifying window, {'unavailable': reason}
+    if Jev could not answer a window that needed asking, or None."""
+    for i in range(2, len(rounds)):
+        window = rounds[i - 2:i + 1]
+        if not all(live(r) for r in window):
+            continue
+        answer = ask(window_state(window))
+        if not answer.get("ok"):
+            return {"unavailable": answer.get("reason", "unknown"), "round": i + 1}
+        if answer["p"] >= threshold:
+            return {"round": i + 1, "p": answer["p"], "reports": [r.get("reports", []) for r in window]}
+    return None
+
+
+def alert_lead(bean, hit, alert):
+    # The body is forwarded into the lead's prompt, so nothing agent-written rides in it — no review prose and no
+    # report file name (agents choose those too). Only the validated bean id, numbers and our own words; the report
+    # list is in cycle-detect.jsonl for the lead to open deliberately.
+    title = "cycle: %s (round %d)" % (bean, hit["round"])
+    body = ("Review rounds %d-%d of %s keep finding the same kind of defect (Jev p=%.2f). Three rounds fixing "
+            "instances of one class usually means the design produces the class (e.g. a classifier instead of "
+            "keywords). Read the reports (listed in fleet-watch/state/cycle-detect.jsonl) and decide the "
+            "architecture before round %d; nothing was scrapped." % (hit["round"] - 2, hit["round"], bean, hit["p"],
+                                                                      hit["round"] + 1))
+    if not alert or not os.access(alert, os.X_OK):
+        return False
+    try:
+        return subprocess.run([alert, "send", "cycle-" + bean, title, body], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=30).returncode == 0
+    except Exception:
+        return False
+
+
+def main(argv):
+    args = argv[1:]
+    dry = "--dry-run" in args
+    args = [a for a in args if a != "--dry-run"]
+    reports_dir = config.get("FLEET_REPORTS", config["FLEET_REPORTS"])
+    if "--reports-dir" in args:
+        i = args.index("--reports-dir")
+        reports_dir = args[i + 1]
+        del args[i:i + 2]
+    if len(args) != 1 or not re.fullmatch(r"[a-z0-9]+-[a-z0-9]+", args[0]):
+        print("usage: fleet-cycle-detect <bean> [--reports-dir DIR] [--dry-run]", file=sys.stderr)
+        return 64
+    bean = args[0]
+    with open(config.get("FLEET_CYCLE_POLICY", DEFAULT_POLICY)) as f:
+        policy = json.load(f)
+    if policy.get("prompt_sha") != prompt_sha():
+        print("no-alert %s: prompt changed since tuning — re-run cycle-detect/eval.py" % bean)
+        return 0
+    # Only a policy whose held-out measurement earned it may reach the lead (cycle-detect/eval-*.json). Unqualified,
+    # nothing is scored — no report text leaves the machine — unless the lead asked to observe with --dry-run.
+    if not dry and policy.get("qualified") is not True:
+        print("no-alert %s: policy not qualified — observe with --dry-run" % bean)
+        return 0
+    state = config.get("FLEET_STATE", config["FLEET_STATE"])
+    samples = policy.get("samples", 1)
+    rounds = rounds_of(reports_for(bean, reports_dir))
+    ask = remembered(averaged(ask_jev, samples), os.path.join(state, "cycle-scores", bean + ".json"), samples)
+    hit = first_cycle(rounds, policy["threshold"], ask)
+    if hit is None:
+        print("no-cycle %s (%d rounds)" % (bean, len(rounds)))
+        return 0
+    if "unavailable" in hit:
+        print("no-alert %s: jev unavailable (%s) at round %d" % (bean, hit["unavailable"], hit["round"]))
+        return 0
+    print("cycle: %s (round %d, p=%.2f)" % (bean, hit["round"], hit["p"]))
+    if dry:
+        return 0
+    marker = os.path.join(state, "cycle-alerted", bean)
+    if os.path.exists(marker):  # once per bean, ever: fleet-alert's own dedup expires
+        print("already alerted %s" % bean)
+        return 0
+    sent = alert_lead(bean, hit, config.get("FLEET_ALERT", os.path.join(config["DROVER_BIN"],"fleet-alert")))
+    os.makedirs(os.path.dirname(marker), exist_ok=True)
+    if sent:
+        with open(marker, "w") as f:
+            f.write("%s round %d\n" % (datetime.now().isoformat(timespec="seconds"), hit["round"]))
+    with open(os.path.join(state, "cycle-detect.jsonl"), "a") as f:
+        f.write(json.dumps({"at": datetime.now().isoformat(timespec="seconds"), "bean": bean, "round": hit["round"],
+                            "p": hit["p"], "reports": hit["reports"], "alert_sent": sent}) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

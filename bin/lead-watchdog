@@ -4,6 +4,12 @@
 # older than DROVER_TAKEOVER_SEC (default 45 min) this sends ONE prompt to the backup-lead seat and sets a
 # flag; the flag clears when the heartbeat is fresh again. launchd keeps it running (dev.drover.lead-watchdog).
 # shellcheck source=drover-env
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 . "$(dirname "$0")/drover-env"
 HB="$FLEET_STATE/lead-heartbeat"; FLAG="$FLEET_STATE/lead-takeover"; LOG="$(dirname "$FLEET_STATE")/watchdog.log"
 BACKUP="${DROVER_BACKUP_LEAD:-lead-backup}"; LIMIT="${DROVER_TAKEOVER_SEC:-2700}"

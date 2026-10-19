@@ -35,7 +35,7 @@ git checkout -q fleet/p-bean-aaaa
 expect "fleet-done: DONE with this bean's commit unlanded -> exit 7" 7 fd coder bean-aaaa DONE all
 if cut -f4,5 "$DROVER_HOME/inbox"/* 2>/dev/null | grep -q 'BLOCKED.*wanted DONE'; then ok "fleet-done: refusal delivered as BLOCKED keeping '[wanted DONE]'"; else bad "fleet-done: refusal delivered as BLOCKED keeping '[wanted DONE]'"; fi
 expect "fleet-done: a different bean on the same branch does not block -> exit 0" 0 fd coder bean-zzzz DONE x
-expect "fleet-done: BLOCKED is always allowed -> exit 0" 0 fd coder bean-aaaa BLOCKED "need decision"
+expect "fleet-done: unlanded BLOCKED is refused -> exit 7" 7 fd coder bean-aaaa BLOCKED "need decision"
 FLEET_UNLANDED_OK="depends on S9 decision" fd coder bean-aaaa PARTIAL p >/dev/null 2>&1; wrc=$?
 if [ $wrc = 0 ] && grep -q 'depends on S9 decision' "$DROVER_HOME/reports/unlanded-waivers.log" && grep -q 'tail-A' "$DROVER_HOME/reports/unlanded-waivers.log"; then ok "fleet-done: a waiver is allowed AND logged with the reason and the subjects"; else bad "fleet-done: waiver (rc=$wrc)"; fi
 git checkout -q -b scratch-not-a-fleet-name fleet/p-bean-aaaa

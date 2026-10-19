@@ -8,6 +8,12 @@
 #   * the switch uses --no-overwrite-ignore: a collision STOPS the dispatch (exit 3) instead of overwriting; a missing bean file is exit 4
 #   * the shared checkout (DROVER_REPO) is refused
 # `fleet assign` calls this and does NOT dispatch when it fails; run it by hand to recover a seat that reported BLOCKED on a dirty tree.
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/drover-env"
 [ $# -ge 2 ] || { echo "usage: fleet-prep <seat> <bean> [worktree]" >&2; exit 64; }
@@ -18,6 +24,7 @@ git -C "$DROVER_REPO" fetch -q origin main
 cd "$wt"
 [ "$(pwd -P)" != "$(cd "$DROVER_REPO" && pwd -P)" ] || { echo "refusing: $wt is the shared checkout" >&2; exit 2; }
 tgt="fleet/$seat-$bean"; base=origin/main; git show-ref --verify -q "refs/heads/$tgt" && base="$tgt"
+"$DROVER_BIN/fleet-seat-live" "$(pwd -P)" >&2 || { echo "fleet-prep: live process; nothing touched (exit 7)" >&2; exit 7; }
 stamp=$(date +%Y%m%d%H%M%S)-$$
 if [ -n "$(git status --porcelain)" ]; then
   w="wip/$seat-$stamp"; bak="$DROVER_HOME/prep-backups/$seat-$stamp"; mkdir -p "$bak"
@@ -32,6 +39,20 @@ if git show-ref --verify -q "refs/heads/$tgt"; then
   git switch -q --no-overwrite-ignore "$tgt" || { echo "fleet-prep: switch to $tgt would overwrite ignored files; stopped (exit 3)" >&2; exit 3; }
 else
   git switch -q --no-overwrite-ignore -c "$tgt" origin/main || { echo "fleet-prep: switch would overwrite ignored files; stopped (exit 3)" >&2; exit 3; }
+fi
+# 2026-10-18: an old branch with no own patches is an old base, not unfinished work.
+if [ -z "$(git cherry origin/main HEAD | grep '^+')" ] && [ "$(git rev-list --count HEAD..origin/main)" -gt 0 ]; then
+  git reset -q --keep origin/main || exit 3
+fi
+if [ -n "${DROVER_GRAPH_DIR:-}" ] && [ -d "$DROVER_GRAPH_DIR" ] && [ ! -L graphify-out ]; then
+  if [ -e graphify-out ]; then
+    bak="$DROVER_HOME/prep-backups/$seat-$stamp"; mkdir -p "$bak"
+    mv graphify-out "$bak/graphify-out"
+  fi
+  ln -s "$DROVER_GRAPH_DIR" graphify-out
+fi
+if [ "${DROVER_SHARED_NM:-0}" = 1 ]; then
+  "$DROVER_BIN/fleet-shared-nm" link "$(pwd -P)" "$(pwd -P)" --archive-real >/dev/null || { echo 'fleet-prep: shared node_modules not linked (exit 6)' >&2; exit 6; }
 fi
 ls .beans/"${bean}"--* >/dev/null 2>&1 || { echo "fleet-prep: bean file for $bean not found on $tgt" >&2; exit 4; }
 echo "$seat ready on $(git branch --show-current) @ $(git rev-parse --short HEAD)"

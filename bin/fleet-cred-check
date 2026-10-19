@@ -7,6 +7,12 @@
 #   "aws:prod|aws sts get-caller-identity --profile prod"), the refill daemon's heartbeat (log mtime), and on macOS the
 #   login keychain (the real cause of repeated "token invalid": the keychain locks for background processes).
 # Env: DROVER_CRED_CHECKS  DROVER_REFILL_LABEL (launchd label shown in the restart hint)  FLEET_REFILL_STALE (seconds, default 600)
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/drover-env"
 bad=0
 chk() { if "${@:2}" >/dev/null 2>&1; then echo "ok    $1"; else echo "DEAD  $1"; bad=1; fi; }

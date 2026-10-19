@@ -1,577 +1,647 @@
 #!/usr/bin/env python3
-"""fleet-observe — read-only exception view of the fleet; alerts, never acts.
+"""Fleet observer: native pane advice, bounded children and origin ancestry for completion.
 
-The observer half of "one manager" (see LESSONS.md "Two managers collide"): with `state/observer`
-present, fleet-watch calls this instead of its normal dispatch/review/land lanes. It reads panes,
-git and the board, and only ever calls `fleet-alert send` (deduped per key) or prints for watch.log.
-It NEVER presses a key, reassigns a bean, lands or pushes.
-
-  fleet-observe            run checks, alert on exceptions
-  fleet-observe --board    print the assignment ledger (owner, bean, branch, last proof of progress)
-  fleet-observe --dry      run checks, print what would alert, send nothing
-
-See docs/RUNBOOK.md "Observer mode" for the operating model this implements.
+2026-10-18: pane status is advisory; missing evidence never releases task ownership.
 """
+
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1] / "lib"))
+from fleet_config import configure
+config=configure(export=__name__=="__main__")
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
+
+import contextlib
 import hashlib
 import json
 import os
 import re
+import shlex
+import signal
 import subprocess
 import sys
+import tempfile
 import time
-
-# A timed-out child must never kill the whole observe pass: one `git merge` that hit its 30s timeout raised
-# TimeoutExpired, the pass died after 1357s, and the fleet saw a 45-minute stall. Every subprocess.run in this
-# file goes through this wrapper: a timeout becomes rc 124 with empty output, like coreutils `timeout`.
-_run = subprocess.run
+from concurrent.futures import ThreadPoolExecutor
 
 
-def _safe_run(*a, **kw):
-    try:
-        return _run(*a, **kw)
-    except subprocess.TimeoutExpired as e:
-        empty = '' if kw.get('text') else b''
-        return subprocess.CompletedProcess(e.cmd, 124, empty, empty)
-
-
-subprocess.run = _safe_run
-
+HOME = os.path.expanduser("~")
+TASKS = config['FLEET_TASKS']
+REPORTS = config['FLEET_REPORTS']
+STATE = config['FLEET_STATE']
+REPO = config.get('DROVER_REPO') or config.get('FLEET_ROOT') or os.getcwd()
+SENT = f"{STATE}/observe-sent"
+PANE_CACHE = f"{STATE}/observe-pane-jev.json"
+QUEUE = f"{STATE}/lead-queue"
+POOL = f"{STATE}/lead-pool"
+PANE_JUDGE = config.get("FLEET_PANE_JUDGE", os.path.join(os.path.dirname(__file__), "fleet-pane-judge"))
+STALL_MIN = int(config.get("FLEET_STALL_MIN", "30"))
+PROD_GROUP = config.get("DROVER_PROD_LOG_GROUP", "")
 NOW = time.time()
-STALL_MIN = int(os.environ.get('FLEET_STALL_MIN', '30'))
-# Optional: an hourly check for stalled scheduled jobs in your own deploy's logs. Off unless set — see
-# README "Configuration". Any log source that can answer "what stalled in the last 15 minutes" fits;
-# this default assumes AWS CloudWatch Logs, but the check is skipped entirely with nothing configured.
-PROD_LOG_GROUP = os.environ.get('DROVER_PROD_LOG_GROUP', '')
-PROD_LOG_REGION = os.environ.get('DROVER_PROD_LOG_REGION', 'us-east-1')
+DRY = "--dry" in sys.argv
+REPORT_OF = {}
 
 
-def drover_env():
-    """The same config every bash script sees: source drover-env (next to this file) and read it back."""
-    env = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drover-env')
-    out = subprocess.run(
-        ['bash', '-c', '. "$0"; printf "%s\\0%s\\0%s\\0%s\\0%s\\0%s\\0%s\\0%s\\0%s\\0%s" "$DROVER_REPO" "$FLEET_TASKS" '
-         '"$FLEET_REPORTS" "$FLEET_STATE" "$DROVER_HOME" "$DROVER_LEAD_SEATS" "$DROVER_SRC" '
-         '"$DROVER_SELF_SERVE" "$DROVER_MIGRATIONS_STATUS" "$DROVER_OWNED_AREAS"', env],
-        capture_output=True, text=True, check=True).stdout.split('\0')
-    return dict(zip(('repo', 'tasks', 'reports', 'state', 'home', 'leads', 'src', 'self_serve', 'mig_status', 'owned_areas'), out))
-
-
-CFG = drover_env()
-REPO, TASKS, REPORTS, STATE = CFG['repo'], CFG['tasks'], CFG['reports'], CFG['state']
-
-# Harness-level failures read off a seat's screen -> (pattern, meaning, disable the harness?).
-# Add your own harness's known error text here the same way. Order matters: more specific first.
-DEAD = [
-    (r'Account \S+ is suspended|monthly spending limit', 'billing suspended', True),
-    (r"(you'?ve|you have) hit your usage limit|usage limit reached|rate limit reached|try again at \d",
-     'usage limit', True),
-    (r'http_status"?:\s*402|Payment Required', 'payment required (402)', True),
-    # opencode out of credits: the seat keeps status 'working' while it waits hours to retry (five seats sat ~3h unseen)
-    (r'insufficient balance', 'out of credits', True),
-    # ...but "Free usage exceeded" is ONE free model's cap, not the harness: alert, never disable. Disabling on it
-    # switched off a whole harness whose other models still had quota.
-    (r'Free usage exceeded', 'free-model usage cap hit (switch the seat to another model, or wait)', False),
-    (r'keychain is locked', 'macOS login keychain locked — unlock it inside herdr (security unlock-keychain)', False),
-    (r'Not logged in|Run /login|access token could not be refreshed|Please sign in again',
-     'not logged in / stale login — restart the seat (a fresh process picks up the current login)', False),
-    (r'open in another app', 'conversation open in another app (press R in the pane)', False),
-    (r'agent executor error|write: broken pipe|request failed: Post|network issue connecting to the server',
-     'transient provider/network error mid-task — its edits are in the worktree; prompt it to continue', False),
-    (r'Question \d+ of \d+|How should I proceed\?',
-     'waiting on a question it asked (herdr reports this as done, not blocked) — read the pane and answer', False),
-    (r'not inside herdr|HERDR_ENV is not 1',
-     'lost herdr context after a resume; confirm it in a prompt or relaunch the seat', False),
-]
-
-
-def sh(*a, timeout=20, cwd=None):
-    # Own process group, killed whole on timeout: a timed-out `git fetch` left its git-remote-https child holding
-    # the output pipe, subprocess.run waited on that pipe forever, and the watcher tick froze for 50 minutes.
+def sh(*args, timeout=20, cwd=None, input_text=None):
     try:
-        p = subprocess.Popen(a, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd,
-                             start_new_session=True)
+        # A descendant retaining the pipe must not survive a timed-out fetch/judge.
+        process = subprocess.Popen(args, stdin=subprocess.PIPE if input_text is not None else None,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   cwd=cwd, start_new_session=True)
         try:
-            return p.communicate(timeout=timeout)[0]
+            return process.communicate(input=input_text, timeout=timeout)[0]
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(p.pid, 9)
-            except OSError:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
                 pass
-            p.communicate()
-            return ''
+            process.communicate()
+            return ""
     except Exception:
-        return ''
+        return ""
 
 
-def git(*a):
-    return sh('git', '-C', REPO, *a).strip()
-
-
-# The pane ends in the harness's own API error (the turn was dropped), not in a question or a finish.
-HARNESS_ERR = re.compile(r'Something went wrong\. Please try again|stream closed with error|stream disconnected|'
-                         r'API Error: (5\d\d|Overloaded|Connection)|ECONNRESET.*(anthropic|openai|cursor)', re.I)
-SENT = f'{STATE}/observe-sent'   # key -> last alert epoch; one alert per key per 6h
-
-
-def review_landed(line):
-    """True when the SHA a REVIEW-NEEDED line names has an equivalent patch on origin/main (git cherry '-')."""
-    m = re.search(r'\b([0-9a-f]{7,40})\b', line)
-    if not m:
-        return False
-    r = subprocess.run(['git', '-C', REPO, 'cherry', 'origin/main', m.group(1), m.group(1) + '~1'],
-                       capture_output=True, text=True, timeout=30)
-    out = [l for l in r.stdout.splitlines() if l.strip()]
-    return r.returncode == 0 and len(out) == 1 and out[0].startswith('- ')
-
-
-def on_main(sha):
-    """True when sha is on origin/main OR its patch landed there under another SHA (a rebase before push).
-    Comparing raw SHAs alone false-alarmed on every rebased landing."""
-    if subprocess.run(['git', '-C', REPO, 'merge-base', '--is-ancestor', sha, 'origin/main'],
-                      capture_output=True, timeout=30).returncode == 0:
-        return True
-    r = subprocess.run(['git', '-C', REPO, 'cherry', 'origin/main', sha, sha + '^'],
-                       capture_output=True, text=True, timeout=30)
-    return r.returncode == 0 and r.stdout.strip().startswith('-')
+def git(*args):
+    return sh("git", "-C", REPO, *args).strip()
 
 
 def alert(key, title, body):
-    sent = dict(l.split('\t', 1) for l in open(SENT).read().split('\n') if '\t' in l) if os.path.exists(SENT) else {}
+    if os.path.exists(SENT):
+        with open(SENT) as handle:
+            sent = dict(line.split("\t", 1) for line in handle if "\t" in line)
+    else:
+        sent = {}
     if key in sent and NOW - float(sent[key]) < 6 * 3600:
         return
-    print(f'{key}: {title} — {body}')
-    if '--dry' not in sys.argv:
+    print(f"{key}: {title} — {body}")
+    if not DRY:
         sent[key] = str(NOW)
-        open(SENT, 'w').write('\n'.join(f'{k}\t{v}' for k, v in sent.items() if NOW - float(v) < 86400))
-        sh(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fleet-alert'),
-           'send', key, title, body, timeout=30)
+        with open(SENT, "w") as handle:
+            handle.write("\n".join(f"{k}\t{v}" for k, v in sent.items() if NOW - float(v) < 86400))
+        sh(os.path.join(config["DROVER_BIN"], "fleet-alert"), "send", key, title, body, timeout=30)
 
 
 def agents():
-    # herdr drops a seat's name when it re-detects the agent (a fresh session, a restart): several seats went
-    # unnamed at once and became unaddressable, so dispatch and prompts failed. Remember pane -> seat for every
-    # named seat; rename an unnamed agent sitting on a remembered pane.
     try:
-        lst = json.loads(sh('herdr', 'agent', 'list'))['result']['agents']
+        roster = json.loads(sh("herdr", "agent", "list", timeout=60))["result"]["agents"]
+        path = os.path.join(STATE, "pane-seat.json")
+        try:
+            with open(path) as handle:
+                remembered = json.load(handle)
+            if not isinstance(remembered, dict):
+                remembered = {}
+        except (OSError, ValueError):
+            remembered = {}
+        changed = False
+        for agent in roster:
+            name, pane = agent.get("name"), agent.get("pane_id")
+            if name and pane and name in {s.split(":")[0] for s in config["DROVER_ROSTER"].split()} and name not in config["DROVER_LEAD_SEATS"].split() and remembered.get(pane) != name:
+                remembered[pane] = name
+                changed = True
+        named = {agent.get("name") for agent in roster if agent.get("name")}
+        for agent in roster:
+            pane = agent.get("pane_id")
+            name = remembered.get(pane)
+            if not agent.get("name") and name and name not in named and not DRY:
+                try:
+                    result = subprocess.run(["herdr", "agent", "rename", pane, name], capture_output=True, timeout=15)
+                    if result.returncode == 0:
+                        agent["name"] = name
+                        named.add(name)
+                except subprocess.TimeoutExpired:
+                    pass
+        if changed and not DRY:
+            os.makedirs(STATE, exist_ok=True)
+            with tempfile.NamedTemporaryFile("w", dir=STATE, delete=False) as handle:
+                json.dump(remembered, handle)
+                temporary = handle.name
+            os.replace(temporary, path)
+        return {agent["name"]: agent for agent in roster if agent.get("name")}
     except Exception:
         return {}
-    mp_file = f'{STATE}/pane-seat.json'
-    try:
-        mp = json.load(open(mp_file))
-    except Exception:
-        mp = {}
-    leads = set(CFG['leads'].split())
-    changed = False
-    for a in lst:
-        n, pane = a.get('name'), a.get('pane_id')
-        if n and pane and n not in leads and mp.get(pane) != n:
-            mp[pane] = n; changed = True
-    named = {a.get('name') for a in lst if a.get('name')}
-    for a in lst:
-        pane = a.get('pane_id')
-        seat = mp.get(pane) if pane else None
-        if not a.get('name') and seat and seat not in named and '--dry' not in sys.argv:
-            r = subprocess.run(['herdr', 'agent', 'rename', pane, seat], capture_output=True, text=True, timeout=15)
-            if r.returncode == 0:
-                a['name'] = seat; named.add(seat); print(f'RENAMED {pane} -> {seat}')
-    if changed:
-        tmp = mp_file + '.tmp'; json.dump(mp, open(tmp, 'w')); os.replace(tmp, mp_file)
-    return {a['name']: a for a in lst if a.get('name')}
 
 
 def screen(name):
-    return sh('herdr', 'agent', 'read', name, '--source', 'visible', '--lines', '40')
-
-
-REPORT_OF = {}
+    return sh("herdr", "agent", "read", name, "--source", "visible", "--lines", "40")
 
 
 def ledger():
     rows = []
     for seat in sorted(os.listdir(TASKS)) if os.path.isdir(TASKS) else []:
-        f = os.path.join(TASKS, seat)
-        if seat.startswith('.') or not os.path.isfile(f):
-            continue   # .branches/ and .dispatch-locks/ live beside the task files
-        parts = open(f).read().split('\t')
-        bean = parts[1].strip() if len(parts) > 1 else '?'
-        rows.append((seat, bean, os.path.getmtime(f)))
+        path = os.path.join(TASKS, seat)
+        if seat.startswith(".") or not os.path.isfile(path):
+            continue
+        with open(path) as handle:
+            parts = handle.read().split("\t")
+        bean = parts[1].strip() if len(parts) > 1 else "?"
+        rows.append((seat, bean, os.path.getmtime(path)))
         if len(parts) > 3 and parts[3].strip():
-            REPORT_OF[(seat, bean)] = parts[3].strip()   # the report path the assignment recorded
+            REPORT_OF[(seat, bean)] = parts[3].strip()
     return rows
 
 
 def progress(seat, bean, since):
-    """Newest proof of progress: a commit on the bean branch or a report file, as epoch seconds."""
-    best = since
-    br = f'fleet/{seat}-{bean}'
-    # agents often work on suffixed branches (fleet/<seat>-<bean>-registry, -core, ...): newest commit on any
-    refs = git('for-each-ref', '--sort=-committerdate', '--format=%(committerdate:unix) %(refname:short)',
-               f'refs/heads/{br}', f'refs/heads/{br}-*')
+    best, branch = since, f"fleet/{seat}-{bean}"
+    refs = git("for-each-ref", "--sort=-committerdate", "--format=%(committerdate:unix) %(refname:short)",
+               f"refs/heads/{branch}", f"refs/heads/{branch}-*")
     for line in refs.splitlines()[:1]:
-        t, name = line.split(' ', 1)
-        if t.isdigit():
-            best = max(best, int(t)); br = name
-    # ...and seats often name the branch after a bean they FILED, not the queue item: any commit on this seat's
-    # branches made after the dispatch is progress on its current assignment (one was flagged "stalled" with
-    # four fresh commits on a differently named branch).
+        stamp, name = line.split(" ", 1)
+        if stamp.isdigit():
+            best, branch = max(best, int(stamp)), name
     if best == since:
-        for line in git('for-each-ref', '--sort=-committerdate', '--format=%(committerdate:unix) %(refname:short)',
-                        f'refs/heads/fleet/{seat}-*').splitlines()[:1]:
-            t, name = line.split(' ', 1)
-            if t.isdigit() and int(t) > since:
-                best = int(t); br = name
-    for fn in os.listdir(REPORTS) if os.path.isdir(REPORTS) else []:
-        if bean in fn and fn.endswith('.md'):
-            best = max(best, os.path.getmtime(os.path.join(REPORTS, fn)))
-    rp = REPORT_OF.get((seat, bean))
-    if rp and os.path.exists(rp):
-        best = max(best, os.path.getmtime(rp))
-    return best, br
+        refs = git("for-each-ref", "--sort=-committerdate", "--format=%(committerdate:unix) %(refname:short)",
+                   f"refs/heads/fleet/{seat}-*")
+        for line in refs.splitlines()[:1]:
+            stamp, name = line.split(" ", 1)
+            if stamp.isdigit() and int(stamp) > since:
+                best, branch = int(stamp), name
+    for filename in os.listdir(REPORTS) if os.path.isdir(REPORTS) else []:
+        if bean in filename and filename.endswith(".md"):
+            best = max(best, os.path.getmtime(os.path.join(REPORTS, filename)))
+    report = REPORT_OF.get((seat, bean))
+    if report and os.path.exists(report):
+        best = max(best, os.path.getmtime(report))
+    return best, branch
+
+
+LIVE_ACTIVITY = re.compile(
+    r"\b(Working|Waiting for background terminal|Thinking|Exploring|Streaming)"
+    # Identical to fleet-pane-judge's rule; a drift test asserts the two agree,
+    # and a mismatch would re-hash a parked pane on every tick.
+    r" \((\d+h\s*)?(\d+m\s*)?(\d+s)?(?=\s*(?:•|\)))"
+)
+
+
+def pane_fingerprint(text):
+    # A running timer changes every tick but is not a new state. Do not cache
+    # pane text itself; only a hash of its stable visible content. Only the
+    # elapsed timer after a live-activity label is erased: "Worked for 2h 6m
+    # 11s" is what marks a turn finished and must stay in the hash.
+    stable = LIVE_ACTIVITY.sub(lambda m: f"{m.group(1)} (TIME", text)
+    stable = re.sub(r"[⠁-⣿]*\s*Running [\d.]+[kKmM]? tokens", "Running COUNT tokens", stable)
+    return hashlib.sha256(stable.encode("utf-8", errors="replace")).hexdigest()
+
+
+def classify_changed(seat, pane, cache, judge):
+    if not pane.strip():
+        return {"state": "unknown", "confidence": 0.0, "reason": "empty_pane"}
+    digest = pane_fingerprint(pane)
+    prior = cache.get(seat)
+    if isinstance(prior, dict) and prior.get("hash") == digest and isinstance(prior.get("result"), dict):
+        try:
+            unchanged = max(0, NOW - float(prior.get("observed_at", NOW)))
+        except (TypeError, ValueError):
+            unchanged = 0
+        # A cache row written before the push-claim Noul was dropped still
+        # carries claims_pushed_probability; never hand a retired key back out.
+        carried = {k: v for k, v in prior["result"].items() if k != "claims_pushed_probability"}
+        return {**carried, "pane_unchanged_seconds": unchanged}
+    try:
+        result = judge(pane)
+        if result.get("state") not in ("working", "waiting_on_question", "provider_error", "stuck_loop", "finished", "unknown"):
+            raise ValueError("invalid pane decision")
+    except Exception:
+        result = {"state": "unknown", "confidence": 0.0, "reason": "judge_unavailable"}
+    cache[seat] = {"hash": digest, "result": result, "observed_at": NOW}
+    return {**result, "pane_unchanged_seconds": 0}
+
+
+def call_pane_judge(pane):
+    result = sh(PANE_JUDGE, timeout=8, input_text=json.dumps({"pane_text": pane}))
+    try:
+        return json.loads(result)
+    except ValueError:
+        return {"state": "unknown", "confidence": 0.0, "reason": "judge_unavailable"}
+
+
+def pane_states(roster):
+    try:
+        if os.path.exists(PANE_CACHE):
+            with open(PANE_CACHE) as handle:
+                cache = json.load(handle)
+        else:
+            cache = {}
+        if not isinstance(cache, dict):
+            cache = {}
+    except (OSError, ValueError):
+        cache = {}
+    cache = {seat: entry for seat, entry in cache.items()
+             if isinstance(entry, dict) and isinstance(entry.get("hash"), str)
+             and isinstance(entry.get("result"), dict)}
+    seats = [name for name in roster if re.search(r"coder|reviewer|analyst", name)]
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        panes = dict(zip(seats, pool.map(screen, seats)))
+        changed = [name for name in seats if panes[name].strip() and
+                   cache.get(name, {}).get("hash") != pane_fingerprint(panes[name])]
+        fresh = dict(zip(changed, pool.map(call_pane_judge, (panes[name] for name in changed))))
+    decisions = {name: classify_changed(name, panes[name], cache,
+                                        lambda _, n=name: fresh[n]) for name in seats}
+    if not DRY:
+        os.makedirs(STATE, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=STATE, prefix="observe-pane-", delete=False) as handle:
+            json.dump(cache, handle, sort_keys=True)
+            temp = handle.name
+        os.replace(temp, PANE_CACHE)
+    return decisions
+
+
+def completion_proof(report_text, is_ancestor):
+    """A report or pane claim is never proof without an origin/main SHA check."""
+    first = report_text.splitlines()[0].strip() if report_text.splitlines() else ""
+    if re.match(r"^BLOCKED\b", first):
+        return "blocked"
+    if not re.match(r"^(?:DONE|LANDED|APPROVE)\b", first):
+        return "none"
+    match = re.search(r"\b[0-9a-f]{9,40}\b", first)
+    if not match:
+        return "not_pushed"
+    return "landed" if is_ancestor(match.group()) else "not_pushed"
+
+
+def on_origin(sha):
+    try:
+        return subprocess.run(["git", "-C", REPO, "merge-base", "--is-ancestor", sha, "origin/main"],
+                              capture_output=True, timeout=10).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
 
 
 def board():
-    ag = agents()
+    roster = agents()
     print(f"{'seat':18} {'bean':11} {'status':8} {'last proof':>10}  branch")
-    for seat, bean, t0 in ledger():
-        p, br = progress(seat, bean, t0)
-        st = ag.get(seat, {}).get('agent_status', 'absent')
-        print(f'{seat:18} {bean:11} {st:8} {int((NOW - p) / 60):>7}min  {br}')
+    for seat, bean, start in ledger():
+        proof, branch = progress(seat, bean, start)
+        status = roster.get(seat, {}).get("agent_status", "absent")
+        print(f"{seat:18} {bean:11} {status:8} {int((NOW - proof) / 60):>7}min  {branch}")
+
+
+def dispatch(roster, off):
+    if not os.path.exists(QUEUE) or not os.path.exists(POOL):
+        return
+    with open(POOL) as handle:
+        pool_raw = [line.strip() for line in handle if line.strip()]
+    pool = [line.split(":")[0] for line in pool_raw]
+    named_only = {line.split(":")[0] for line in pool_raw if line.endswith(":named")}
+    with open(QUEUE) as handle:
+        lines = [line.rstrip("\n") for line in handle if line.strip()]
+    assignments = ledger()
+    held = {seat for seat, _, _ in assignments}
+    taken = {bean for _, bean, _ in assignments}
+    owner_dir = os.path.join(STATE, "owner")
+    if os.path.isdir(owner_dir):
+        taken.update(os.listdir(owner_dir))
+    lines = [line for line in lines if line.split("\t", 1)[0] == "self-serve" or
+             line.split("\t", 1)[0] not in taken]
+    idle = []
+    for seat in pool:
+        agent = roster.get(seat)
+        if not agent or agent.get("agent") in off or seat in held or agent.get("agent_status") not in ("idle", "done"):
+            continue
+        pick = next((i for i, line in enumerate(lines)
+                     if len(line.split("\t")) >= 3 and
+                     ((seat in line.split("\t")[1].split(",")) if seat in named_only else
+                      (line.split("\t")[1] == "*" or agent.get("agent") in line.split("\t")[1].split(",") or
+                       seat in line.split("\t")[1].split(",")))), None)
+        if pick is None:
+            idle.append(seat)
+            continue
+        bean, target, prompt = lines.pop(pick).split("\t", 2)
+        report = os.path.join(REPORTS, f"{seat}-{bean}.md")
+        if DRY:
+            print(f"WOULD-DISPATCH {bean} -> {seat}")
+            continue
+        with open(os.path.join(TASKS, seat), "w") as handle:
+            handle.write(f"{int(NOW)}\t{bean}\tnone\t{report}\n")
+        outcome = subprocess.run(["herdr", "agent", "prompt", seat,
+                                  prompt + f" Report to {report} (first line = verdict + pushed SHA)."],
+                                 capture_output=True, text=True, timeout=60)
+        if outcome.returncode != 0:
+            os.remove(os.path.join(TASKS, seat))
+            lines.insert(pick, f"{bean}\t{target}\t{prompt}")
+            print(f"DISPATCH-FAILED {seat} {bean}")
+            continue
+        print(f"DISPATCH {bean} -> {seat}")
+    if not DRY:
+        with open(QUEUE, "w") as handle:
+            handle.write("".join(line + "\n" for line in lines))
+    if len(idle) >= 2:
+        alert("queue-empty-" + time.strftime("%Y%m%d%H"), f"{len(idle)} seats idle, nothing in the lead queue they may take",
+              "Idle: " + " ".join(idle) + f". Queue holds {len(lines)} line(s) routed elsewhere.")
 
 
 def check():
-    ag = agents()
-    if not ag:
-        # A failed or timed-out `herdr agent list` returns {}; reading it as "every seat absent" raised a stall
-        # alert for every working seat at once. An unreadable roster is no evidence: skip this tick.
-        print('herdr agent list unreadable this tick; seat checks skipped')
+    roster = agents()
+    if not roster:
+        print("herdr agent list unreadable this tick; seat checks skipped")
         return
-    off = set(open(f'{STATE}/harness-off').read().split()) if os.path.exists(f'{STATE}/harness-off') else set()
+    off = set(open(f"{STATE}/harness-off").read().split()) if os.path.exists(f"{STATE}/harness-off") else set()
+    assignments = ledger()
+    decisions = pane_states(roster)
+    # Refresh before evaluating any report SHA. A stale remote-tracking ref
+    # must not create a false not-pushed alert or delay a valid release.
+    git("fetch", "-q", "origin", "main")
+    reap_owners()
 
-    # 0. Reap owner records of finished beans. A claim is written on dispatch and nothing removed it, so most
-    #    owner files named completed or scrapped beans and finished work kept looking owned.
-    od = f'{STATE}/owner'
-    beans_dir = f'{REPO}/.beans'
-    if os.path.isdir(od) and os.path.isdir(beans_dir):
-        for b in os.listdir(od):
-            bf = next((f for f in os.listdir(beans_dir) if f.startswith(b + '-')), None)
-            st = re.search(r'^status:\s*(\S+)', open(f'{beans_dir}/{bf}', errors='ignore').read(), re.M) if bf else None
-            if not bf:
-                # the shared checkout can lag origin/main right after a push from another worktree: a bean filed
-                # minutes ago looked nonexistent and its owner was reaped. Ask main.
-                onmain = subprocess.run(['git', '-C', REPO, 'ls-tree', '--name-only', 'origin/main', '.beans/'],
-                                        capture_output=True, text=True, timeout=30).stdout
-                if f'/{b}-' in onmain:
-                    continue
-            if not bf or (st and st.group(1) in ('completed', 'scrapped')):
-                keep = f"{CFG['home']}/handoffs/owner-reaped"
-                os.makedirs(keep, exist_ok=True)
-                os.replace(f'{od}/{b}', f'{keep}/{b}')
-                print(f'owner reaped {b} ({st.group(1) if st else "no bean file"})')
-
-    # 1. seats: dialogs and dead harnesses (read the screen of every non-working roster seat)
-    for name, a in ag.items():
-        if not re.search(r'coder|reviewer|analyst', name) or a.get('agent') in off:
+    # Jev choices alert only. They never disable a harness, answer a dialog, or
+    # clear an assignment. No regex scans the pane for a dead/status signature.
+    for seat, result in decisions.items():
+        if roster[seat].get("agent") in off:
             continue
-        st = a.get('agent_status')
-        if st == 'blocked':
-            alert(f'dialog-{name}', f'{name} is waiting on a dialog',
-                  'Seat is blocked on an approval/question UI. Read it (herdr agent read) and answer it '
-                  'deliberately; the observer never presses keys.')
-        txt = screen(name)
-        if st == 'working':
-            # a working seat is judged only by its live bottom lines (a retry/limit banner sits there while the
-            # harness reports "working"); scrollback above may hold a banner that has since cleared
-            txt = '\n'.join([l for l in txt.splitlines() if l.strip()][-3:])
-            if not any(d and re.search(p_, txt, re.I) for p_, _, d in DEAD):
-                continue
-        # A message that DISABLES a harness must be live: only the bottom lines count. A stale "account suspended"
-        # higher up the screen survived a relaunch on another model and re-disabled the harness every tick.
-        # Alert-only patterns may still match anywhere on the screen.
-        bottom = '\n'.join([l for l in txt.splitlines() if l.strip()][-6:])
-        for pat, what, disable in DEAD:
-            if re.search(pat, bottom if disable else txt, re.I):
-                if disable and a.get('agent'):
-                    with open(f'{STATE}/harness-off', 'a') as fh:
-                        fh.write(a['agent'] + '\n')
-                    off.add(a['agent'])
-                key = f'dead-{name}-{what[:12]}-' + hashlib.md5(txt[-600:].encode()).hexdigest()[:6]
-                alert(key, f'{name}: {what}',
-                      f"harness {a.get('agent')} {'disabled (state/harness-off)' if disable else 'left on'}; "
-                      f"its assignment is not progressing.")
-                break
+        state = result["state"]
+        if state == "waiting_on_question":
+            alert(f"dialog-{seat}", f"{seat} is waiting on a question",
+                  "Read the pane and answer deliberately; the observer never presses keys.")
+        elif state == "provider_error":
+            alert(f"provider-{seat}", f"{seat} has a provider/session error",
+                  "Read the current pane; its assignment is not progressing. Harness remains enabled.")
+        elif state == "stuck_loop":
+            alert(f"loop-{seat}", f"{seat} is stuck in a loop", "Read the current pane and route a fix; no automatic action was taken.")
+        elif state == "unknown":
+            alert(f"pane-uncertain-{seat}", f"{seat} pane state unverified", "Jev unavailable or uncertain; inspect the pane. No completion action taken.")
 
-    # 2. finished / blocked / stalled assignments. With no inbox lane in observer mode, the seat's own report
-    # is the outcome: DONE on origin -> release the seat; BLOCKED -> surface the blocker once and release; else stall.
-    for seat, bean, t0 in ledger():
-        if ag.get(seat, {}).get('agent') in off:
-            continue   # harness switched off (billing/limit): its seat cannot progress; the dead-harness alert already fired
-        p, br = progress(seat, bean, t0)
-        st = ag.get(seat, {}).get('agent_status', 'absent')
-        rep = REPORT_OF.get((seat, bean)) or os.path.join(REPORTS, f'{seat}-{bean}.md')
-        if not os.path.exists(rep) and os.path.exists(os.path.join(REPORTS, f'{bean}.md')):
-            rep = os.path.join(REPORTS, f'{bean}.md')   # seats sometimes drop the seat prefix
-        if not os.path.exists(rep) and os.path.isdir(REPORTS):
-            # a brief may name its own report path: take the seat's newest report written since the assignment
-            # (a finished seat was flagged "stalled" 30 min after writing its report under the brief's name)
-            mine = [os.path.join(REPORTS, f) for f in os.listdir(REPORTS) if f.startswith(seat + '-') and f.endswith('.md')]
-            mine = [f for f in mine if os.path.getmtime(f) >= t0]
-            if mine:
-                rep = max(mine, key=os.path.getmtime)
-        if st != 'working' and os.path.exists(rep) and os.path.getmtime(rep) >= t0:
-            body = open(rep, errors='ignore').read()
-            # the FIRST line is the verdict (the self-land contract's report step); a trailing "DONE <path>"
-            # echo must not override a BLOCKED head.
-            head = next((l for l in body.splitlines()[:3] if re.search(r'\b(DONE|BLOCKED|LANDED)\b', l)), '')
-            verdict = head or next((l for l in reversed(body.strip().splitlines())
-                                     if re.match(r'(DONE|BLOCKED)\b', l)), '')
-            if re.match(r'\W*REVIEW-NEEDED', body) and review_landed(body.splitlines()[0]):
-                # the lead reviewed and landed it, usually by cherry-pick, so the SHA is not an ancestor; an
-                # equivalent patch on origin/main is the evidence. Without this the seat sat idle and re-alerted.
-                print(f'released {seat} ({bean}: review-needed commit already on origin/main)')
-                os.remove(os.path.join(TASKS, seat)); continue
-            if re.match(r'\W*REVIEW-NEEDED', body):
-                # the seat's cross-model reviewer failed and it handed the diff to the lead: it is WAITING, not
-                # free. Releasing it here dispatched new work over a slice the lead was about to approve.
-                alert(f'review-needed-{seat}-{bean}', f'{seat} needs a lead review on {bean}', body.splitlines()[0][:300])
-                continue
-            if 'BLOCKED' in verdict and bean.endswith(('-waiting', '-standby')):
-                continue   # the lead parked this seat waiting on another landing; its BLOCKED is the expected state
-            if 'BLOCKED' in verdict:
-                why = next((l for l in body.splitlines() if re.match(r'\s*(HUMAN|LEAD|BLOCKED)[:\s]', l)), verdict)
-                key = f'blocked-{seat}-{bean}-' + hashlib.md5(verdict.encode()).hexdigest()[:6]
-                alert(key, f'{seat} BLOCKED on {bean}', f'{why.strip()[:300]} — report: {rep}')
-                os.remove(os.path.join(TASKS, seat)); continue
-            # A report with NO verdict line is a progress note, not a finish: releasing on it dispatched new work
-            # over a seat mid-task. Research and verification reports lead with a verdict word too.
-            if not verdict and re.search(r'^\W*(HUNT|VERDICT|COMPLETE|PASSED|NOTHING TO DO|NO-?OP\b|[0-9]+/[0-9]+ (PASS|scenarios))',
-                                         body, re.M | re.I):
-                verdict = 'DONE'
-            if re.match(r'\W*(PARTIAL|LANDED-PARTIAL|IN PROGRESS|WIP)\b', body):
-                # PARTIAL = part landed, the rest is still this seat's work: never a release. Seats freed on PARTIAL
-                # were handed self-serve rounds and walked away from their assignments.
-                continue
-            if not verdict and body:
-                # any wording is fine when the first line names a commit that is already on origin/main
-                # (seats wrote CLOSED / NOTHING TO DO / PASSED and each was read as "no verdict" -> false stall)
-                first = body.splitlines()[0]
-                for sha in re.findall(r'\b[0-9a-f]{7,40}\b', first)[:3]:
-                    if on_main(sha):
-                        verdict = 'LANDED ' + sha
-                        break
-                if not verdict and re.match(r'\W*(CLOSED|SHIPPED|MERGED|FIXED)\b', first):
-                    verdict = 'DONE'
-            if re.search(r'DONE|LANDED', verdict):
-                print(f'released {seat} ({bean}: {(verdict or (body.splitlines()[0] if body else ""))[:80]})')
-                os.remove(os.path.join(TASKS, seat)); continue
-        if st != 'working' and NOW - p > STALL_MIN * 60 and re.search(
-                r'(shells?|monitors?|background terminals?) (still )?running|still running', screen(seat)):
-            continue   # idle between waits on its own background jobs (herdr says "done") — busy, not stalled
-        if st != 'working' and NOW - p > STALL_MIN * 60 and HARNESS_ERR.search(screen(seat)[-1500:]):
-            # the harness's API dropped the turn mid-task: not a stall. One nudge to continue fixes it;
-            # reassigning would throw the work away.
-            alert(f'harness-err-{seat}-{bean}', f'{seat}: its harness API dropped the turn on {bean}',
-                  'The pane ends in a harness/API error, not a question or a finish. Nudge it to continue from the last step.')
+    # Assignment state: a Jev 'finished' answer merely selects a candidate.
+    # Report freshness plus SHA ancestry are the independent release proof.
+    for seat, bean, start in assignments:
+        if roster.get(seat, {}).get("agent") in off:
             continue
-        if bean.endswith(('-standby', '-waiting')):
-            continue   # the lead parked this seat on purpose (waiting on another bean or a proof): not a stall
-        if 'reviewer' in seat and st != 'working':
-            # A reviewer whose bean's coder is still working is waiting for a REVIEW-NEEDED, not stalled.
-            coder = next((s_ for s_, b_, _ in ledger() if b_ == bean and 'reviewer' not in s_), None)
-            if coder and ag.get(coder, {}).get('agent_status') == 'working':
+        if bean.endswith(("-standby", "-waiting")):
+            continue
+        proof, branch = progress(seat, bean, start)
+        state = decisions.get(seat, {}).get("state", "unknown")
+        report = REPORT_OF.get((seat, bean)) or os.path.join(REPORTS, f"{seat}-{bean}.md")
+        if not os.path.exists(report) and os.path.isfile(os.path.join(REPORTS, f"{bean}.md")):
+            report = os.path.join(REPORTS, f"{bean}.md")
+        report_is_fresh = os.path.exists(report) and os.path.getmtime(report) >= start
+        # Jev can abstain or be down. A fresh report plus origin/main ancestry
+        # is independent mechanical proof, so never gate release on its Choice.
+        if report_is_fresh:
+            with open(report, errors="replace") as handle:
+                body = handle.read(2000)
+            outcome = completion_proof(body, on_origin)
+            if outcome == "blocked":
+                alert(f"blocked-{seat}-{bean}-" + hashlib.md5(body.splitlines()[0].encode()).hexdigest()[:6],
+                      f"{seat} BLOCKED on {bean}", f"Report: {report}")
+                if not DRY:
+                    os.remove(os.path.join(TASKS, seat))
                 continue
-        if st != 'working' and NOW - p > STALL_MIN * 60:
-            alert(f'stall-{seat}-{bean}', f'{seat} stalled on {bean}',
-                  f'status={st}, no commit on {br} and no report for {int((NOW - p) / 60)} min. '
-                  f'Read the pane, then reassign or unblock.')
+            if outcome == "landed":
+                print(f"released {seat} ({bean}: ancestry-proven on origin/main)")
+                if not DRY:
+                    os.remove(os.path.join(TASKS, seat))
+                continue
+            if outcome == "not_pushed":
+                alert(f"notpushed-{seat}-{bean}", f"{seat} claims DONE on {bean} without ancestry proof",
+                      f"Report {report} names no SHA on origin/main. Keep assignment until verified.")
+        if state == "finished" and NOW - proof > STALL_MIN * 60:
+            alert(f"stall-{seat}-{bean}", f"{seat} finished without a proven report for {bean}",
+                  f"No commit/report proof for {int((NOW - proof) / 60)} min on {branch}; inspect and route.")
+        if (state == "working" and NOW - proof > STALL_MIN * 60 and
+                decisions.get(seat, {}).get("pane_unchanged_seconds", 0) > STALL_MIN * 60):
+            alert(f"stale-working-{seat}-{bean}", f"{seat} working pane has no new content for {bean}",
+                  f"Pane and commit/report proof unchanged for {STALL_MIN}+ min on {branch}; inspect manually.")
 
-    # 3. critical runnable work with no owner (queued-by-the-lead counts as owned)
+    critical_work(assignments)
+
+    # Mechanical completion audit is separate from Jev. origin/main ancestry is
+    # the only release signal; no pane claim can waive it.
+    for filename in os.listdir(REPORTS) if os.path.isdir(REPORTS) else []:
+        path = os.path.join(REPORTS, filename)
+        if not filename.endswith(".md") or NOW - os.path.getmtime(path) > 6 * 3600 or "-review-" in filename:
+            continue
+        with open(path, errors="replace") as handle:
+            head = handle.read(600)
+        if completion_proof(head, on_origin) != "not_pushed":
+            continue
+        if re.match(r"^(?:DONE|LANDED|APPROVE)\b", head):
+            alert(f"notpushed-{filename}", f"{filename}: claims landed without origin/main proof",
+                  "Self-land contract: DONE requires a SHA ancestor of origin/main. Send it back.")
+
+    dispatch(roster, off)
+    migration_health()
+    shared_checkout_health()
+
+    stamp = f"{STATE}/observe-prod.stamp"
+    if PROD_GROUP and (not os.path.exists(stamp) or NOW - os.path.getmtime(stamp) > 3600):
+        if not DRY:
+            with open(stamp, "w") as handle:
+                handle.write(str(int(NOW)))
+        output = sh("aws", "logs", "filter-log-events", "--region", "us-east-1", "--log-group-name", PROD_GROUP,
+                    "--start-time", str(int((NOW - 900) * 1000)), "--filter-pattern", '"has not completed since"',
+                    "--query", "events[].message", "--output", "text", timeout=60)
+        jobs = sorted(set(re.findall(r'job \\?"([a-z0-9-]+)\\?" has not completed', output)))
+        if jobs:
+            alert("prod-jobs-stalled", f"{len(jobs)} production scheduled jobs stalled",
+                  ", ".join(jobs[:12]) + (" …" if len(jobs) > 12 else ""))
+
+    # Check if production is behind origin/main for > 30 minutes (bean-q54z)
     try:
-        q = ('{ beans(filter:{status:["todo"], priority:["critical"], type:["bug","feature","task"], '
-             'isBlocked:false}) { id title } }')
-        # Read the board as it is on origin/main, not the shared checkout: the checkout lags every landing and
-        # reported beans already completed on main as unowned.
-        snap = f'{STATE}/beans-origin'
-        sh('git', '-C', REPO, 'fetch', '-q', 'origin', timeout=60)
-        # Every external step bounded: an unbounded `rm -rf` of the old snapshot hung the tick 50 minutes while
-        # the disk was reclaiming 49 GB. Rename it out of the way (instant) and delete it in the background.
-        if os.path.isdir(snap):
-            old = f'{snap}.old.{int(NOW)}'
-            os.replace(snap, old)
-            subprocess.Popen(['rm', '-rf', old], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             start_new_session=True)
-        os.makedirs(snap, exist_ok=True)
-        sh('bash', '-c', f"git -C '{REPO}' archive origin/main .beans .beans.yml | tar -x -C '{snap}'", timeout=60)
-        crit = json.loads(sh('beans', 'query', '--json', q, cwd=snap, timeout=30))['beans']
-    except Exception:
-        crit = []
-    # owned = assigned on a seat, claimed through state/owner/<bean> (self-serve or lead), or queued
-    owned = {b for _, b, _ in ledger()} | (set(os.listdir(f'{STATE}/owner')) if os.path.isdir(f'{STATE}/owner') else set())
-    if os.path.exists(QUEUE):
-        owned |= {l.split('\t')[0] for l in open(QUEUE) if l.strip()}
-    free = [b['id'] for b in crit if b['id'] not in owned and not os.path.exists(f"{STATE}/noop-held/{b['id']}")]
-    if free:   # ONE alert, keyed on the set, so it re-fires only when the set changes
-        key = 'crit-unowned-' + hashlib.md5(' '.join(sorted(free)).encode()).hexdigest()[:8]
-        alert(key, f'{len(free)} critical bean(s) with no owner', ' '.join(free))
-
-    # 4. DONE reports that name a SHA not on origin/main (the self-land contract: pushed means on origin)
-    git('fetch', '-q', 'origin', 'main')
-    for fn in os.listdir(REPORTS) if os.path.isdir(REPORTS) else []:
-        f = os.path.join(REPORTS, fn)
-        if not fn.endswith('.md') or NOW - os.path.getmtime(f) > 6 * 3600 or '-review-' in fn:
-            continue
-        head = open(f, errors='ignore').read(600)
-        first = head.splitlines()[0] if head else ''
-        # A landing claim is a report whose FIRST LINE starts with LANDED or DONE (the verdict-word contract). Every
-        # other verdict — BLOCKED, REVIEW-NEEDED, PARTIAL, a hunt — claims nothing about origin/main. The old test
-        # (any "pushed"/"DONE" in the head, minus a list of negative phrases) raised four false alarms in one day.
-        if not re.match(r'\W*(LANDED|DONE)\b', first):
-            continue
-        owner = next((n for n in ag if fn.startswith(n + '-')), None)
-        if owner and ag[owner].get('agent_status') == 'working':
-            continue   # its owner is still on it (e.g. mid-rebase/push) — alert only once the seat stops
-        m = re.search(r'\b([0-9a-f]{9,40})\b', head)
-        if m and subprocess.run(['git', '-C', REPO, 'merge-base', '--is-ancestor', m.group(1), 'origin/main'],
-                                 capture_output=True).returncode != 0:
-            if git('cat-file', '-t', m.group(1)) == 'commit':
-                alert(f'notpushed-{fn}', f'{fn}: claims landed but {m.group(1)} is not on origin/main',
-                      'The self-land contract: DONE means the SHA is an ancestor of origin/main. Send it back.')
-
-    # 4b. hand queued work to free seats
-    dispatch(ag, off)
-
-    # 4c. optional: migrations on main but not applied (hourly). A "migration NNN needs applying" line in a report
-    # was the only signal, and migrations sat unapplied while the code that needs them was live.
-    # DROVER_MIGRATIONS_STATUS = a command run in DROVER_REPO that prints one "PENDING <number>_<name>" per
-    # unapplied migration. state/migrations-held: one per line, first token the number, the rest the reason.
-    if CFG['mig_status']:
-        mstamp = f'{STATE}/observe-migrations.stamp'
-        if not os.path.exists(mstamp) or NOW - os.path.getmtime(mstamp) > 3600:
-            open(mstamp, 'w').write(str(int(NOW)))
-            hf = f'{STATE}/migrations-held'
-            held = {l.split()[0] for l in open(hf) if l.split()} if os.path.exists(hf) else set()
-            out = sh('bash', '-c', CFG['mig_status'], cwd=REPO, timeout=180)
-            pend = [m for m in re.findall(r'PENDING (\d+)_\S+', out) if m not in held]
-            if pend:
-                alert('migrations-pending-' + '-'.join(pend), f'{len(pend)} migration(s) on main not applied: {" ".join(pend)}',
-                      'Code that needs them may already be deployed. Review each and apply, '
-                      'or add it to state/migrations-held with a reason.')
-
-    # 4d. keep the shared checkout's main current. Hooks that measure LOCAL main refused good pushes while it sat
-    # far behind, because the old fast-forward swallowed its own failure.
-    git('fetch', '-q', 'origin')
-    if git('rev-parse', '--abbrev-ref', 'HEAD') == 'main' and git('rev-list', '--count', 'main..origin/main') not in ('', '0'):
-        r = subprocess.run(['git', '-C', REPO, 'merge', '-q', '--ff-only', 'origin/main'], capture_output=True, text=True)
-        lock = f'{REPO}/.git/index.lock'
-        if r.returncode != 0 and 'index.lock' in r.stderr and (not os.path.exists(lock) or NOW - os.path.getmtime(lock) < 600):
-            pass   # a live git op holds the lock and frees it in seconds; only a lock older than 10 min is stuck
-        elif r.returncode != 0:
-            blockers = re.findall(r'^\t(\S+)', r.stderr, re.M)[:6]
-            alert('main-ff-blocked-' + time.strftime('%Y%m%d%H'), 'shared checkout main cannot fast-forward',
-                  f'{git("rev-list", "--count", "main..origin/main")} behind; blocked by: '
-                  + (', '.join(blockers) or r.stderr.strip()[:200])
-                  + '. Compare each with origin/main; move identical or stale copies aside, then fast-forward.')
-
-    # 4e. bean files created in the SHARED checkout instead of a seat worktree are invisible to dispatch and to
-    # every other seat until someone commits them.
-    stray = [l[3:] for l in git('status', '--porcelain', '--untracked-files=all', '--', '.beans').splitlines()
-             if l.startswith('?? ')]
-    if stray:
-        alert('stray-beans-' + hashlib.md5(' '.join(sorted(stray)).encode()).hexdigest()[:8],
-              f'{len(stray)} bean file(s) uncommitted in the shared checkout',
-              'Not on main, so dispatch cannot see them: ' + ', '.join(os.path.basename(x)[:40] for x in stray[:6])
-              + ('…' if len(stray) > 6 else '') + '. Have the filing seat commit them from its worktree and push.')
-
-    # 5. optional: production scheduled jobs stalled (hourly; skipped with no DROVER_PROD_LOG_GROUP)
-    if PROD_LOG_GROUP:
-        stamp = f'{STATE}/observe-prod.stamp'
-        if not os.path.exists(stamp) or NOW - os.path.getmtime(stamp) > 3600:
-            open(stamp, 'w').write(str(int(NOW)))
-            out = sh('aws', 'logs', 'filter-log-events', '--region', PROD_LOG_REGION,
-                      '--log-group-name', PROD_LOG_GROUP, '--start-time', str(int((NOW - 900) * 1000)),
-                      '--filter-pattern', '"has not completed since"',
-                      '--query', 'events[].message', '--output', 'text', timeout=60)
-            jobs = sorted(set(re.findall(r'job \\?"([a-z0-9-]+)\\?" has not completed', out)))
-            if jobs:
-                alert('prod-jobs-stalled', f'{len(jobs)} production scheduled jobs stalled',
-                      ', '.join(jobs[:12]) + (' …' if len(jobs) > 12 else ''))
+        health_url = config.get("APPRUNNER_HEALTH_URL", config.get("DROVER_PROD_VERSION_URL", ""))
+        health_raw = sh("curl", "-fsS", "-m", "10", health_url)
+        live_sha = None
+        live_build = {}
+        if health_raw:
+            try:
+                data = json.loads(health_raw)
+                live_build = data.get("build", {})
+                live_sha = live_build.get("sha")
+            except Exception:
+                live_sha = None
+                live_build = {}
+        tip_raw = git("ls-remote", "origin", "refs/heads/main")
+        match = re.match(r"^([0-9a-f]{40})\b", tip_raw.strip()) if tip_raw else None
+        tip = match.group(1) if match else None
+        if not tip:
+            alert("prod-remote-check-failed", "cannot resolve tip of origin/main via ls-remote",
+                  "git ls-remote failed; retaining divergence state without declaring convergence")
+        else:
+            behind = check_production_behind(live_sha, tip, NOW, live_build=live_build)
+            if behind:
+                live_label = behind['live'][:7] if behind['live'] else 'unknown'
+                alert("prod-behind-main", "production behind origin/main > 30 min",
+                      f"Live is {live_label}, tip is {behind['tip'][:7]} ({behind['minutes_behind']}m behind). "
+                      f"Oldest undeployed commit {behind['oldest_sha'][:7]}. "
+                      f"Deployer may be down or paused.")
+    except Exception as e:
+        alert("prod-behind-error", "production behind check error", str(e))
 
 
-# --- lead queue ---------------------------------------------------------------------------------------
-# ONE manager: the lead writes the ORDER (state/lead-queue); this only hands the next line to a free seat,
-# so no seat waits on the lead's next message. Line format: <bean>\t<harnesses: claude,cursor,agy | *>\t<prompt>
-# Pool = seats allowed to take queued work (state/lead-pool, one seat name per line, optionally `name:named`
-# to mean "only take a line that names this seat explicitly", for a seat with a narrower remit).
-QUEUE = f'{STATE}/lead-queue'
-POOL = f'{STATE}/lead-pool'
-# Harnesses that pick their own work when nothing queued fits them (DROVER_SELF_SERVE, e.g. "opencode"), per
-# docs/self-serve-playbook.md. Seats on cheap or free models otherwise sat idle beside a queue routed elsewhere.
-SELF_SERVE = set(CFG['self_serve'].split())
-# Areas owned by a single seat (DROVER_OWNED_AREAS, space-separated `area:owner-seat`, e.g. 'billing:billing-reviewer').
-# A scope decision has to reach EVERY prompt source the same hour — role playbooks AND this generated prompt: when
-# only the playbooks said it, three self-serving seats drifted into the owned area from this prompt's text.
-OWNED = [x.split(':', 1) for x in CFG['owned_areas'].split() if ':' in x]
-
-
-def owned_exclusion(seat):
-    areas = [f'{area} (owned by {owner})' for area, owner in OWNED if owner != seat]
-    return (' NEVER take a bean in these single-owner areas: ' + ', '.join(areas) + '.') if areas else ''
-PLAYBOOK = os.path.join(CFG['src'], 'docs', 'self-serve-playbook.md')
-
-
-def dispatch(ag, off):
-    if not os.path.exists(QUEUE) or not os.path.exists(POOL):
+def reap_owners():
+    """A lagging shared checkout is not evidence that a new bean disappeared."""
+    directory = os.path.join(STATE, "owner")
+    if not os.path.isdir(directory):
         return
-    pool_raw = [l.strip() for l in open(POOL) if l.strip()]
-    pool = [l.split(':')[0] for l in pool_raw]
-    named_only = {l.split(':')[0] for l in pool_raw if l.endswith(':named')}
-    lines = [l.rstrip('\n') for l in open(QUEUE) if l.strip()]
-    held = {seat for seat, _, _ in ledger()}
-    idle = []
-    for seat in pool:
-        a = ag.get(seat)
-        if not a or a.get('agent') in off or seat in held or a.get('agent_status') not in ('idle', 'done'):
-            continue
-        pick = next((i for i, l in enumerate(lines)
-                     if len(l.split('\t')) >= 3 and (
-                         (seat in l.split('\t')[1].split(','))
-                         if seat in named_only else
-                         (l.split('\t')[1] == '*' or a.get('agent') in l.split('\t')[1].split(',')
-                          or seat in l.split('\t')[1].split(','))
-                     )), None)
-        if pick is None:
-            # throttled per seat, so a seat that finds nothing is not re-prompted every tick
-            stamp = f'{STATE}/self-serve-{seat}.stamp'
-            if a.get('agent') in SELF_SERVE and (not os.path.exists(stamp) or NOW - os.path.getmtime(stamp) > 1200):
-                open(stamp, 'w').write(str(int(NOW)))
-                lines.append(f'self-serve\t{seat}\tSelf-serve: read and follow {PLAYBOOK} section "Self-serve" '
-                             '(pick an unowned ready bean in scope and land it, or run one hunt).' + owned_exclusion(seat))
-                pick = len(lines) - 1
-            else:
-                idle.append(seat); continue
-        bean, _, prompt = lines.pop(pick).split('\t', 2)
-        rep = os.path.join(REPORTS, f'{seat}-{bean}.md')
-        open(os.path.join(TASKS, seat), 'w').write(f'{int(NOW)}\t{bean}\tnone\t{rep}\n')
-        if bean == 'self-serve' and a.get('agent') == 'opencode':
-            # each self-serve round starts in a FRESH opencode session (`/new` keeps the model): rounds piled up
-            # in one session until its context ran out mid-bean. herdr sees the new session as a new agent and
-            # drops the seat name, so re-assert it on the same pane.
-            pane = a.get('pane_id')
-            subprocess.run(['herdr', 'agent', 'prompt', seat, '/new'], capture_output=True, text=True, timeout=30)
-            time.sleep(3)
-            if pane:
-                subprocess.run(['herdr', 'agent', 'rename', pane, seat], capture_output=True, text=True, timeout=15)
-        r = subprocess.run(
-            ['herdr', 'agent', 'prompt', seat, prompt + f' Report to {rep} (first line = verdict + pushed SHA).'],
-            capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:   # a failed send puts the work back (never claim what did not start)
-            os.remove(os.path.join(TASKS, seat)); lines.insert(pick, f'{bean}\t*\t{prompt}')
-            print(f'DISPATCH-FAILED {seat} {bean}'); continue
-        print(f'DISPATCH {bean} -> {seat}')
-    open(QUEUE, 'w').write(''.join(l + '\n' for l in lines))
-    if len(idle) >= 2:   # not only when the queue is EMPTY: idle seats beside a queue none may take stayed silent
-        alert('queue-empty-' + time.strftime('%Y%m%d%H'), f'{len(idle)} seats idle, nothing in the lead queue they may take',
-              f'Idle: {" ".join(idle)}. Queue holds {len(lines)} line(s) routed elsewhere. Fill or re-route {QUEUE}.')
+    beans = os.path.join(REPO, ".beans")
+    names = os.listdir(beans) if os.path.isdir(beans) else []
+    origin = None
+    for bean in os.listdir(directory):
+        filename = next((name for name in names if name.startswith(bean + "--")), None)
+        status = None
+        if filename:
+            with open(os.path.join(beans, filename), errors="replace") as handle:
+                match = re.search(r"^status:\s*(\S+)", handle.read(), re.M)
+            status = match.group(1) if match else None
+        else:
+            if origin is None:
+                origin = git("ls-tree", "-r", "--name-only", "origin/main", ".beans")
+            # Empty output includes an unavailable git query: retain ownership.
+            if not origin or any(path.startswith(f".beans/{bean}--") for path in origin.splitlines()):
+                continue
+        if not filename or status in ("completed", "scrapped"):
+            print(f"owner reaped {bean} ({status or 'no bean file'})")
+            if not DRY:
+                target = os.path.join(config["DROVER_HOME"], "handoffs/owner-reaped")
+                os.makedirs(target, exist_ok=True)
+                os.replace(os.path.join(directory, bean), os.path.join(target, bean))
 
 
-if __name__ == '__main__':
-    board() if '--board' in sys.argv else check()
+def critical_work(assignments):
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="beans-origin-", dir=STATE) as snapshot:
+            command = f"git -C {shlex.quote(REPO)} archive origin/main .beans .beans.yml | tar -x -C {shlex.quote(snapshot)}"
+            sh("bash", "-o", "pipefail", "-c", command, timeout=60)
+            if not os.path.isdir(os.path.join(snapshot, ".beans")) or not os.path.isfile(os.path.join(snapshot, ".beans.yml")):
+                return
+            query = '{ beans(filter:{status:["todo"], priority:["critical"], type:["bug","feature","task"], isBlocked:false}) { id title } }'
+            critical = json.loads(sh("beans", "query", "--json", query, cwd=snapshot, timeout=30))["beans"]
+    except (OSError, ValueError, KeyError):
+        return
+    owned = {bean for _, bean, _ in assignments}
+    directory = os.path.join(STATE, "owner")
+    if os.path.isdir(directory):
+        owned.update(os.listdir(directory))
+    if os.path.exists(QUEUE):
+        with open(QUEUE) as handle:
+            owned.update(line.split("\t")[0] for line in handle if line.strip())
+    free = [bean["id"] for bean in critical if bean["id"] not in owned and
+            not os.path.exists(f"{STATE}/noop-held/{bean['id']}")]
+    if free:
+        key = "crit-unowned-" + hashlib.md5(" ".join(sorted(free)).encode()).hexdigest()[:8]
+        alert(key, f"{len(free)} critical bean(s) with no owner", " ".join(free))
+
+
+def migration_health():
+    stamp = os.path.join(STATE, "observe-migrations.stamp")
+    if os.path.exists(stamp) and NOW - os.path.getmtime(stamp) < 3600:
+        return
+    if not DRY:
+        os.makedirs(STATE, exist_ok=True)
+        with open(stamp, "w") as handle:
+            handle.write(str(int(NOW)))
+    held_file = os.path.join(STATE, "migrations-held")
+    with open(held_file) if os.path.exists(held_file) else contextlib.nullcontext([]) as handle:
+        held = {line.split()[0] for line in handle if line.split()}
+    # Read status only; never merge a checkout or apply a migration from this check.
+    command = config.get('DROVER_MIGRATIONS_STATUS', '')
+    if not command:
+        return
+    command = 'export PGOPTIONS="${PGOPTIONS:-} -c default_transaction_read_only=on"; ' + command
+    output = sh("bash", "-c", command, cwd=REPO, timeout=180)
+    if not output.strip():
+        alert("migrations-status-unavailable", "migration status unavailable", "Status query returned no evidence; no migration was applied.")
+        return
+    pending = [n for n in re.findall(r"PENDING (\d+)_\S+", output) if n not in held]
+    if pending:
+        alert("migrations-pending-" + "-".join(pending), f"{len(pending)} migration(s) on main not applied",
+              " ".join(pending) + ". Lead: review/apply or record a reason in state/migrations-held.")
+
+
+def shared_checkout_health():
+    if git("rev-parse", "--abbrev-ref", "HEAD") == "main" and git("rev-list", "--count", "main..origin/main") not in ("", "0") and not DRY:
+        try:
+            result = subprocess.run(["git", "-C", REPO, "merge", "-q", "--ff-only", "origin/main"], capture_output=True, text=True, timeout=30)
+            lock = os.path.join(REPO, ".git/index.lock")
+            transient_lock = "index.lock" in result.stderr and (not os.path.exists(lock) or NOW-os.path.getmtime(lock)<600)
+            if result.returncode != 0 and not transient_lock:
+                alert("main-ff-blocked-" + time.strftime("%Y%m%d%H"), "shared checkout main cannot fast-forward", result.stderr[:300])
+        except subprocess.TimeoutExpired:
+            alert("main-ff-timeout", "shared checkout fast-forward timed out", "Inspect the shared checkout; the observer pass continues.")
+    stray = []
+    for line in git("status", "--porcelain", "--untracked-files=all", "--", ".beans").splitlines():
+        if line.startswith("?? "):
+            path = os.path.join(REPO, line[3:])
+            if os.path.isfile(path) and NOW-os.path.getmtime(path)>900:
+                stray.append(line[3:])
+    if stray:
+        alert("stray-beans-" + hashlib.md5(" ".join(sorted(stray)).encode()).hexdigest()[:8],
+              f"{len(stray)} bean file(s) uncommitted in the shared checkout", ", ".join(stray[:6]))
+
+
+def check_production_behind(live_sha, tip, now=NOW, live_build=None):
+    if not tip:
+        return None
+
+    behind_path = f"{STATE}/observe-prod-behind.json"
+    deploy_state_path = f"{STATE}/apprunner-deploy-state.json"
+
+    # Check if a deployment is currently in progress / interrupted for this tip
+    deploy_in_progress = False
+    if os.path.exists(deploy_state_path):
+        try:
+            with open(deploy_state_path) as handle:
+                dstate = json.load(handle)
+            if dstate.get("inProgressSha") and dstate.get("inProgressSha").lower() == tip.lower():
+                deploy_in_progress = True
+        except Exception:
+            pass
+
+    has_env_override = False
+    if live_build and isinstance(live_build, dict):
+        has_env_override = bool(live_build.get("env_override") or live_build.get("envOverride"))
+
+    # Truly converged: live matches tip, no in-progress/failed deploy marker, no disagreement
+    if live_sha and live_sha.lower() == tip.lower() and not deploy_in_progress and not has_env_override:
+        if not DRY and os.path.exists(behind_path):
+            try:
+                os.remove(behind_path)
+            except Exception:
+                pass
+        return None
+
+    # Production is behind or probe is failing while tip is known
+    first_seen = None
+    if os.path.exists(behind_path):
+        try:
+            with open(behind_path) as handle:
+                data = json.load(handle)
+            # Continuous divergence: retain first_seen across intermediate deployments and tip movements
+            first_seen = data.get("first_seen")
+        except Exception:
+            pass
+
+    oldest_sha = tip
+    if live_sha:
+        try:
+            commits = git("log", "--format=%H", f"{live_sha}..{tip}").splitlines()
+            if commits:
+                oldest_sha = commits[-1]
+        except Exception:
+            pass
+
+    if first_seen is None:
+        first_seen = now
+
+    if not DRY:
+        try:
+            os.makedirs(STATE, exist_ok=True)
+            with tempfile.NamedTemporaryFile("w", dir=STATE, prefix="observe-behind-", delete=False) as handle:
+                json.dump({"live_sha": live_sha, "tip": tip, "first_seen": first_seen}, handle)
+                temp = handle.name
+            os.replace(temp, behind_path)
+        except Exception:
+            pass
+
+    if now - first_seen > 30 * 60:
+        mins = int((now - first_seen) / 60)
+        return {
+            "live": live_sha,
+            "tip": tip,
+            "oldest_sha": oldest_sha,
+            "minutes_behind": mins,
+        }
+    return None
+
+
+if __name__ == "__main__":
+    board() if "--board" in sys.argv else check()

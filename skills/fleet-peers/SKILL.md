@@ -37,8 +37,7 @@ breaking it cost the fleet real hours; the dated evidence is in drover's `docs/L
 - beans is the shared work board (`beans show <id>`, `beans update <id> ...`); commit the bean file with your
   code. **Never delete a bean file on a branch.** If a bean seems missing:
   `git ls-files --with-tree=main .beans | grep <id>`, then `git checkout main -- .beans`.
-- Claim files before you edit them: `fleet-claim take <you> <bean> <path>...`. If a claim comes back HELD,
-  say so in your report instead of editing anyway.
+- Advisory claim admission is disabled (2026-10-19); it does not lock a file or block progress. Use the native assignment/task sources and `fleet-claims-audit` to establish current ownership.
 - Dev-server ports and databases are shared by everyone — go through `lead` before starting a server.
 
 ## Never

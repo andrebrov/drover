@@ -16,6 +16,12 @@ A range is `A..B` (or one rev): its tip is the right side. `git rev-parse A..B` 
 two-line "rev", every `git show <rev>:<path>` would fail and the completion check would pass on nothing; the tip is resolved on its own.
 Wire it into a pre-push hook with examples/pre-push-bean-guard.sh. Beans live in $DROVER_BEANS_DIR (default .beans).
 """
+
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1]/"lib"))
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
 import os
 import re
 import subprocess

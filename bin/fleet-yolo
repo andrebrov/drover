@@ -22,6 +22,12 @@ A seat that is `working` is never interrupted; it is retried on the next run.
   fleet-yolo seat --force        # restart a named seat even if already yolo (e.g. to move it to a new model)
   fleet-yolo seat --model=NAME   # relaunch with this model instead of whatever it was already running
 """
+
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1]/"lib"))
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
 import json, os, re, subprocess, sys, time
 
 DRY = '--dry-run' in sys.argv

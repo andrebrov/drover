@@ -12,6 +12,12 @@ your own interactive sessions are untouched. Idempotent — safe to run every ti
   cursor  -> .cursor/cli.json              allow Shell/Read/Write everything
   other harnesses -> no per-project config knob; fleet-yolo's relaunch stays the backstop
 """
+
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1]/"lib"))
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
 import json
 import os
 import re

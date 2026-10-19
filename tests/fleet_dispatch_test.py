@@ -65,7 +65,7 @@ class T(unittest.TestCase):
         self.b.bean('bean-0001'); self.b.bean('bean-0002'); self.b.bean('bean-0003')
         self.b.seat('busy', 'working', 'fleet/busy-bean-0001')
         self.b.seat('free1'); self.b.seat('free2')
-        (self.b.root / 'config' / 'dispatch-skip').write_text('bean-0002\n')
+        (self.b.root / 'config' / 'dispatch-skip').write_text('bean-0002 # lead '+time.strftime('%Y-%m-%d')+': assigned elsewhere\n')
         r = self.b.run()
         self.assertIn('board_ready=3 dispatchable=1', r.stdout)
         self.assertIn('on_working_seat_branch: 1', r.stdout)
@@ -124,14 +124,15 @@ class T(unittest.TestCase):
         self.assertNotIn('bean-done', pins)
         self.assertIn('worker\tbean-live', pins)
 
-    def test_pin_expiry_idle_seat_with_newer_report(self):
+    def test_pin_retained_until_main_completes_even_with_newer_report(self):
         self.b.bean('bean-0001', ready=False, status='in-progress')
         self.b.seat('idler')
         pins = self.b.root / 'config' / 'refill-pins'
         pins.write_text('idler\tbean-0001 @%d\n' % (time.time() - 3600))
         (self.b.root / 'reports' / 'idler-bean-0001.md').write_text('done\nDONE /p\n')
         r = self.b.run()
-        self.assertIn('pin removed: idler bean-0001', r.stdout)
+        self.assertNotIn('pin removed: idler bean-0001', r.stdout)
+        self.assertIn('idler\tbean-0001', pins.read_text())
 
     def test_a_pinned_bean_goes_to_its_free_seat_first_and_not_to_others(self):
         self.b.bean('bean-0001', priority='low'); self.b.bean('bean-0002', priority='critical')

@@ -21,6 +21,12 @@
 #   fleet-watch once            one tick, then exit
 #   fleet-watch enqueue <bean>  add a bean to the global queue
 #   fleet-watch queue           show the queue
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 set -uo pipefail
 # shellcheck source=drover-env
 . "$(dirname "$0")/drover-env"
@@ -153,7 +159,9 @@ check_budget(){
     else rm -f "$seat_tmp" "$STATE/budget-seat"; fi
   else rm -f "$STATE/budget-seat"; fi
   [ $((SECONDS-_b)) -ge 15 ] && log "SLOW-SUB fleet-budget $((SECONDS-_b))s"
-  _b=$SECONDS; spend_guard; [ $((SECONDS-_b)) -ge 15 ] && log "SLOW-SUB spend_guard $((SECONDS-_b))s"
+  if [ ! -f "$STATE/observer" ] && [ ! -f "$STATE/safe-route/enabled" ]; then
+    _b=$SECONDS; spend_guard; [ $((SECONDS-_b)) -ge 15 ] && log "SLOW-SUB spend_guard $((SECONDS-_b))s"
+  fi
 }
 
 # --- guardrail: opencode daily spend cap (2026-09-17/18: $290 then $376 a day, vs $27-$82 on each of the four days before) ---
@@ -872,8 +880,13 @@ harvest_step(){ local h; h=$("$DROVER_BIN"/fleet-harvest-beans 2>/dev/null | gre
 # collided — the fix is one owner. With state/observer present, agents own code -> review -> push
 # themselves and the lead owns assignment; the watcher only OBSERVES and ALERTS, never mutates.
 # `rm state/observer` restores the normal mutating lanes below.
+migration_alert(){
+  [ -n "${DROVER_MIGRATIONS_DIR:-}" ] && [ -n "${DROVER_MIGRATIONS_STATUS:-}" ] || return 0
+  python3 "$DROVER_SRC/lib/fleet_pending_migrations.py" tick --repo "$REPO" --state "$STATE" || log 'MIGRATIONS status unavailable'
+}
 tick(){
-  if [ -f "$STATE/observer" ]; then observe_tick; return; fi
+  migration_alert
+  if [ -f "$STATE/observer" ] || [ -f "$STATE/safe-route/enabled" ]; then observe_tick; return; fi
   local _t0=$SECONDS
   T clear_dialogs; T heal_repo; T check_budget; T harvest_step; T drain_inbox; T auto_announce; T retry_reviews
   T reap_tasks; T seat_scan; T owner_sync; T sweep_guard; T snapshot_wip; T inventory_alert; T yolo_guard
@@ -884,23 +897,36 @@ tick(){
 }
 
 observe_tick(){
-  local _t0=$SECONDS
-  T check_budget; T inventory_alert
-  # A bean is completed only when its code is on origin/main, and a review counts only when it is grounded
-  # (a verdict line or a file:line citation). Both checkers print one line per violation; each is alerted.
-  "$DROVER_BIN"/fleet-review-check --minutes 30 2>/dev/null | while read -r _ f rest; do
-    "$DROVER_BIN"/fleet-alert send "empty-review-${f%:}" "empty review: ${f%:}" "${rest} — re-run the review; it does not count" >/dev/null 2>&1; done
-  # A live seat works on a fresh base: a seat hundreds of commits behind main wastes its whole assignment.
-  "$DROVER_BIN"/fleet-stale-worktree --max 300 2>/dev/null | while read -r _ seat rest; do
-    "$DROVER_BIN"/fleet-alert send "stale-base-${seat%:}" "${seat%:} works on a stale base" "${rest} — start the next bean from a fresh branch off origin/main" >/dev/null 2>&1; done
-  "$DROVER_BIN"/fleet-landed-check --hours 24 2>/dev/null | while read -r _ bean rest; do
-    "$DROVER_BIN"/fleet-alert send "unproven-${bean%:}" "${bean%:} marked completed without landed code" "${rest} — reopen it or record the landing commit" >/dev/null 2>&1; done
-  "$DROVER_BIN"/fleet-observe 2>&1 | while read -r l; do log "OBSERVE $l"; done
-  [ $((SECONDS-_t0)) -ge 30 ] && log "SLOW-OBSERVE $((SECONDS-_t0))s"
-  # The tick-stall detector reads state/last: an observer tick must stamp it too, or the fleet reports
-  # a false multi-hour STALL for a watcher that is running fine, just not mutating.
-  { echo "tick $(date '+%H:%M:%S') (observer)"; "$DROVER_BIN"/fleet-observe --board 2>/dev/null; } > "$STATE/last" 2>/dev/null
+  check_budget
+  # Keep observer diagnostics; they may alert the lead but never route legacy work.
+  capped 5 "$DROVER_BIN/fleet-review-check" --minutes 30 2>/dev/null | while read -r _ f rest; do
+    capped 3 "$DROVER_BIN/fleet-alert" send "empty-review-${f%:}" "empty review: ${f%:}" "$rest" >/dev/null 2>&1
+  done
+  capped 5 "$DROVER_BIN/fleet-stale-worktree" --max 300 2>/dev/null | while read -r _ seat rest; do
+    capped 3 "$DROVER_BIN/fleet-alert" send "stale-base-${seat%:}" "${seat%:} works on a stale base" "$rest" >/dev/null 2>&1
+  done
+  capped 5 "$DROVER_BIN/fleet-landed-check" --hours 24 2>/dev/null | while read -r _ bean rest; do
+    capped 3 "$DROVER_BIN/fleet-alert" send "unproven-${bean%:}" "${bean%:} marked completed without landed code" "$rest" >/dev/null 2>&1
+  done
+  if [ -f "$STATE/safe-route/enabled" ]; then
+    local pressure pressure_rc mem_tmp
+    pressure=$(capped 3 ${FLEET_SYSCTL:-/usr/sbin/sysctl} -n kern.memorystatus_vm_pressure_level 2>/dev/null); pressure_rc=$?
+    if [ "$pressure_rc" -ne 0 ]; then pressure=unknown; fi
+    case "$pressure" in 1|2|4) : ;; *) pressure=unknown ;; esac
+    mem_tmp=$(mktemp "$STATE/.memory-status.XXXXXX")
+    if { date +%s; printf '%s\n' "$pressure"; } > "$mem_tmp"; then
+      mv -f "$mem_tmp" "$STATE/memory-status"
+    else rm -f "$mem_tmp" "$STATE/memory-status"; pressure=unknown; fi
+    if [ "$pressure" = 1 ]; then rm -f "$STATE/memory-pressure"
+    else : > "$STATE/memory-pressure"; fi
+    capped 5 "$DROVER_BIN/fleet-observe" --board 2>/dev/null | while read -r l; do log "BOARD $l"; done
+    capped 25 "$DROVER_BIN/fleet-safe-route" tick >/dev/null 2>&1 || log "SAFE-ROUTE capped/failed (rc=$?)"
+  else
+    capped 10 "$DROVER_BIN/fleet-observe" 2>&1 | while read -r l; do log "OBSERVE $l"; done
+  fi
+  { echo "tick $(date '+%H:%M:%S') (observer)"; capped 5 "$DROVER_BIN/fleet-observe" --board 2>/dev/null; } > "$STATE/last" 2>/dev/null
 }
+
 
 if [ "${1:-run}" = once ]; then tick; exit 0; fi
 log "fleet-watch started (tick ${TICK}s)"

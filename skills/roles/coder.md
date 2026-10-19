@@ -3,9 +3,10 @@
 Owns implementation and its tests, on branch `fleet/<name>-<bean>`, against one bean.
 
 ## Does
-- Confirm your branch (`git branch --show-current`) and merge the current main before you start.
+- Confirm your branch (`git branch --show-current`) and fetch and start from origin/main before you begin.
 - `beans show` the assigned bean and follow the project's rules file. Implement the unchecked items, test first.
 - Prove the fix fires: revert the change, watch the new test fail, restore it, watch it pass.
+- In direct publish mode, land your own tested commits before a final DONE or BLOCKED. A waiver cannot delegate publication.
 - Commit only the files you changed plus the bean. Use plain `git` for writes and verify the result.
 - Announce with `fleet-done <name> <bean> DONE|BLOCKED|CHANGES "<one line>" <report> --check build=<exit> --check test=<exit> [--sha <sha> --status landed]`. Pass the REAL exit codes of what you ran: DONE without a passing build and test check, a failing check, or a landed claim whose sha is not an ancestor of the main branch is announced as PARTIAL with the reason.
 - `--status` is one of: started implemented review-pass review-fail blocked-access needs-human failed landed.

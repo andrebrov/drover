@@ -1,3 +1,5 @@
+> Historical reference, retired 2026-10-19: the observer no longer schedules automatic self-serve work. The configuration names below describe that former mode. Use the explicit lead queue or finite root-granted routing; this playbook applies only when a human assigns its scope.
+
 # Self-serve playbook — how a seat on a cheap or free model keeps itself busy and lands work
 
 In observer mode the lead queue routes each line to the harnesses that may take it. Seats on harnesses that

@@ -11,6 +11,17 @@
 # edited one planner test today, and three needed the same conflict resolved
 # three times. A claim is advisory, not a lock: it exists so an agent knows to pick
 # different work, or to pair, BEFORE the conflict is written.
+# 2026-10-13: advisory admission must not block parallel seats.
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
+if [ "${1:-check}" = take ]; then
+  echo 'fleet-claim: claims are DISABLED; landing and rebase handle overlap.'
+  exit 0
+fi
 set +u
 # shellcheck source=drover-env
 . "$(dirname "$0")/drover-env"

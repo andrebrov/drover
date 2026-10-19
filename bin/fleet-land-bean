@@ -14,6 +14,12 @@
 #                        paths                (e.g. 'npx jest --findRelatedTests $CHANGED --passWithNoTests')
 # The FULL cumulative suite runs at the push boundary (fleet-verify-main), not here — so lands stay
 # fast and a coder never starves behind a serial full-suite.
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 set -u
 # shellcheck source=drover-env
 . "$(dirname "$0")/drover-env"

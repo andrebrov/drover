@@ -3,6 +3,12 @@
 # (fleet-verify-main: build+test on a clean worktree at main HEAD) and pushes to origin ONLY if green.
 # Never force. Whatever your push triggers (CI, a deploy) follows the push. Skip the gate with
 # FLEET_PUSH_FORCE=1 only for a known-green tree the gate can't reach (e.g. an infra-only change).
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 set -u
 # shellcheck source=drover-env
 . "$(dirname "$0")/drover-env"

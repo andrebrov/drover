@@ -8,6 +8,12 @@
 # would be great to send them for bug hunting." Coders are excluded on purpose:
 # they hold beans and a bean is better work than a hunt.
 # The hunt briefs are $FLEET_BRIEFS/{bug,ux,perf}-hunt.txt (install.sh seeds them from examples/briefs).
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 set -euo pipefail
 # shellcheck source=drover-env
 . "$(dirname "$0")/drover-env"

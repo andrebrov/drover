@@ -6,6 +6,12 @@
 #
 # Why a nightly job at all: a graph nobody refreshes silently drifts (measured: 12 days stale on one
 # fleet because nothing ran `graphify update .`). A refresh is AST-only — no model calls, a few minutes.
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 set -uo pipefail
 # shellcheck source=drover-env
 . "$(dirname "$0")/drover-env"

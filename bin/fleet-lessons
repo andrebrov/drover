@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""fleet-lessons — evidence and health for one fleet rule (bean-jisv).
+  fleet-lessons add --id ID --cue CUE --rule SECTION --evidence REF --check-kind command|bean|manual --check-ref REF
+  fleet-lessons list
+  fleet-lessons check [--now YYYY-MM-DD]
+  fleet-lessons standup
+  fleet-lessons retro
+A record without evidence or a check kind is refused. Command checks are one argv, no shell, and time out.
+"""
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1] / "lib"))
+from fleet_config import configure
+config=configure(export=__name__=="__main__")
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
+
+from fleet_lessons import main
+
+if __name__ == '__main__':
+    raise SystemExit(main(_fleet_sys.argv))

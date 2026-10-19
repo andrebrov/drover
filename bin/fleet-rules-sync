@@ -9,6 +9,12 @@ matter dropped and a header naming the source. A hand edit of a generated copy, 
 build or the pre-commit hook and the copies cannot drift. Defaults: $DROVER_REPO/.cursor/rules -> $DROVER_REPO/.grok/rules (override with --src/--dst
 or DROVER_RULES_SRC / DROVER_RULES_DST). Rules named by DROVER_RULES_SKIP_PREFIX (default `tessl__`, i.e. installed by a package manager) are not mirrored.
 """
+
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1]/"lib"))
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
 import os
 import re
 import sys

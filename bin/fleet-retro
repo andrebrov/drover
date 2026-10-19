@@ -7,6 +7,12 @@
 #
 # The session is fully recorded, so this reads evidence rather than recollection —
 # the one advantage this has over a human retro, and the reason it can be counted.
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 set -uo pipefail
 # shellcheck source=drover-env
 . "$(dirname "$0")/drover-env"

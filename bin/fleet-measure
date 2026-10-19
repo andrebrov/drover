@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""fleet-measure — the 4-hourly scoreboard (founder 2026-10-13: "measure results every 4 hours and look for opportunities").
+Writes ~/.local/share/fleet-reports/measure/<stamp>.md, prints it, compares with the previous run, and ends with OPPORTUNITIES (machine-found, ranked).
+Every number is read from git, the ledger, state files or the DB read-only; nothing is estimated. Usage: fleet-measure [--no-render]"""
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1] / "lib"))
+from fleet_config import configure
+config=configure(export=__name__=="__main__")
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
+
+import os, re, subprocess, sys, tempfile, time, json, glob, datetime as dt
+from fleet_stamp import read_fresh, stamp as write_stamped
+from pathlib import Path
+from zoneinfo import ZoneInfo
+H = os.path.expanduser('~'); ROOT = config.get('FLEET_ROOT') or config.get('DROVER_REPO') or os.getcwd(); OUT = str(Path(config['FLEET_REPORTS']) / 'measure'); os.makedirs(OUT, exist_ok=True)
+now = time.time(); stamp = time.strftime('%Y%m%d-%H%M'); hrs = 4
+def sh(*a, cwd=ROOT, t=120):
+    try: return subprocess.run(a, capture_output=True, text=True, cwd=cwd, timeout=t).stdout
+    except Exception as e: return ''
+
+def refresh_unlanded():
+    """Own the snapshot; incomplete Git observations never replace a complete one."""
+    def git(*args, input=None):
+        # communicate(input=) feeds a pipe in 512-byte writes (2.8M syscalls for the patch stream);
+        # a spooled file as stdin hands Git the whole batch in one read.
+        with tempfile.TemporaryFile('w+') as stdin:
+            if input is not None:
+                stdin.write(input); stdin.seek(0)
+            return subprocess.run(['git', *args], cwd=ROOT, capture_output=True, text=True, timeout=60,
+                                  check=True, stdin=stdin if input is not None else None).stdout
+
+    try:
+        # Fetch both main and remote fleet refs, not just main's FETCH_HEAD.
+        git('fetch', '-q', '--prune', 'origin',
+            '+refs/heads/main:refs/remotes/origin/main',
+            '+refs/heads/fleet/*:refs/remotes/origin/fleet/*')
+        base = git('rev-parse', 'origin/main').strip()
+        refs = git('for-each-ref', '--no-merged=' + base, '--format=%(refname) %(objectname)',
+                   'refs/heads/fleet/', 'refs/remotes/origin/fleet/').splitlines()
+        # Cache immutable patch IDs separately from main-dependent tip results.
+        # A main advance invalidates tip results, including old archive candidates.
+        cache_path = Path(A) / 'unlanded-cache.json'
+        common = str((Path(ROOT) / git('rev-parse', '--git-common-dir').strip()).resolve())
+        sha_pattern = r'(?:[0-9a-f]{40}|[0-9a-f]{64})'
+        def valid_sha(value):
+            return isinstance(value, str) and re.fullmatch(sha_pattern, value) is not None
+        try:
+            cache = json.loads(cache_path.read_text())
+            if (cache.get('version') != 1 or cache.get('repository') != common
+                    or not valid_sha(cache.get('base'))
+                    or not isinstance(cache.get('patches'), dict)
+                    or not isinstance(cache.get('tips'), dict)
+                    or not all(valid_sha(k) and (v is None or valid_sha(v)) for k, v in cache['patches'].items())
+                    or not all(valid_sha(tip) and isinstance(pending, dict)
+                               and all(valid_sha(sha) and type(ct) is int for sha, ct in pending.items())
+                               for tip, pending in cache['tips'].items())):
+                raise ValueError('invalid cache')
+        except (OSError, UnicodeError, ValueError, AttributeError):
+            cache = {'version': 1, 'repository': common, 'base': base, 'patches': {}, 'tips': {}}
+        tip_results = cache['tips'] if cache['base'] == base else {}
+        selected = {row.split()[1] for row in refs}
+        missing = sorted(selected - tip_results.keys())
+        if missing:
+            # One topological traversal labels reachability for all missing tips.
+            # Bit 0 is main; each other bit is one frozen branch tip. Children
+            # precede parents, so OR propagation replaces per-branch Git walks.
+            masks = {base: 1}
+            for index, tip in enumerate(missing, 1):
+                masks[tip] = masks.get(tip, 0) | (1 << index)
+            graph = git('log', '--topo-order', '--format=%H%x09%P%x09%ct%x09%s', '--stdin',
+                        input='\n'.join([base, *missing]) + '\n')
+            nodes = {}
+            for line in graph.splitlines():
+                sha, parents, timestamp, subject = line.split('\t', 3)
+                mask = masks.get(sha, 0)
+                nodes[sha] = (mask, int(timestamp), subject, parents.split())
+                for parent in parents.split():
+                    masks[parent] = masks.get(parent, 0) | mask
+            if any(tip not in nodes for tip in [base, *missing]):
+                raise ValueError('incomplete Git graph')
+            all_tips = (1 << (len(missing) + 1)) - 2
+            candidates = {sha: node for sha, node in nodes.items()
+                          if not node[0] & 1 and len(node[3]) <= 1
+                          and re.search(config['DROVER_BEAN_RE'], node[2])}
+            main = {sha: node for sha, node in nodes.items()
+                    if node[0] & 1 and node[0] & all_tips != all_tips and len(node[3]) <= 1}
+            unknown = sorted((candidates.keys() | main.keys()) - cache['patches'].keys()) if candidates else []
+            if unknown:
+                # diff-tree --stdin batches immutable commit diffs; patch-id
+                # consumes that batch once, without rename/external diff work.
+                patches = git('diff-tree', '--stdin', '--root', '-p', '--no-renames',
+                              '--no-ext-diff', '--no-textconv', input='\n'.join(unknown) + '\n')
+                ids = dict.fromkeys(unknown)
+                for line in git('patch-id', '--stable', input=patches).splitlines():
+                    patch, sha = line.split()
+                    if sha not in ids or not valid_sha(patch):
+                        raise ValueError('invalid Git patch observation')
+                    ids[sha] = patch
+                cache['patches'].update(ids)
+            shared = {}
+            for sha, node in main.items() if candidates else []:
+                patch = cache['patches'][sha]
+                if patch is not None:
+                    shared[patch] = shared.get(patch, all_tips) & node[0]
+            pending = {tip: {} for tip in missing}
+            for sha, node in candidates.items():
+                # A matching main patch excludes a commit only on branches
+                # where that main commit is NOT already an ancestor. This is
+                # git cherry semantics even for a branch's revert/reapply.
+                eligible = node[0] & shared.get(cache['patches'][sha], all_tips)
+                for index, tip in enumerate(missing, 1):
+                    if eligible & (1 << index):
+                        pending[tip][sha] = node[1]
+            tip_results.update(pending)
+        branches = {}
+        for row in refs:
+            ref, tip = row.split()
+            branch = re.sub(r'^refs/(?:heads|remotes/origin)/', '', ref)
+            branches.setdefault(branch, {}).update(tip_results[tip])
+        cache.update(base=base, tips={tip: tip_results[tip] for tip in selected})
+        rows = []
+        for branch, pending in sorted(branches.items()):
+            observed = list(pending.values())
+            # Preserve the stagnant-branch policy: active work is not escalated.
+            if observed and now - max(observed) >= 3600:
+                rows.append(f'{branch}: {len(observed)} unlanded bean commit(s), newest {int((now - max(observed)) / 60)} min')
+        target = Path(A) / 'unlanded.txt'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f'.unlanded.{os.getpid()}.tmp')
+        try:
+            temporary.write_text(json.dumps(cache, separators=(',', ':')))
+            temporary.replace(cache_path)
+            temporary.write_text(''.join(row + '\n' for row in rows))
+            temporary.replace(target)
+            # The marker is the LAST write (bean-90dj): a run killed before it leaves the previous receipt, which ages out.
+            write_stamped(target.with_name('unlanded.txt.ok'), __file__, {'rows': len(rows)}, inputs={'tip': base}, now=now)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return None
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        # Keep the last complete snapshot's original mtime. Never certify partial 0.
+        return f'Git refresh unavailable ({type(error).__name__})'
+
+
+def alert_count(name):
+    """All scoreboard alert counts share the two-hour observation contract."""
+    # unlanded.txt is written by this tool and carries a stamp (receipt .ok); stuck.txt is written by fleet-watch, which is not a
+    # stamped writer yet, so its file mtime remains the observation time.
+    if name == 'unlanded.txt':
+        fresh = read_fresh(Path(A) / 'unlanded.txt.ok', 7200, __file__, now=now)
+        if not fresh:
+            return None, f'unmeasured ({fresh})'
+    try:
+        with (Path(A) / name).open() as source:
+            observed_at = os.fstat(source.fileno()).st_mtime
+            age = now - observed_at
+            when = dt.datetime.fromtimestamp(observed_at, ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M %Z')
+            if age > 7200:
+                return None, f'unmeasured (source stale since {when})'
+            if age < 0:
+                return None, 'unmeasured (source timestamp is in the future)'
+            return sum(bool(line.strip()) for line in source), f'observed {when}'
+    except FileNotFoundError:
+        return None, 'unmeasured (source missing)'
+    except (OSError, UnicodeError, ValueError):
+        return None, 'unmeasured (source unreadable)'
+
+
+A = str(Path(config['FLEET_STATE']) / 'alerts')
+refresh_error = refresh_unlanded()
+# A newly written observation is later than the scan's starting clock.
+now = time.time()
+since = f'{hrs} hours ago'
+def commits(window):
+    o = sh('git', 'log', 'origin/main', '--no-merges', f'--since={window}', '--format=%ct\t%s').splitlines()
+    return [(int(l.split('\t')[0]), l.split('\t', 1)[1]) for l in o if '\t' in l]
+allc = commits(since); code = [c for c in allc if not re.match(r'^(chore|docs)\(beans\)', c[1])]
+day = [c for c in commits('24 hours ago') if not re.match(r'^(chore|docs)\(beans\)', c[1])]
+M = {}                                                       # metrics, for the comparison and the opportunities
+M['landings_4h'] = len(code); M['landings_24h'] = len(day)
+M['beans_landed_4h'] = len({m.group(1) for _, s in code for m in [re.search('(' + config['DROVER_BEAN_RE'] + ')', s)] if m})
+# seats
+agents = json.loads(subprocess.run(['herdr', 'agent', 'list'], capture_output=True, text=True).stdout or '{"result":{"agents":[]}}')['result']['agents']
+names = [a['name'] for a in agents if a.get('name') ]
+active = []; idle = []
+for n in names:
+    wt = str(Path(config['DROVER_WORKTREES']) / f'fleet-{n}')
+    if not os.path.isdir(wt): continue
+    ct = sh('git', '-C', wt, 'log', '-1', '--format=%ct').strip()
+    (active if ct.isdigit() and now - int(ct) < hrs * 3600 else idle).append(n)
+M['seats_active_4h'] = len(active); M['seats_idle_4h'] = len(idle)
+# unlanded / stuck / alerts
+def lines(p):
+    try: return [l for l in Path(p).read_text().splitlines() if l.strip()]
+    except Exception: return []
+sources = {}
+for key, name in [('unlanded_branches_60m', 'unlanded.txt'), ('stuck_seats', 'stuck.txt')]:
+    M[key], sources[key] = alert_count(name)
+M['alert_sources'] = sources
+if refresh_error: M['unlanded_refresh_error'] = refresh_error
+M['queue_items'] = len([f for f in glob.glob(config['FLEET_BRIEFS'] + '/queue/*.txt')])
+# reports in the window: outcome mix
+rep = [f for f in glob.glob(config['FLEET_REPORTS'] + '/*-*.md') if now - os.path.getmtime(f) < hrs * 3600]
+mix = {'DONE': 0, 'READY': 0, 'PARTIAL': 0, 'BLOCKED': 0}
+for f in rep:
+    with open(f, errors='ignore') as source: h = source.read(260).upper()
+    for k in ('BLOCKED', 'PARTIAL', 'READY', 'DONE'):
+        if k in h: mix[k] += 1; break
+M['reports_4h'] = len(rep); M['blocked_share'] = round(mix['BLOCKED'] / len(rep), 2) if rep else 0.0
+# Optional application version endpoint; no product endpoint or SQL is built in.
+prod = ''
+version_url = config.get('DROVER_PROD_VERSION_URL', '')
+try:
+    import urllib.request
+    if version_url:
+        version = json.load(urllib.request.urlopen(version_url, timeout=10))
+        prod = version.get('sha') or version.get('build', {}).get('sha') or ''
+except Exception:
+    pass
+lag = len(sh('git', 'log', f'{prod}..origin/main', '--no-merges', '--format=%h').split()) if prod else -1
+M['prod_lag_commits'] = lag
+deploys = lines(config['FLEET_REPORTS'] + '/deploys.log')[-3:]
+render = ''  # Application-specific measurement commands stay in the owning project.
+# previous run
+prev = sorted(glob.glob(f'{OUT}/*.json'))[-1:]
+# The comparison baseline must itself be a complete, recent, same-version measurement; otherwise there is none (never the old value).
+prev_read = read_fresh(prev[0], 12 * 3600, __file__, now=now) if prev else None
+pm = prev_read if isinstance(prev_read, dict) else {}
+def delta(k):
+    v = M[k]; p = pm.get(k)
+    if v is None: return sources[k]
+    if k in sources:
+        prior_basis = pm.get('alert_sources', {}).get(k)
+        if not isinstance(prior_basis, str) or not prior_basis.startswith('observed '): p = None
+    return f'{v}' + (f' ({v - p:+g} vs last)' if isinstance(p, (int, float)) and isinstance(v, (int, float)) else '')
+L = [f'# Fleet scoreboard {stamp} (window: last {hrs} h)', '',
+     '## Delivery', f'- code landings on main: {delta("landings_4h")} in 4 h, {M["landings_24h"]} in 24 h; beans touched: {delta("beans_landed_4h")}',
+     f'- production: {prod[:7] or "UNREADABLE"}; undeployed code commits: {delta("prod_lag_commits")}', *[f'- deploy: {d}' for d in deploys], '',
+     '## Fleet', f'- seats with a commit in the last 4 h: {len(active)} ({", ".join(active)}); idle: {len(idle)} ({", ".join(idle)})',
+     f'- reports in window: {M["reports_4h"]} {mix}; BLOCKED share {M["blocked_share"]}',
+     f'- branches with bean commits unlanded > 60 min: {delta("unlanded_branches_60m")}; stuck seats: {delta("stuck_seats")}; queue items waiting: {M["queue_items"]}',
+     *[f'- {key}: {basis}' for key, basis in sources.items() if M[key] is not None],
+     *([f'- {refresh_error}; last complete snapshot retained subject to the two-hour limit.'] if refresh_error else []), '']
+
+# opportunities
+O = []
+if M['seats_idle_4h'] >= 3 and M['queue_items'] == 0: O.append(f'{M["seats_idle_4h"]} seats idle and the queue is empty: feed work (triage LAND/NEEDS-OWNER packets, focus beans with unchecked slices, or a founder priority).')
+if M['unlanded_branches_60m'] is not None and M['unlanded_branches_60m'] > 20: O.append(f'{M["unlanded_branches_60m"]} branches hold unlanded bean commits: inspect the current unlanded.txt snapshot before starting new work.')
+if M['prod_lag_commits'] > 10: O.append(f'production lags main by {M["prod_lag_commits"]} code commits: run fleet-deploy.')
+if M['blocked_share'] > 0.25: O.append(f'BLOCKED share {M["blocked_share"]}: read the BLOCKED reports for a shared cause (worktree, env, contract) before more dispatches.')
+if M['landings_4h'] < 5: O.append('fewer than 5 code landings in 4 h: find the longest wait (assign -> first commit -> landing -> deploy) for the top bean.')
+if M['stuck_seats']: O.append('stuck seats: restart them (fleet rm) and reassign their bean.')
+L += ['## OPPORTUNITIES (machine-found)'] + ([f'{i+1}. {o}' for i, o in enumerate(O)] or ['- none triggered; inspect unavailable sources before drawing a conclusion.'])
+txt = '\n'.join(L)
+Path(f'{OUT}/{stamp}.md').write_text(txt)
+write_stamped(f'{OUT}/{stamp}.json', __file__, M, inputs={'window_hours': hrs, 'root': ROOT}, now=now)  # last write: the marker
+print(txt)

@@ -38,12 +38,14 @@ spends no turns — until that prompt arrives.**
 
 ## Observer mode (agents self-land)
 
+Current boundary (2026-10-19): this excludes the legacy dialog/model/landing/push lanes. The ordinary observer can dispatch explicitly queued work, recover remembered seat names and safely fast-forward a lagging shared main. When finite routing is enabled, the watcher invokes only its board view and the grant-bound router. Automatic self-serve fallback is retired.
+
 Running the lead's own direct assignments alongside the watcher's automated lanes is the one combination
 to avoid — see `docs/LESSONS.md`, "Two managers collide". Put the fleet in observer mode instead of running
 both:
 
 ```bash
-touch ~/.local/share/drover/watch/state/observer   # watcher stops mutating; runs fleet-observe instead
+touch ~/.local/share/drover/watch/state/observer   # leave legacy action lanes; run fleet-observe instead
 fleet-observe --board                               # one-screen read: what's live, what's stuck, what needs you
 rm ~/.local/share/drover/watch/state/observer        # restore the watcher's normal dispatch/review/land/push lanes
 ```
@@ -131,3 +133,19 @@ no tip could be landed and three of three approved beans needed a rebase round (
 It only switches a CLEAN tree; a worktree with uncommitted tracked changes keeps its branch and the lead gets a
 warning. **Do not remove worktrees to solve branch problems**: worktrees are what limited a `git reset --hard`
 accident to one agent. In a shared tree it would have destroyed every agent's work at once.
+
+## Current evidence and portable adapters
+
+- `fleet-claims-audit --json`: read-only native ownership audit. Exit 0 agrees, 1 confirms a closed bean still owned, 2 means UNKNOWN. It never repairs a record.
+- `fleet-measure --no-render`: publish the delivery scoreboard and stamped JSON. No application render command or SQL is built in. `fleet-standup` includes the fresh measurement, ownership result, optional status checks and local lesson ledger.
+- `fleet-observatory --output /absolute/path/observatory.html`: write a local, inert kanban view. `--json` writes no HTML. It cannot publish over native task/question/decision state.
+- `fleet-precedent <bean>`: bounded historical evidence from landed beans and native review reports. It never changes a decision or gates an action. Turn it off with `FLEET_PRECEDENT=off`.
+- `fleet-main-tripwire`: run the configured project gate in disposable checkouts. The default uses the existing slot pool and clean verifier. A custom `DROVER_TRIPWIRE_GATE` adapter owns the same provisioning/fixture grants as the push hook; its exit contract is 0 GREEN, 1 RED, 2 UNAVAILABLE (3/75 busy and 124 timeout are also unavailable). It must return 1 for compiler/test failures. Missing lease/infrastructure messages are reported as unavailable. No database driver is guessed.
+- `fleet-main-tripwire --check-freshness`: inspect the last evaluated SHA/time and main distance. A pinned `--ref` experiment needs isolated `TRIPWIRE_STATE` and `TRIPWIRE_ALERTS`; it cannot replace the normal monitor’s proof.
+- `fleet-lessons add ...`, `check`, `standup`, `retro`: operate on this fleet’s evidence/check ledger. No private team policy is seeded by installation.
+
+Shared dependency preparation is opt-in (`DROVER_SHARED_NM=1`). Before a project build/push, call `fleet-shared-nm check REPO HEAD`; on mismatch run the printed `link ... --archive-real` repair. Keep a single centrally built graph directory in `DROVER_GRAPH_DIR`; preparation links to it and preserves an old local graph in the prep backup.
+
+Finite root-granted routing is disabled unless `state/safe-route/enabled` exists. It runs inside the existing watcher tick, never as a second scheduler. Grants and completions bind exact job/brief/source/task/report bytes and generation. Unknown budget, native availability or memory pressure retains the job. Observer routing does not enter legacy vendor spend queries or the legacy mutation lanes.
+
+Update only through `install.sh` after committing and publishing the source. Preflight recognizes known main-history versions; reconcile unknown installed patches first. `--force` cannot waive drift. The installer still symlinks tools and leaves configuration/state in place. It never runs a runtime hook patcher.

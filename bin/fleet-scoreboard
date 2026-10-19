@@ -3,6 +3,12 @@
 # INVENTORY not yet integrated — NOT dispatch/utilization (vanity: a busy fleet with a red or
 # unpushed main shipped nothing). Reads the landing ledger (fleet-land-bean / fleet-push) + git +
 # fleet state. Read-only.
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 set -u
 # shellcheck source=drover-env
 . "$(dirname "$0")/drover-env"

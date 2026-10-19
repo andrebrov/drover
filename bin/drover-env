@@ -11,7 +11,7 @@ DROVER_CONFIG="${DROVER_CONFIG:-$HOME/.config/drover/config}"
 # drover checkout they came from (for skills/ and docs/). Scripts call each other through
 # $DROVER_BIN, never through PATH: launchd's PATH is short, and `fleet` is also the name of an IDE CLI.
 _drover_self="${BASH_SOURCE[0]}"
-DROVER_BIN="$(cd "$(dirname "$_drover_self")" && pwd)"
+DROVER_BIN="${DROVER_BIN:-$(cd "$(dirname "$_drover_self")" && pwd)}"
 while [ -L "$_drover_self" ]; do
   _drover_t=$(readlink "$_drover_self")
   case $_drover_t in /*) _drover_self=$_drover_t ;; *) _drover_self=$(dirname "$_drover_self")/$_drover_t ;; esac
@@ -40,7 +40,7 @@ if [ -z "${DROVER_BEAN_PREFIX:-}" ] && [ -f "${DROVER_REPO:-/nonexistent}/.beans
   DROVER_BEAN_PREFIX=$(sed -n 's/^[[:space:]]*prefix:[[:space:]]*//p' "$DROVER_REPO/.beans.yml" | head -1 | tr -d "\"'")
 fi
 DROVER_BEAN_PREFIX="${DROVER_BEAN_PREFIX:-bean-}"
-DROVER_BEAN_RE="${DROVER_BEAN_RE:-${DROVER_BEAN_PREFIX}[a-z0-9]{4}}"
+DROVER_BEAN_RE="${DROVER_BEAN_RE:-${DROVER_BEAN_PREFIX}[a-z0-9]+}"
 
 # Refill daemon (fleet-refill), queue restock (fleet-feed), grouping (fleet-batch), health (fleet-cred-check).
 FLEET_REFILL_LOG="${FLEET_REFILL_LOG:-$DROVER_HOME/logs/fleet-refill.log}"      # heartbeat every 10 ticks; a log older than 10 min is a dead daemon
@@ -56,3 +56,12 @@ DROVER_PROD_VERSION_URL="${DROVER_PROD_VERSION_URL:-}"   # optional: URL returni
 DROVER_PROD_LAG_MIN="${DROVER_PROD_LAG_MIN:-90}"         # production may not lag the main branch by code commits older than this
 DROVER_CODE_PATHS_LAG="${DROVER_CODE_PATHS_LAG:-}"       # space-separated pathspecs that count as "code" for the lag check (empty = every path)
 DROVER_MID_TASK_MIN="${DROVER_MID_TASK_MIN:-90}"         # a seat with a bean-named commit not on main younger than this is mid-task, never idle
+
+# 2026-10-19: native Python tools read these same paths; there is no second config file.
+DROVER_CONFIG_DIR="${DROVER_CONFIG_DIR:-$(dirname "$DROVER_CONFIG")}"
+DROVER_OWNERS_FILE="${DROVER_OWNERS_FILE:-$DROVER_CONFIG_DIR/assigned-owners.txt}"
+DROVER_DISPATCH_SKIP="${DROVER_DISPATCH_SKIP:-$DROVER_CONFIG_DIR/dispatch-skip}"
+FLEET_SEAT_STATE="${FLEET_SEAT_STATE:-$DROVER_HOME/seat-state}"
+FLEET_ROOT="${FLEET_ROOT:-${DROVER_REPO:-}}"
+DROVER_SEAT_MODELS="${DROVER_SEAT_MODELS:-}"
+DROVER_CALLSIGNS="${DROVER_CALLSIGNS:-$DROVER_CONFIG_DIR/callsigns.tsv}"

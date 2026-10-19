@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# fleet-verify-main — the merge-queue CUMULATIVE gate.
+#
+# Per-bean landing (fleet-land-bean) gates each bean against the main it forks from; it does NOT prove
+# the CUMULATIVE main (all landed-but-unpushed beans together) is green. A batch of isolation-green
+# beans broke on the combined tree (2026-09-21). This runs DROVER_BUILD + DROVER_TEST_ALL on the ref's
+# HEAD in a CLEAN detached worktree — so untracked debris in the shared checkout can neither hide a
+# failure nor false-fail the gate. Exit 0 = the tree is green and safe to push; non-zero = do NOT push.
+#
+# Set DROVER_BUILD and DROVER_TEST_ALL in ~/.config/drover/config. If BOTH are empty this gate can
+# prove nothing and exits non-zero (fail closed) so it never green-lights an unverified push.
+#
+#   fleet-verify-main            verify local main HEAD
+#   fleet-verify-main <ref>      verify an arbitrary ref
+set -u
+# shellcheck source=drover-env
+. "$(dirname "$0")/../bin/drover-env"
+REPO="${DROVER_REPO:?set DROVER_REPO}"
+BUILD="${DROVER_BUILD:-}"; TEST_ALL="${DROVER_TEST_ALL:-}"
+LOGDIR="$FLEET_STATE/verify"; mkdir -p "$LOGDIR"
+ref="${1:-main}"
+tip=$(git -C "$REPO" rev-parse "$ref" 2>/dev/null) || { echo "verify: bad ref '$ref'"; exit 2; }
+if [ -z "$BUILD" ] && [ -z "$TEST_ALL" ]; then
+  echo "verify: neither DROVER_BUILD nor DROVER_TEST_ALL is set — cannot verify; refusing to green-light a push"; exit 3
+fi
+wt="$FLEET_STATE/verify-wt/$$"
+cleanup(){ git -C "$REPO" worktree remove --force "$wt" 2>/dev/null; rm -rf "$wt"; }
+trap cleanup EXIT
+rm -rf "$wt"; mkdir -p "$(dirname "$wt")"
+git -C "$REPO" worktree add -q --detach "$wt" "$tip" || { echo "verify: worktree add failed"; exit 1; }
+# a fresh worktree has no deps; symlink the repo's installed ones (DROVER_CLONE_DIRS, relative paths)
+for d in ${DROVER_CLONE_DIRS:-node_modules}; do
+  [ -e "$wt/$d" ] || { mkdir -p "$(dirname "$wt/$d")" 2>/dev/null; ln -s "$REPO/$d" "$wt/$d" 2>/dev/null; }
+done
+# warm an incremental build cache: copy DROVER_BUILD_CACHE paths in so a "cold" gate build starts warm
+# (e.g. tsc --incremental's .tsbuildinfo). A stale cache only recompiles the changed files — never wrong.
+for c in ${DROVER_BUILD_CACHE:-}; do
+  [ -f "$REPO/$c" ] && { mkdir -p "$(dirname "$wt/$c")" 2>/dev/null; cp "$REPO/$c" "$wt/$c" 2>/dev/null; }
+done
+
+echo "verify: build+test on $ref @ ${tip:0:9} (clean worktree)"
+if [ -n "$BUILD" ]; then
+  ( cd "$wt" && sh -c "$BUILD" ) >"$LOGDIR/build.log" 2>&1
+  if [ $? -ne 0 ]; then echo "verify: BUILD FAILED — $LOGDIR/build.log"; tail -12 "$LOGDIR/build.log"; exit 1; fi
+fi
+if [ -n "$TEST_ALL" ]; then
+  # progress watchdog, not a wall-clock cap: run the suite to completion; kill ONLY after DROVER_GATE_STALL
+  # seconds with NO new output (a genuine hang). A slow-but-progressing suite under load survives.
+  : > "$LOGDIR/test.log"   # pre-create so the watchdog's `wc -c < test.log` never opens a missing file
+  ( cd "$wt" && sh -c "$TEST_ALL" ) >"$LOGDIR/test.log" 2>&1 &
+  tp=$!; last=-1; quiet=0; stall="${DROVER_GATE_STALL:-300}"
+  while kill -0 "$tp" 2>/dev/null; do
+    sleep 10
+    sz=$(wc -c < "$LOGDIR/test.log" 2>/dev/null); sz=${sz:-0}
+    if [ "$sz" != "$last" ]; then last=$sz; quiet=0; else quiet=$((quiet+10)); fi
+    [ "$quiet" -ge "$stall" ] && { kill -9 "$tp" 2>/dev/null; break; }
+  done
+  wait "$tp" 2>/dev/null; trc=$?
+  tail -8 "$LOGDIR/test.log"
+  if [ "$trc" -ne 0 ]; then echo "verify: TESTS FAILED/STALLED (rc=$trc) — $LOGDIR/test.log — DO NOT PUSH"; exit 1; fi
+fi
+echo "verify: GREEN — $ref @ ${tip:0:9} is safe to push"
+exit 0

@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""fleet-claims-audit — read-only current task ownership, using dispatch's native projection.
+
+  fleet-claims-audit [--fixture DIR] [--repo DIR] [--json]
+
+Reads assigned-owners.txt, fleet-tasks, the roster, pending markers and fetched
+origin/main bean status. Advisory file claims and ask TTL are not ownership.
+Exit 0: sources agree; 1: confirmed closed-bean ownership; 2: UNKNOWN, including
+competing seats or source disagreement/unavailability. Never repairs any source.
+"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
+from fleet_config import configure
+config=configure(export=__name__=="__main__")
+from fleet_usage import gate
+gate(sys.argv, __file__)
+import argparse
+import json
+import os
+import subprocess
+from fleet_ownership import audit, current_assignments, issue, main_beans, read_owners, read_tasks, roster_seats
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--fixture', default=config.get('FLEET_CLAIMS_AUDIT_FIXTURE'))
+    parser.add_argument('--repo')
+    parser.add_argument('--json', action='store_true')
+    args = parser.parse_args()
+    fixture = Path(args.fixture) if args.fixture else None
+    home = Path.home()
+    owners_path = fixture / 'config/assigned-owners.txt' if fixture else Path(config['DROVER_OWNERS_FILE'])
+    task_path = fixture / 'tasks' if fixture else Path(config.get('FLEET_TASKS', config['FLEET_TASKS']))
+    pending = fixture / 'seat-state' if fixture else Path(config.get('FLEET_SEAT_STATE', config['FLEET_SEAT_STATE']))
+    repo = Path(args.repo) if args.repo else fixture / 'repo' if fixture else Path(config.get('FLEET_REPO', config.get('DROVER_REPO', os.getcwd())))
+    rows, errors, owner_hash = read_owners(owners_path)
+    tasks, task_errors, hashes = read_tasks(task_path)
+    errors.extend(task_errors)
+    roster = {}
+    try:
+        data = json.loads((fixture / 'roster.json').read_text()) if fixture else json.loads(subprocess.check_output(['herdr', 'agent', 'list'], timeout=15))
+        roster = roster_seats(data)
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError, TypeError, AttributeError):
+        errors.append(issue('ROSTER_UNAVAILABLE', 'cannot read an unambiguous native roster'))
+    statuses, bean_errors, main_sha = main_beans(repo, set(current_assignments(rows).values()) | set(tasks.values()))
+    errors.extend(bean_errors)
+    result = audit(rows, tasks, statuses, roster, pending, errors)
+    result.update(main_sha=main_sha, owner_sha256=owner_hash, task_sha256=hashes)
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    elif result['status'] == 'ok':
+        print('fleet-claims-audit: OK — current owner and native task sources agree')
+    else:
+        for finding in result['findings']:
+            context = ' '.join(f'{k}={v}' for k, v in finding.items() if k not in {'identity', 'detail'})
+            print(f"fleet-claims-audit: {result['status'].upper()} {finding['identity']} {context} — {finding['detail']}")
+    return {'ok': 0, 'fail': 1, 'unknown': 2}[result['status']]
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -20,6 +20,12 @@ Env: DROVER_SPEC_FEED_CAP       open feeder-filed beans at once (default 6)
   fleet-spec-feed            file one bean (if under the cap) and commit it on main
   fleet-spec-feed --dry-run  print the stuck epics, ranked orphans and what would be filed; change nothing
 """
+
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1]/"lib"))
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
 import glob, json, os, re, subprocess, sys
 
 

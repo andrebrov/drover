@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# fleet-seat-live <worktree> — exit 7 and print up to 3 "pid command" lines when a node/npm/npx/tsc/tsx/jest/vite/playwright process
+# (not a harness: claude, codex, opencode, agy, cursor, gemini, herdr) has its cwd inside the worktree; exit 0 when none. (bean-hd7u D2/D3)
+# Measured 2026-10-13: the pilot seat showed status `done` while a background loop rebuilt backend/dist in its tree.
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in
+  0) exit 0 ;;
+  2) exit 2 ;;
+  10) ;;
+  *) exit $_fleet_rc ;;
+esac
+unset _fleet_lib _fleet_rc
+. "$(dirname "$0")/drover-env"
+
+lib=$(cd "$(dirname "$0")" && pwd)/../lib
+here=$(cd "${1:?worktree}" && pwd -P) || exit 2
+live=$(lsof -a -d cwd -Fpn 2>/dev/null | awk -v w="$here" '/^p/{p=substr($0,2)} /^n/{n=substr($0,2); if (n==w || index(n,w"/")==1) print p}' | while read -r pid; do
+  [ "$pid" = "$$" ] && continue; c=$(ps -o command= -p "$pid" 2>/dev/null || true)
+  if printf '%s' "$c" | grep -Eq 'claude|codex|opencode|agy|cursor|gemini|herdr'; then continue; fi
+  # A seat's own language server or MCP daemon is not work (bean-0s1x, list owned by lib/fleet_daemons.py).
+  if python3 "$lib/fleet_daemons.py" --match "$c"; then continue; fi
+  if basename "$(ps -o comm= -p "$pid" 2>/dev/null || true)" | grep -Eqx 'node|npm|npx|tsc|tsx|jest|vite|playwright'; then echo "$pid $c"; fi
+done | head -3)
+[ -z "$live" ] || { printf '%s\n' "$live"; exit 7; }

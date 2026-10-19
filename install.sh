@@ -6,7 +6,7 @@
 #   ./install.sh --load           ...and load fleet-watch, fleet-stale, fleet-standup-hourly, fleet-refill
 #   ./install.sh --load-watchdog  ...and also lead-watchdog (only if you run a backup-lead seat)
 #   ./install.sh --dry-run        print the plan, change nothing
-#   ./install.sh --force          replace existing files in ~/.local/bin that are not drover symlinks
+#   ./install.sh --force          replace known historical files in ~/.local/bin after drift preflight
 #   ./install.sh --uninstall      unload + remove the plists and the symlinks; keeps config and state
 #
 # Env: DROVER_BIN_DIR (default ~/.local/bin), DROVER_HOME (default ~/.local/share/drover),
@@ -43,6 +43,8 @@ if [ "$UNINSTALL" = 1 ]; then
   say "kept: $CFG_DIR (config) and $HOME_DIR (state, reports). Remove them by hand if you want them gone."
   exit 0
 fi
+
+python3 "$SRC/lib/install_guard.py" "$SRC" "$BIN_DIR" || exit $?
 
 say "symlinks in $BIN_DIR:"
 [ -d "$BIN_DIR" ] || run mkdir -p "$BIN_DIR"

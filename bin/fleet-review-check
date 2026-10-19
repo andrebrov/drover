@@ -13,6 +13,12 @@ neither a verdict word (VERDICT/APPROVE/CHANGES/LANDABLE) nor any file:line refe
                                                          exit 1 when any exist
 Read-only. fleet-watch runs it every observer tick and alerts on each line.
 """
+
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1]/"lib"))
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
 import glob
 import os
 import re

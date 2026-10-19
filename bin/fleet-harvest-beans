@@ -2,6 +2,12 @@
 # fleet-harvest-beans — copy every bean file an agent created in its worktree into the main checkout
 # and commit it there. The board follows main: a bean that lives only in a worktree cannot be dispatched.
 # Commits only the harvested paths (--only), so the human's staged work in that checkout is untouched.
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 set -euo pipefail
 # shellcheck source=drover-env
 . "$(dirname "$0")/drover-env"

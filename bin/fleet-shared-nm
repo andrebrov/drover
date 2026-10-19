@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# fleet-shared-nm — ONE read-only node_modules per lockfile set (bean-hd7u D1).
+#   fleet-shared-nm key    [repo]            print the lock key (sha256 of the lockfiles + node major)
+#   fleet-shared-nm ensure [repo]            build <cache>/<key>/ if absent (npm ci), print its path
+#   fleet-shared-nm link   <repo> <worktree> [--archive-real] ensure, then link all three dependency paths; preserve real directories when requested
+#   fleet-shared-nm check  <repo> [ref]      refuse unless all dependency links match that ref's lock key (default HEAD)
+# The tree is chmod a-w after the build: `npm install` or a write inside a seat fails with EACCES instead of
+# forking state. A dependency change lands via the lander, which builds the next key; the old key stays until reaped.
+# Cache root: FLEET_NM_CACHE (default ~/.cache/fleet/nm).
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in
+  0) exit 0 ;;
+  2) exit 2 ;;
+  10) ;;
+  *) exit $_fleet_rc ;;
+esac
+unset _fleet_lib _fleet_rc
+. "$(dirname "$0")/drover-env"
+
+set -euo pipefail
+cache=${FLEET_NM_CACHE:-$HOME/.cache/drover/nm}
+case "$cache" in /*) ;; *) cache="$(pwd)/$cache" ;; esac
+locks=(package-lock.json backend/package-lock.json frontend/package-lock.json)
+manifests=(package.json backend/package.json frontend/package.json .npmrc)
+tmp=
+sha(){ shasum -a 256 | cut -c1-16; }
+
+key(){ # $1 repo, optional $2 Git ref (the gate judges committed locks, not dirty files)
+  local r=$1 ref=${2:-} f
+  if [ -n "$ref" ]; then
+    git -C "$r" cat-file -e "$ref:package-lock.json" 2>/dev/null || { echo "fleet-shared-nm: $ref has no package-lock.json" >&2; return 2; }
+  else
+    [ -f "$r/package-lock.json" ] || { echo "fleet-shared-nm: $r has no package-lock.json" >&2; return 2; }
+  fi
+  { printf 'node%s\n' "$(node -p 'process.versions.node.split(".")[0]')"
+    for f in "${locks[@]}"; do
+      if [ -n "$ref" ]; then
+        if git -C "$r" cat-file -e "$ref:$f" 2>/dev/null; then printf '%s\n' "$f"; git -C "$r" show "$ref:$f" || return 2; fi
+      elif [ -f "$r/$f" ]; then printf '%s\n' "$f"; cat "$r/$f"; fi
+    done
+  } | sha
+}
+
+ensure(){ # $1 repo -> prints dir
+  local r=$1 k dir f
+  k=$(key "$r") || return $?
+  dir=$cache/$k
+  if [ -f "$dir/READY" ]; then printf '%s\n' "$dir"; return 0; fi
+  mkdir -p "$cache"
+  tmp=$(mktemp -d "$cache/.build.$k.XXXXXX")
+  trap 'if [ -n "${tmp:-}" ] && [ -d "$tmp" ]; then chmod -R u+w "$tmp" 2>/dev/null; rm -rf "$tmp"; fi' EXIT
+  for f in "${locks[@]}" "${manifests[@]}"; do
+    if [ -f "$r/$f" ]; then mkdir -p "$tmp/$(dirname "$f")"; cp "$r/$f" "$tmp/$f"; fi
+  done
+  # ponytail: scripts run (esbuild/sharp postinstall); the tree is the product of the lockfile only
+  (cd "$tmp" && npm ci --no-audit --no-fund >"$tmp/.npm-ci.log" 2>&1) || { tail -5 "$tmp/.npm-ci.log" >&2; echo "fleet-shared-nm: npm ci failed" >&2; return 3; }
+  [ -d "$tmp/node_modules" ] || { echo "fleet-shared-nm: npm ci produced no node_modules" >&2; return 3; }
+  touch "$tmp/READY"
+  chmod -R a-w "$tmp"
+  if [ -f "$dir/READY" ]; then :  # another builder won the race
+  else mv "$tmp" "$dir" 2>/dev/null || true; fi
+  trap - EXIT
+  if [ -d "$tmp" ]; then chmod -R u+w "$tmp"; rm -rf "$tmp"; fi
+  printf '%s\n' "$dir"
+}
+
+target(){ # Hoisted workspaces may have no nested node_modules; never leave an old nested link behind.
+  if [ -d "$1/$2" ]; then printf '%s\n' "$1/$2"; else printf '%s\n' "$1/node_modules"; fi
+}
+
+check(){ # $1 repo $2 ref
+  local r=$1 ref=$2 k dir d expected actual
+  k=$(key "$r" "$ref") || return $?
+  [ "$(key "$r")" = "$k" ] || { echo "fleet-shared-nm: lockfiles differ from $ref; commit or restore those lockfiles before checking dependencies" >&2; return 4; }
+  dir=$cache/$k
+  for d in node_modules backend/node_modules frontend/node_modules; do
+    expected=$(target "$dir" "$d")
+    expected=$(cd "$expected" 2>/dev/null && pwd -P) || expected=missing
+    actual=$(cd "$r/$d" 2>/dev/null && pwd -P) || actual=missing
+    if [ ! -f "$dir/READY" ] || [ ! -L "$r/$d" ] || [ "$actual" != "$expected" ]; then
+      echo "fleet-shared-nm: node_modules lock key mismatch at $r/$d (expected $k from $ref)" >&2
+      echo "repair: fleet-shared-nm link '$r' '$r' --archive-real" >&2
+      return 4
+    fi
+  done
+  printf 'fleet-shared-nm: dependencies match %s (%s)\n' "$ref" "$k"
+}
+
+link(){ # $1 repo $2 worktree $3 archive-real (0/1)
+  local dir d backup= backup_root=${FLEET_NM_BACKUPS:-$DROVER_HOME/dependency-backups}
+  if [ -f "$2/package-lock.json" ] && [ "$(key "$1")" != "$(key "$2")" ]; then
+    echo "fleet-shared-nm: source lock key differs from the worktree; use the worktree's own lockfiles" >&2; return 4
+  fi
+  dir=$(ensure "$1") || return $?
+  # Preflight every path before replacing ANY link (agy-coder had a real frontend directory).
+  for d in node_modules backend/node_modules frontend/node_modules; do
+    if [ -e "$2/$d" ] && [ ! -L "$2/$d" ] && [ "$3" != 1 ]; then echo "fleet-shared-nm: $2/$d is a real directory; refusing to replace it (use --archive-real to preserve and relink)" >&2; return 4; fi
+  done
+  for d in node_modules backend/node_modules frontend/node_modules; do
+    if [ -e "$2/$d" ] && [ ! -L "$2/$d" ]; then
+      if [ -z "$backup" ]; then mkdir -p "$backup_root"; backup=$(mktemp -d "$backup_root/$(basename "$2").XXXXXX"); fi
+      mkdir -p "$backup/$(dirname "$d")"
+      mv "$2/$d" "$backup/$d"
+      echo "fleet-shared-nm: preserved $2/$d at $backup/$d" >&2
+    fi
+  done
+  for d in node_modules backend/node_modules frontend/node_modules; do
+    rm -f "$2/$d"
+    mkdir -p "$2/$(dirname "$d")"
+    ln -s "$(target "$dir" "$d")" "$2/$d"
+  done
+  printf '%s\n' "$dir"
+}
+
+case ${1:-} in
+  key)    key "${2:-$(pwd)}" ;;
+  ensure) ensure "${2:-$(pwd)}" ;;
+  check)  check "${2:-$(pwd)}" "${3:-HEAD}" ;;
+  link)   [ $# -eq 3 ] || { [ $# -eq 4 ] && [ "$4" = --archive-real ]; } || { echo "usage: fleet-shared-nm link <repo> <worktree> [--archive-real]" >&2; exit 64; }; link "$2" "$3" "$(( $# == 4 ))" ;;
+  *)      echo "usage: fleet-shared-nm key|ensure [repo] | check [repo] [ref] | link <repo> <worktree> [--archive-real]" >&2; exit 64 ;;
+esac

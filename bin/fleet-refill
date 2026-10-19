@@ -26,6 +26,12 @@ heartbeat line is logged every 10 ticks; fleet-cred-check treats a log older tha
 Env: REFILL_POLL (60) REFILL_IDLE_POLLS (4) REFILL_COOLDOWN (900) REFILL_MIN_FREE_GB (30) REFILL_MAX_SENDS (4)
      REFILL_MAX_WAITERS (8) REFILL_SOFT_POLLS (12) REFILL_HUNTS REFILL_FEED_EVERY (300) REFILL_TICK_LIMIT (600)
 """
+
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1]/"lib"))
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
 import fcntl, glob, hashlib, json, os, re, signal, subprocess, sys, time
 
 
@@ -284,11 +290,7 @@ def landing_audit(st, now, dry=False):
             log(f'NUDGE FAILED {seat} {bean} rc={rr.returncode}')
     if dry:
         return
-    d = f'{STATE_DIR}/alerts'
-    os.makedirs(d, exist_ok=True)
-    open(f'{d}/unlanded.txt', 'w').write('\n'.join(alerts) + ('\n' if alerts else ''))
-    if not incomplete:
-        open(f'{d}/unlanded.txt.ok', 'w').write(str(int(now)))
+    if incomplete: log('landing audit: incomplete; no scoreboard observation published')
 
 
 def stuck_check(st, now, dry=False):

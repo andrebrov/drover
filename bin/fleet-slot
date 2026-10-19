@@ -29,6 +29,12 @@ FLEET_NPROC_LIMIT (default 1500; 0 disables) and only ever LOWERS the limit: cap
 A runaway fork then fails with EAGAIN instead of taking the machine down (see docs/LESSONS.md, "Never run jest
 via node -e with more than one worker").
 """
+
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1]/"lib"))
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
 import fcntl
 import json
 import os

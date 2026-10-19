@@ -7,6 +7,12 @@
 # Writes one line into $FLEET_INBOX. The lead (or fleet-watch) blocks on that
 # directory (fleet-wait) instead of reading panes or trusting `fleet status`,
 # which reports `done` while an agent is still mid-turn.
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 set -euo pipefail
 # shellcheck source=drover-env
 . "$(dirname "$0")/drover-env"
@@ -79,13 +85,17 @@ fi
 # The refusal is delivered to the lead as BLOCKED but keeps what the seat wanted: "[wanted DONE] UNLANDED ..." and the report path. Exit 7 tells the seat the steps.
 # Exit 2 from the checker (cannot determine) never blocks: the report goes out marked "[landing unverified]". A waiver (FLEET_UNLANDED_OK="<reason>") is per call,
 # goes into the summary AND into $FLEET_REPORTS/unlanded-waivers.log with the subjects it covers, so a waived loss is visible, not silent.
-if [ "$(cat "$DROVER_PUBLISH_MODE_FILE" 2>/dev/null || echo direct)" = direct ] && { [ "$state" = DONE ] || [ "$state" = PARTIAL ] || [ "$state" = READY ]; }; then
+if [ "$(cat "$DROVER_PUBLISH_MODE_FILE" 2>/dev/null || echo direct)" = direct ] && { [ "$state" = DONE ] || [ "$state" = PARTIAL ] || [ "$state" = READY ] || [ "$state" = BLOCKED ]; }; then
   cur_branch=$(git branch --show-current 2>/dev/null || true)
   if [ -n "$cur_branch" ] && [ "$cur_branch" != main ] && [ "$cur_branch" != master ]; then
     lrc=0; unl=$("$DROVER_BIN/fleet-branch-landed" HEAD "$bean" 2>/dev/null) || lrc=$?     # under set -e a bare unl=$(...) with rc 1 would abort the whole script silently
     if [ "$lrc" = 2 ]; then summary="$summary [landing unverified: fleet-branch-landed could not determine]"
     elif [ "$lrc" = 1 ]; then
       n=$(printf '%s\n' "$unl" | sed 1d | wc -l | tr -d ' ')
+      if [ -n "${FLEET_UNLANDED_OK:-}" ] && printf '%s' "$FLEET_UNLANDED_OK" | grep -qiE 'handles publication|ready to publish|to be published|will be (landed|published)'; then
+        echo 'fleet-done: REFUSED waiver: publication is yours; land your own commits.' >&2
+        FLEET_UNLANDED_OK=""
+      fi
       if [ -n "${FLEET_UNLANDED_OK:-}" ]; then
         summary="$summary [UNLANDED WAIVED: ${FLEET_UNLANDED_OK}]"
         mkdir -p "$FLEET_REPORTS"

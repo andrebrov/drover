@@ -9,6 +9,12 @@ $FLEET_BRIEFS/queue/NNN-assign-<bean>.txt. fleet-refill hands that to an idle se
   fleet-feed             queue what is due; prints one line per bean queued
 Env: FEED_COOLDOWN_MIN (default 90)  FEED_MAX_QUEUE (default 12)  DROVER_FOCUS_BEANS  DROVER_FEED_FOCUS (words in the brief)
 """
+
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1]/"lib"))
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
 import datetime as dt, fcntl, glob, os, re, subprocess, sys, time
 
 

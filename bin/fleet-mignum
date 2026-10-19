@@ -8,6 +8,12 @@
 #
 # Requires DROVER_MIGRATIONS_DIR (e.g. "backend/src/db/migrations"), a path relative to DROVER_REPO
 # whose files start with a zero-padded number. Unset = refuses; there is no safe generic default.
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 set -euo pipefail
 # shellcheck source=drover-env
 . "$(dirname "$0")/drover-env"
@@ -22,7 +28,7 @@ git -C "$DROVER_REPO" fetch -q origin main 2>/dev/null || true
 max=$( { git -C "$DROVER_REPO" ls-tree --name-only origin/main "$DIR/"
          for b in $(git -C "$DROVER_REPO" for-each-ref --format='%(refname:short)' refs/heads/fleet/); do
            git -C "$DROVER_REPO" ls-tree -r --name-only "$b" -- "$DIR" 2>/dev/null; done
-         cut -f1 "$RES"; } | sed 's#.*/##' | grep -oE '^[0-9]{3}' | sort -n | tail -1)
+         cut -f1 "$RES"; } | sed 's#.*/##' | grep -oE '^[0-9]+' | sort -n | tail -1)
 next=$(printf '%03d' $((10#${max:-0} + 1)))
 printf '%s\t%s\t%s\n' "$next" "$bean" "$(date -u +%FT%TZ)" >> "$RES"
 echo "$next"

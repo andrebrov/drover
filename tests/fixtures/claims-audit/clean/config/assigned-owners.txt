@@ -1,0 +1,1 @@
+bean-a001 alpha @1000

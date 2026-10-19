@@ -11,6 +11,12 @@ A batch holds at most MAX_ITEMS items. Originals move to queue-batched/ (never d
 Item -> (class, area) comes from the refill log line "HUNT #N <class> / <area>"; an item whose hunt is not in the
 log is left in the queue untouched.
 """
+
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1]/"lib"))
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
 import glob, os, re, shutil, subprocess, sys, time
 
 

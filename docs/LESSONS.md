@@ -1440,3 +1440,13 @@ A comparison against another multi-agent runner found four mechanisms that remov
   holding a pin = 0.
 - **A lead command with a glob or a list runs inside a heredoc script or a script file,** including one-liners with a wildcard: an unmatched
   glob under a shell with `nomatch` aborts the command, and it repeated five times.
+
+## 2026-10-19 — current evidence has one owner
+
+An idle native status does not release a task while a detached landing process still owns its worktree. Judge command identity plus cwd, and preserve UNKNOWN when the evidence cannot be read. A current task audit compares the native owner record, four-column task snapshot, roster/pending identity and fetched main; advisory file claims do not decide ownership.
+
+A scoreboard is not a file-presence check. Its writer publishes payload, completed marker, input fingerprint, writer hash and computation time in one atomic rename. Consumers reject old, unfinished and other-version results. An owner-nudging loop must not touch that writer’s observation time.
+
+Help must exit before configuration, credential or network access. Installation must check every destination before writing any; an unknown installed-only patch is a reconciliation problem, not a reason to add a force bypass. Keep hooks in source, not in runtime text replacements.
+
+A main monitor publishes the revision it actually evaluated before looking at newer main. A missing fixture lease is UNAVAILABLE; a failing green base cannot identify a new code culprit. Run timeout children in an owned process group and reap the group before releasing its lease. Keep branch/ref strings in argv, never in evaluated shell text.

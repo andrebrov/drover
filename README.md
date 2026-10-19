@@ -80,8 +80,7 @@ mid-review was interrupted then double-assigned, a third was displaced out from 
 time.**
 
 - **Observer mode** (`touch state/observer`) turns the watcher into a pure observer: every tick becomes
-  `fleet-observe` instead of the mutating lanes above — it reads state, logs, and alerts, and never presses
-  a key in a pane, reassigns a bean, lands, or pushes (`rm state/observer` restores the normal lanes). Use
+  `fleet-observe` instead of the mutating lanes above — it reads state, logs and alerts instead of entering those lanes. Explicit lead-queue dispatch, remembered-seat recovery and a safe shared-main fast-forward remain supported; it never lands or pushes (`rm state/observer` restores the normal lanes). Use
   it when a human or the agents themselves are going to own dispatch/landing directly for a while.
 - **The lead queue** is what a human or lead uses to hand out work while the watcher stays observer-only:
   write a TAB-delimited `<bean>\t<harnesses-or-*>\t<prompt>` line to `state/lead-queue` and list eligible
@@ -92,9 +91,7 @@ time.**
   rounds, then a self-run SHIP-bar review takes over — see `docs/LESSONS.md`), push through the one
   fleet-wide push lock (`examples/pre-push-lock.sh`), and prove the push landed with
   `git merge-base --is-ancestor <sha> origin/main` before reporting DONE.
-- **Self-serve** (`docs/self-serve-playbook.md`): seats on a harness listed in `DROVER_SELF_SERVE` pick their
-  own ready bean (claimed atomically through `state/owner/<bean>`) or run one hunt when no queued line fits
-  them, instead of idling beside a queue routed to other harnesses.
+- **Explicit ownership:** automatic self-serve fallback is retired. The lead queue or finite root-granted routing assigns the work. The [historical playbook](docs/self-serve-playbook.md) remains a reference for a human-assigned scope, not an active scheduler.
 
 `fleet-observe --board` gives a one-screen read of the fleet in observer mode, and observer ticks still
 stamp `state/last` so the tick-stall alert doesn't fire on a watcher that's running exactly as configured.
@@ -289,8 +286,6 @@ values as `${VAR:-value}` so an environment variable still wins. See [`examples/
 | `DROVER_GENERATED` | empty | ERE of generated paths `fleet-claim` refuses to claim. |
 | `DROVER_LEAD_SEATS` | `lead lead-backup` | Seats `fleet-yolo` never restarts and `fleet-observe` never maps for auto-rename. |
 | `DROVER_SEAT_MODELS` | empty | `seat=model` pairs: a seat with no `--model` of its own is relaunched on its pin by `fleet-yolo`. |
-| `DROVER_SELF_SERVE` | empty | Harnesses whose idle seats self-serve per `docs/self-serve-playbook.md` (e.g. `opencode`). |
-| `DROVER_OWNED_AREAS` | empty | `area:owner-seat` pairs: areas one seat owns alone. Every self-serve prompt sent to another seat says never to take a bean there. |
 | `FLEET_HEAVY_SLOTS`, `FLEET_PUSH_SLOTS` | `2`, `3` | `fleet-slot`: general heavy-run slots are 2..N (`0` disables the limiter); push slots are separate and parallel. |
 | `FLEET_NPROC_LIMIT` | `1500` | Per-user process ceiling for each `fleet-slot run` child and each seat shell started by `fleet` (`ulimit -u`); lower-only; `0` disables. |
 | `DROVER_MIGRATIONS_STATUS` | empty | Command printing `PENDING <n>_<name>` per unapplied migration; `fleet-observe` alerts hourly on any not in `state/migrations-held`. |
@@ -334,3 +329,9 @@ subset is [`skills/fleet-peers/SKILL.md`](skills/fleet-peers/SKILL.md).
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## October 19 tooling update
+
+Callsigned seats, lockfile-keyed dependencies, guarded installation, native ownership audits, stamped measurements, a read-only kanban observatory, finite opt-in routing, precedent-aware briefs and a project-configurable main tripwire are included. See [the update and revision accounting](docs/UPDATES-2026-10-19.md) and [configuration](examples/config).
+
+Run the complete offline fixture suite with `bash tests/run-all.sh`. Installation refuses uncommitted sources or unknown installed-only drift; `--force` does not waive that check.

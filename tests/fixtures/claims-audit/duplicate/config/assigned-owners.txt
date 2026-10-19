@@ -1,0 +1,2 @@
+bean-a001 alpha @1000
+bean-a001 beta @1001

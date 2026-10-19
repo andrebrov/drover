@@ -7,6 +7,12 @@ no network, API error) exits 2 and prints nothing, and fleet-watch then behaves 
 The API key is read from ~/.config/typesafe/api_key inside this process; it never appears in argv.
 Text is redacted of credential-shaped strings before it leaves the machine; pane tails and reports still
 contain paths, branch names and task titles — enable this only if sending those to api.typesafe.ai is OK."""
+
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1]/"lib"))
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
 import json, os, re, sys, urllib.request
 NOOP = ("This report describes a round in which the coding agent produced NO new work: it only re-carried, "
         "re-picked, cherry-picked, rebased or re-verified commits that already existed (often already approved), "

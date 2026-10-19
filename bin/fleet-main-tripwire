@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""fleet-main-tripwire — evaluate origin/main with the project's own gate.
+
+2026-10-16: publish a completed result before catching up with a moving main.
+2026-10-17: infrastructure refusals are unavailable; never attribute them as code failures.
+Uses DROVER_TRIPWIRE_GATE when configured, otherwise fleet-slot + fleet-verify-main.
+The project adapter owns DB provisioning and fixture leases, just as its push gate does.
+No deployment, migrations, remote writes or agent messages.
+"""
+import argparse,fcntl,hashlib,json,os,re,signal,subprocess,sys,tempfile,time
+from pathlib import Path
+from urllib.parse import unquote,urlparse
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'lib'))
+from fleet_usage import gate
+gate(sys.argv,__file__)
+from fleet_config import configure
+config=configure(export=__name__=="__main__")
+REPO=config.get('DROVER_REPO') or os.getcwd()
+STATE_DIR=Path(config.get('TRIPWIRE_STATE',os.path.join(config['DROVER_HOME'],'main-tripwire')))
+ALERTS=Path(config.get('TRIPWIRE_ALERTS',os.path.join(config['FLEET_STATE'],'alerts')))
+WRITER={'writer_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),'writer_pid':os.getpid(),'writer_loaded_at':int(time.time())}
+FAIL_RE=re.compile(r'^\s*FAIL\s+(\S+)',re.M)
+def _run(cmd, cwd=None, timeout=1800, env=None):
+    e = dict(os.environ)
+    if env:
+        e.update(env)
+    # subprocess.run kills only the leader on timeout; grandchildren kept the
+    # slot and old checkout alive after the tripwire crashed (2026-10-16).
+    with subprocess.Popen(cmd, cwd=cwd, env=e, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, start_new_session=True) as proc:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try: os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError: pass
+            try: out, err = proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                try: os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                out, err = proc.communicate()
+            raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+        return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+def failed_test_files(output, cwd=None):
+    """Name suites from ANSI Jest, node:test TAP diagnostics and its spec failure summary."""
+    clean = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', output or '')
+    found, tap_failure = [], False
+    def node_file(location):
+        location = location.strip().strip("'\"")
+        match = re.match(r'(.+\.[cm]?[jt]sx?)(?::\d+){1,2}$', location)
+        if not match: return
+        file = match.group(1)
+        if file.startswith('file://'): file = unquote(urlparse(file).path)
+        if not os.path.isabs(file): file = os.path.abspath(os.path.join(cwd or os.getcwd(), file))
+        found.append(file)
+    for line in clean.splitlines():
+        jest = FAIL_RE.match(line)
+        if jest: found.append(jest.group(1))
+        if re.match(r'\s*not ok\s+\d+\b', line): tap_failure = True
+        elif re.match(r'\s*(?:ok\s+\d+\b|\.\.\.$|# Subtest:)', line): tap_failure = False
+        location = re.match(r'\s*location:\s*(.+)', line)
+        if tap_failure and location: node_file(location.group(1))
+        spec = re.match(r'\s*test at (.+)', line)
+        if spec: node_file(spec.group(1))
+    return list(dict.fromkeys(found))
+
+def changes_tested_inputs(commit):
+    """Only known bookkeeping is excluded. Unknown paths remain potential build/test inputs.
+
+    Never skip a backend/config/script change merely because its suffix is not TypeScript.
+    Merge commits compare every parent; inability to inspect is unavailable, not proof of no inputs.
+    """
+    result = _run(['git', '-C', REPO, 'diff-tree', '--root', '-m', '--no-commit-id',
+                   '--name-only', '-r', commit], timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError('candidate input diff unavailable')
+    metadata = ('.beans/', 'docs/', 'reports/', 'openspec/')
+    return any(not path.startswith(metadata) and path not in ('README.md', 'CHANGELOG.md')
+               for path in result.stdout.splitlines())
+
+
+
+def git(*args):
+    return subprocess.check_output(['git','-C',REPO,*args],text=True,stderr=subprocess.DEVNULL).strip()
+
+
+def atom(path,value):
+    path.parent.mkdir(parents=True,exist_ok=True)
+    with tempfile.NamedTemporaryFile('w',dir=path.parent,delete=False) as f:
+        temporary=Path(f.name);f.write(value)
+    try:temporary.replace(path)
+    finally:temporary.unlink(missing_ok=True)
+
+
+def load_state():
+    try:return json.loads((STATE_DIR/'state.json').read_text())
+    except (OSError,ValueError):return {}
+
+
+def run_gate(tip, label):
+    """One isolated checkout and bounded process group per evaluation, including bisection."""
+    directory=Path(tempfile.mkdtemp(prefix='gate-',dir=STATE_DIR))
+    worktree=directory/'wt'
+    try:
+        subprocess.run(['git','-C',REPO,'worktree','add','-q','--detach',str(worktree),tip],check=True,capture_output=True)
+        command=config.get('DROVER_TRIPWIRE_GATE')
+        if command:
+            args=['bash','-c',command]
+        else:
+            args=[os.path.join(config['DROVER_BIN'],'fleet-slot'),'run','--',
+                  os.path.join(config['DROVER_BIN'],'fleet-verify-main'),tip]
+        result=_run(args,cwd=worktree,timeout=float(config.get('DROVER_TRIPWIRE_TIMEOUT','1800')))
+        output=result.stdout+result.stderr
+        path=STATE_DIR/'logs'/f'{label}-{tip}.log';atom(path,output)
+        if result.returncode==0:return 'green',output,path
+        if result.returncode in (2,3,75,124) or re.search(r'UNAVAILABLE|ENVIRONMENTAL|fixture unavailable|missing lease|no space left|connection refused',output,re.I):
+            return 'unavailable',output,path
+        return 'red',output,path
+    except subprocess.TimeoutExpired:
+        path=STATE_DIR/'logs'/f'{label}-{tip}.log';atom(path,'UNAVAILABLE: gate timeout; owned process group terminated\n')
+        return 'unavailable',path.read_text(),path
+    finally:
+        if worktree.exists():subprocess.run(['git','-C',REPO,'worktree','remove','--force',str(worktree)],capture_output=True)
+        directory.rmdir()
+
+
+def distance(tip,current):
+    if tip==current:return 0
+    p=subprocess.run(['git','-C',REPO,'merge-base','--is-ancestor',tip,current],capture_output=True)
+    return int(git('rev-list','--count',f'{tip}..{current}')) if p.returncode==0 else None
+
+
+def publish(state):
+    """The immutable evaluated identity/time precede the catch-up observation."""
+    atom(STATE_DIR/'state.json',json.dumps(state))
+    alert=ALERTS/'main-red.txt';receipt=ALERTS/'main-red.txt.ok'
+    if state['outcome']=='green':
+        atom(alert,'');atom(receipt,json.dumps(state))
+    else:
+        receipt.unlink(missing_ok=True)
+        text=f"{state['outcome'].upper()} origin/main @ {state['evaluated_sha']}\n"
+        text+=''.join(f'{key} {value}\n' for key,value in state.items())
+        atom(alert,text)
+
+
+def check_freshness():
+    state=load_state();at=state.get('evaluated_at');tip=state.get('evaluated_sha')
+    try:current=git('rev-parse','origin/main')
+    except subprocess.CalledProcessError:current=None
+    if not isinstance(at,(int,float)) or not tip or not current or at>time.time():
+        print('tripwire unavailable: no readable evaluation identity/time');return 2
+    if time.time()-at>7200 and tip!=current:
+        print('tripwire stale: evaluation older than two hours and main advanced');return 2
+    if state.get('outcome')=='unavailable':
+        print('tripwire unavailable: last gate could not evaluate');return 2
+    print(f"tripwire {state.get('outcome')}: evaluated {tip}; current {current}; commits_behind {distance(tip,current)}")
+    return 0
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--ref',default='origin/main')
+    parser.add_argument('--check-freshness',action='store_true')
+    parser.add_argument('--print-alert',action='store_true')
+    parser.add_argument('--dry',action='store_true')
+    args=parser.parse_args()
+    if args.check_freshness:return check_freshness()
+    if args.print_alert:
+        path=ALERTS/'main-red.txt';print(path.read_text() if path.exists() else 'UNAVAILABLE: no evaluation');return 0
+    if args.ref!='origin/main' and (STATE_DIR.resolve()==Path(config['DROVER_HOME'],'main-tripwire').resolve()
+            or ALERTS.resolve()==Path(config['FLEET_STATE'],'alerts').resolve()):
+        print('UNAVAILABLE: a pinned probe needs isolated TRIPWIRE_STATE and TRIPWIRE_ALERTS');return 2
+    if args.dry:
+        print(f'gate {args.ref}; adapter: '+(config.get('DROVER_TRIPWIRE_GATE') or 'fleet-slot + fleet-verify-main'));return 0
+    STATE_DIR.mkdir(parents=True,exist_ok=True)
+    with (STATE_DIR/'run.lock').open('a') as lease:
+        try:fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:print('UNAVAILABLE: another evaluation owns the tripwire');return 2
+        git('fetch','-q','origin','main');tip=git('rev-parse',args.ref)
+        prior=load_state();base=prior.get('last_green')
+        state={'evaluated_sha':tip,'evaluated_at':int(time.time()),'last_green':base,**WRITER}
+        outcome,output,path=run_gate(tip,'evaluated')
+        state.update(outcome=outcome,log=str(path),failed_files=failed_test_files(output))
+        if outcome=='red':
+            # Confirm failures serially; a one-off load/timeout result cannot turn main red.
+            outcome,again,_=run_gate(tip,'confirmed')
+            state['outcome']=outcome
+            if outcome=='red' and base:
+                baseline,_,_=run_gate(base,'baseline')
+                if baseline!='green':state.update(outcome='unavailable',reason='gate also fails at green base')
+                else:
+                    candidates=[sha for sha in git('rev-list','--reverse','--ancestry-path',f'{base}..{tip}').splitlines() if changes_tested_inputs(sha)]
+                    # Every candidate is tested against the same fixed gate inputs/adapter.
+                    while candidates:
+                        middle=(len(candidates)-1)//2;candidate=candidates[middle]
+                        result,_,_=run_gate(candidate,'attribution')
+                        if result=='unavailable':state.update(outcome='unavailable',reason='attribution gate unavailable');break
+                        if result=='green':candidates=candidates[middle+1:]
+                        else:candidates=candidates[:middle+1] if middle else [candidate];
+                        if len(candidates)==1:
+                            result,_,_=run_gate(candidates[0],'first-bad')
+                            if result=='red':state['first_bad']=candidates[0]
+                            elif result=='unavailable':state.update(outcome='unavailable',reason='first-bad gate unavailable')
+                            break
+            if state['outcome']=='red':
+                subject=git('show','-s','--format=%s',state.get('first_bad') or tip)
+                match=re.search(config['DROVER_BEAN_RE'],subject);bean=match.group() if match else None
+                state.update(bean=bean or 'unknown',seat='unknown')
+                if bean:
+                    reports=sorted(Path(config['FLEET_REPORTS']).glob(f'*-{bean}.md'),key=lambda p:p.stat().st_mtime,reverse=True)
+                    if reports:state['seat']=reports[0].name.removesuffix(f'-{bean}.md')
+        if state['outcome']=='green':state['last_green']=tip
+        # Publish before fetch: a constantly moving main cannot starve an already completed result.
+        publish(state)
+        try:
+            git('fetch','-q','origin','main');current=git('rev-parse','origin/main')
+            state.update(origin_main_sha=current,commits_behind=distance(tip,current));publish(state)
+        except subprocess.CalledProcessError:pass
+        print(f"tripwire {state['outcome'].upper()}: evaluated {tip}; log {path}")
+        return {'green':0,'red':1,'unavailable':2}[state['outcome']]
+
+
+if __name__=='__main__':
+    try:sys.exit(main())
+    except (OSError,ValueError,subprocess.SubprocessError) as error:
+        print(f'UNAVAILABLE: tripwire evidence unavailable ({type(error).__name__})');sys.exit(2)

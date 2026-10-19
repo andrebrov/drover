@@ -20,6 +20,12 @@
 # and every dispatch looks abandoned after 15 minutes even when the commit and the
 # report are both on disk. The branch is therefore recorded per agent and used for
 # the sha, the code-commit count and the last-commit age.
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 set -euo pipefail
 # shellcheck source=drover-env
 . "$(dirname "$0")/drover-env"

@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""bean-uhrt: finite root-approved routing inside the existing observer, never a daemon.
+11 TAB fields: agent bean role report branch brief brief_sha after_mode after_ref after_sha generation.
+Commands: tick | status | validate | register ID JOB_FILE ROOT_GRANT_JSON. No manual completion command.
+"""
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1] / "lib"))
+from fleet_config import configure
+config=configure(export=__name__=="__main__")
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
+
+import base64,hashlib,json,os,re,selectors,signal,stat,subprocess,sys,tempfile,time
+from pathlib import Path
+HOME=Path.home()
+ST=Path(config.get('FLEET_STATE',config['FLEET_STATE']))
+R=Path(config.get('SAFE_ROOT',str(ST/'safe-route')))
+TASKS=Path(config.get('FLEET_TASKS',config['FLEET_TASKS']))
+REPORTS=Path(config.get('FLEET_REPORTS',config['FLEET_REPORTS'])).resolve()
+BRIEFS=Path(config['FLEET_BRIEFS']).resolve()
+INBOX=Path(config.get('FLEET_INBOX',config['FLEET_INBOX']))
+REPO=Path(config.get('FLEET_REPO',config.get('DROVER_REPO',os.getcwd()))).resolve()
+TRACK=config.get('FLEET_TRACK',str(Path(config['DROVER_BIN'])/'fleet-track'))
+HERDR=config.get('HERDR','herdr')
+MAX_LOG=262144
+class Refused(Exception):pass
+def now():return int(config.get('SAFE_NOW',time.time()))
+def opaque(s):return isinstance(s,str) and bool(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}',s)) and '..' not in s
+def digest(b):return hashlib.sha256(b).hexdigest()
+def read(p,cap=16384):
+ if p.is_symlink() or not p.is_file() or p.stat().st_size>cap:raise Refused('unsafe or missing file')
+ return p.read_bytes()
+def atom(p,b):
+ p.parent.mkdir(parents=True,exist_ok=True)
+ fd,tmp=tempfile.mkstemp(prefix='.'+p.name+'.',dir=str(p.parent))
+ try:
+  with os.fdopen(fd,'wb') as f:f.write(b);f.flush();os.fsync(f.fileno())
+  os.replace(tmp,p)
+ finally:
+  if os.path.exists(tmp):os.unlink(tmp)
+def put(p,d):atom(p,(json.dumps(d,sort_keys=True)+'\n').encode())
+def load(p):
+ try:return json.loads(read(p))
+ except (ValueError,OSError):raise Refused('invalid record')
+def log(s):
+ p=R/'log'
+ if p.exists() and p.stat().st_size>=MAX_LOG:
+  with p.open('rb') as f:f.seek(max(0,p.stat().st_size-MAX_LOG));atom(R/'log.1',f.read(MAX_LOG))
+  atom(p,b'')
+ with p.open('a') as f:f.write(f'{now()} {s}\n')
+def notice(jid,kind,s):
+ if not opaque(jid) or not opaque(kind):raise Refused('unsafe notice identity')
+ key=f'{kind}-{jid}';p=R/'lead'/key
+ if p.exists():return
+ INBOX.mkdir(parents=True,exist_ok=True)
+ atom(INBOX/f'{now()}-lead-safe-route-{key}.msg',f'{now()}\tlead\tsafe-route\t{kind}\t{s}\t-\n'.encode())
+ atom(p,b'notified\n');log(f'LEAD_NOTICE {key} {s}')
+def bounded(argv,seconds=5,cap=16384):
+ """Bound before buffering. Own and reap the native group, including timeout descendants."""
+ p=None;buf=bytearray();rc=125;sel=selectors.DefaultSelector()
+ try:
+  p=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,start_new_session=True,env=os.environ.copy(),bufsize=0)
+  os.set_blocking(p.stdout.fileno(),False);sel.register(p.stdout,selectors.EVENT_READ);deadline=time.monotonic()+seconds
+  while True:
+   if time.monotonic()>=deadline:rc=124;break
+   events=sel.select(min(.02,max(0,deadline-time.monotonic())))
+   for _,_ in events:
+    try:b=os.read(p.stdout.fileno(),min(4096,cap+1-len(buf)))
+    except BlockingIOError:continue
+    if not b:sel.unregister(p.stdout)
+    else:buf.extend(b)
+   if len(buf)>cap:rc=125;break
+   if p.poll() is not None and not sel.get_map():rc=p.returncode;break
+ except OSError:rc=125
+ finally:
+  sel.close()
+  if p is not None:
+   for sig in [signal.SIGTERM,signal.SIGKILL]:
+    try:os.killpg(p.pid,sig)
+    except ProcessLookupError:pass
+   if p.stdout:p.stdout.close()
+   try:p.wait(timeout=.2)
+   except subprocess.TimeoutExpired:rc=125
+ return rc,bytes(buf[:cap])
+def git(*args):
+ gd=REPO/'.git'
+ if gd.is_file():
+  s=read(gd,4096).decode().strip()
+  if not s.startswith('gitdir: '):raise Refused('invalid gitdir')
+  gd=(REPO/s[8:]).resolve()
+ rc,out=bounded(['/usr/bin/git','--git-dir='+str(gd),'--work-tree='+str(REPO),*args])
+ if rc:raise Refused('source unavailable')
+ return out.decode().strip()
+def generation():
+ g=read(R/'generation',256).decode().strip()
+ if not opaque(g):raise Refused('blank or invalid generation')
+ floor=int(read(R/'activation',64).decode().strip())
+ if floor<=0 or floor>now():raise Refused('invalid activation timestamp')
+ return g,floor
+def path(s,root):
+ p=Path(s)
+ if not p.is_absolute() or '..' in p.parts or any(ord(c)<32 for c in s) or p!=p.resolve():raise Refused('unsafe path')
+ try:p.relative_to(root)
+ except ValueError:raise Refused('path outside approved root')
+ return p
+def parse_job(jid,raw,gen):
+ if not opaque(jid):raise Refused('unsafe job id')
+ f=raw.decode().rstrip('\n').split('\t')
+ if len(f)!=11 or any(not s or '\n' in s or '\r' in s for s in f):raise Refused('expected 11 nonblank fields')
+ a,b,role,rp,br,bp,bsha,mode,ref,asha,jgen=f
+ if not opaque(a) or not opaque(b) or role not in ['coder','reviewer'] or jgen!=gen:raise Refused('identity or generation')
+ if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_./-]{0,200}',br) or '..' in br or br.startswith('/'):raise Refused('branch')
+ if not re.fullmatch('[a-f0-9]{64}',bsha):raise Refused('brief hash')
+ if mode not in ['bootstrap','completed']:raise Refused('after mode')
+ if mode=='bootstrap':
+  if (ref,asha)!=('-','-'):raise Refused('bootstrap fields')
+ else:
+  path(ref,REPORTS)
+  if not re.fullmatch('[a-f0-9]{64}',asha):raise Refused('after hash')
+ path(rp,REPORTS);brief=path(bp,BRIEFS)
+ if digest(read(brief,65536))!=bsha:raise Refused('brief changed')
+ return dict(zip(['agent','bean','role','report','branch','brief','brief_sha','mode','after_ref','after_sha','generation'],f),id=jid,job_sha256=digest(raw))
+def grant_for(j,gp):
+ st=gp.stat()
+ if gp.is_symlink() or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600:raise Refused('grant must be owner-only 0600')
+ g=load(gp)
+ for k in ['agent','bean','role','generation','job_sha256']:
+  if g.get(k)!=j[k]:raise Refused('root grant mismatch')
+ if g.get('schema')!=1 or g.get('job_id')!=j['id'] or g.get('bean_status') not in ['todo','in-progress']:raise Refused('root role/status grant')
+ if not isinstance(g.get('approved_at'),int) or not isinstance(g.get('expires_at'),int) or not (0<g['approved_at']<=now()<=g['expires_at']<=g['approved_at']+86400):raise Refused('grant expired/invalid')
+ if not re.fullmatch('[a-f0-9]{40}',str(g.get('source_sha',''))) or git('rev-parse','--verify',j['branch']+'^{commit}')!=g['source_sha']:raise Refused('unapproved source')
+ expected=g.get('expected_task_sha256')
+ if expected is not None and not re.fullmatch('[a-f0-9]{64}',str(expected)):raise Refused('task grant')
+ # Root explicitly records the source harness; a reviewer must have a different harness.
+ if j['role']=='reviewer':
+  if not opaque(g.get('reviewed_harness')) or g['reviewed_harness']==j['agent'].split('-')[0]:raise Refused('same-harness review')
+ return g
+def task_record(a):
+ p=TASKS/a
+ if not p.exists():return None
+ raw=read(p,4096);f=raw.decode().rstrip('\n').split('\t')
+ if len(f)!=4 or not f[0].isdigit() or not opaque(f[1]) or (f[2]!='none' and not re.fullmatch('[a-f0-9]{7,40}',f[2])):raise Refused('unknown TASK')
+ path(f[3],REPORTS)
+ return {'raw_b64':base64.b64encode(raw).decode(),'sha256':digest(raw),'fields':f}
+def completed(a):
+ try:return load(R/'completed'/a)
+ except (Refused,OSError):return None
+def task_available(a,t):
+ if t is None:return True
+ c=completed(a)
+ return c is not None and c.get('generation')==generation()[0] and c.get('task_sha256')==t['sha256'] and c.get('task_b64')==t['raw_b64']
+BOOTSTRAP_STATES={'DONE','LANDED'}
+# Terminal handoff states free a seat for the lead to handle; they are NOT feature-complete claims.
+HANDOFF_STATES={'BLOCKED','CHANGES','PARTIAL'}
+HANDOFF_DISPOSITIONS={'handoff','handoff-to-lead'}
+def handoff_ok(g):
+ if g.get('bootstrap_handoff_disposition') not in HANDOFF_DISPOSITIONS:return False
+ reason=g.get('bootstrap_handoff_reason')
+ return isinstance(reason,str) and bool(reason.strip())
+def bootstrap_free(j,g,t):
+ if j['mode']!='bootstrap':return False
+ if t is None:return g.get('expected_task_sha256') is None
+ # Root explicitly authorizes one exact inactive TASK snapshot, never a bean-name exemption.
+ if g.get('expected_task_sha256')!=t['sha256'] or g.get('free_task_b64')!=t['raw_b64']:return False
+ verified=g.get('verified_free_at')
+ if type(verified) is not int or not g['approved_at']<=verified<=now() or verified<int(t['fields'][0]):return False
+ state=g.get('bootstrap_report_state')
+ if state in HANDOFF_STATES:
+  if not handoff_ok(g):return False
+ elif state not in BOOTSTRAP_STATES:return False
+ try:
+  p=path(t['fields'][3],REPORTS)
+  return p.is_file() and p.stat().st_mtime>=int(t['fields'][0]) and digest(read(p,4194304))==g.get('bootstrap_report_sha256')
+ except (Refused,OSError):return False
+def dependency(j,g,t):
+ if j['mode']=='bootstrap':
+  if not bootstrap_free(j,g,t):raise Refused('bootstrap requires exact approved free TASK snapshot')
+ else:
+  h=digest(read(Path(j['after_ref']),4194304))
+  if h!=j['after_sha']:raise Refused('dependency changed')
+  proof=False
+  for p in sorted((R/'completed').iterdir()):
+   c=load(p)
+   if c.get('generation')==j['generation'] and c.get('report')==j['after_ref'] and c.get('report_sha256')==h:proof=True;break
+  if not proof:raise Refused('dependency has no exact completion proof')
+def safe_budget(a):
+ try:
+  f=read(ST/'budget-seat',65536).decode().splitlines();stamp=int(f[0]);age=now()-stamp
+  if age<0 or age>300:return False
+  rows=[s.split() for s in f[1:] if s.split() and s.split()[0]==a]
+  return len(rows)==1 and len(rows[0])==4 and rows[0][2] in ['idle','done'] and rows[0][3].upper()=='OK'
+ except (Refused,OSError,ValueError,IndexError):return False
+def memory_clear():
+ try:
+  f=read(ST/'memory-status',128).decode().splitlines()
+  return len(f)==2 and f[0].isdigit() and 0<=now()-int(f[0])<=300 and f[1]=='1' and not (ST/'memory-pressure').exists()
+ except (Refused,OSError):return False
+def reservation(a):
+ d=R/'reserved'/a
+ r=load(d/'reservation.json')
+ if not all(opaque(r.get(k)) for k in ['id','agent','bean','generation']) or r.get('agent')!=a or r.get('role') not in ['coder','reviewer'] or type(r.get('dispatch_ts')) is not int or r['dispatch_ts']<=0:raise Refused('invalid reservation')
+ path(r['report'],REPORTS)
+ expected=f"{r['id']}\n{r['bean']}\n{r['role']}\n{r['report']}\n".encode()
+ if read(d/'job')!=expected or read(d/'dispatch_ts').decode().strip()!=str(r['dispatch_ts']):raise Refused('reservation identity changed')
+ return r
+def progress(r):
+ try:
+  p=path(r['report'],REPORTS)
+  if p.is_file() and p.stat().st_mtime>=r['dispatch_ts']:return True
+  baseline=r['task']['fields'][2]
+  git('merge-base','--is-ancestor',baseline,r['branch'])
+  lines=git('log','--format=%ct','--no-merges',baseline+'..'+r['branch'],'--','.',':(exclude).beans').splitlines()
+  return any(s.isdigit() and int(s)>=r['dispatch_ts'] for s in lines)
+ except (Refused,OSError,KeyError,TypeError):return False
+def completions(jobs,gen,floor):
+ # Timestamp-prefixed native filenames discard historical work without opening/logging each message.
+ # Enumerate at most 20k names; read at most 128 current messages per tick, with a rotating cursor.
+ names=[];count=0
+ with os.scandir(INBOX) as entries:
+  for e in entries:
+   count+=1
+   if count>20000:notice('inbox','capacity','inbox over bounded capacity; root archive required');break
+   prefix=e.name.split('-',1)[0]
+   if e.name.endswith('.msg') and prefix.isdigit() and int(prefix)>=floor and e.is_file(follow_symlinks=False):names.append(e.name)
+ names.sort()
+ try:cursor=read(R/'inbox-cursor',256).decode()
+ except (Refused,OSError):cursor=''
+ selected=[n for n in names if n>cursor]+[n for n in names if n<=cursor]
+ byseat={}
+ for j in jobs:byseat.setdefault((j['agent'],j['bean']),[]).append(j)
+ for name in selected[:128]:
+  m=INBOX/name
+  try:
+   raw=read(m);f=raw.decode().rstrip('\n').split('\t')
+   if len(f)!=6 or not f[0].isdigit():continue
+   ts,a,b,state,summary,rp=f
+   if not opaque(a) or not opaque(b):continue
+   r=reservation(a)
+   matches=[j for j in byseat.get((a,b),[]) if j['id']==r.get('id')]
+   if len(matches)!=1:continue
+   j=matches[0];t=task_record(a)
+   if r.get('generation')!=gen or any(r.get(k)!=j[k] for k in ['id','agent','bean','role','report','job_sha256']):continue
+   if t is None or t!=r.get('task') or t['fields'][1]!=b or t['fields'][3]!=rp or rp!=j['report']:continue
+   if not r['dispatch_ts']<=int(ts)<=now()+5:continue
+   if state in ['PARTIAL','CHANGES','BLOCKED']:
+    notice(j['id'],state,f'{a}/{b} reported {state}; reserved for lead follow-up');continue
+   if state not in ['DONE','LANDED']:continue
+   report=path(rp,REPORTS)
+   if not report.is_file() or report.stat().st_mtime<r['dispatch_ts']:continue
+   rb=read(report,4194304);before=report.stat()
+   if digest(read(report,4194304))!=digest(rb) or report.stat().st_mtime_ns!=before.st_mtime_ns:continue
+   c={'id':j['id'],'agent':a,'bean':b,'role':j['role'],'generation':gen,'dispatch_ts':r['dispatch_ts'],'message_ts':int(ts),'report':rp,'report_sha256':digest(rb),'task_sha256':t['sha256'],'task_b64':t['raw_b64'],'completed_at':now()}
+   # Durable proof comes first. TASK is never cleared. Its exact digest authorizes the next CAS write.
+   put(R/'completed'/a,c)
+   (R/'queue'/(j['id']+'.job')).unlink()
+   # Only these known reservation files are removed; no recursive/path-derived deletion.
+   d=R/'reserved'/a
+   for p in d.iterdir():
+    if p.is_file() and not p.is_symlink():p.unlink()
+   d.rmdir()
+   os.replace(m,R/'consumed'/name)
+   log(f"COMPLETED {j['id']} {a} {b} exact TASK/report/generation")
+  except (Refused,OSError,ValueError,KeyError):continue
+ if selected:atom(R/'inbox-cursor',selected[min(127,len(selected)-1)].encode())
+def seat_held(a):
+ # Root seat markers are singular 'hold'; keep local and legacy aliases without clearing any marker.
+ return any((root/a).exists() for root in [R/'holds',ST/'hold',ST/'blocked',ST/'held'])
+def roster(out):
+ frame=json.loads(out)
+ if not isinstance(frame,dict) or not isinstance(frame.get('result'),dict) or not isinstance(frame['result'].get('agents'),list):raise ValueError('invalid roster envelope')
+ agents={}
+ for peer in frame['result']['agents']:
+  if not isinstance(peer,dict) or not opaque(peer.get('name')):continue
+  name=peer['name'];status=peer.get('agent_status')
+  if not isinstance(status,str) or status not in ['idle','done','working','blocked','unknown','MISSING'] or name in agents:
+   agents[name]={'name':name,'agent_status':'unknown'}
+  else:agents[name]=peer
+ return agents
+def tick():
+ if not (R/'enabled').is_file():return
+ gen,floor=generation();jobs=[]
+ for p in sorted((R/'queue').glob('*.job'))[:100]:
+  try:jobs.append(parse_job(p.stem,read(p),gen))
+  except (Refused,OSError,ValueError):log('REFUSED queued job schema/identity')
+ completions(jobs,gen,floor)
+ for d in sorted((R/'reserved').iterdir()):
+  if not d.is_dir() or d.is_symlink() or not opaque(d.name):continue
+  try:
+   r=reservation(d.name)
+   if now()-r['dispatch_ts']>=900 and not progress(r):notice(r['id'],'no-progress',f"{d.name}/{r['bean']} has no fresh source commit or report after 15 minutes")
+  except (Refused,OSError,KeyError):continue
+ if (ST/'land-paused').exists() or not memory_clear():log('HOLD pause/pressure/unknown memory; all new prompts held');return
+ rc,out=bounded([HERDR,'agent','list'])
+ if rc:log('HOLD roster unavailable');return
+ try:agents=roster(out)
+ except (ValueError,KeyError,TypeError):log('HOLD roster unknown');return
+ attempts=0;limit=max(1,min(2,int(config.get('SAFE_MAX_PER_TICK','1'))))
+ for j in jobs:
+  if attempts>=limit:break
+  if not (R/'queue'/(j['id']+'.job')).exists():continue
+  a=j['agent'];d=R/'reserved'/a
+  try:
+   if seat_held(a) or d.exists():continue
+   if agents.get(a,{}).get('agent_status') not in ['idle','done'] or not safe_budget(a):continue
+   t=task_record(a);g=grant_for(j,R/'grants'/(j['id']+'.json'))
+   root_free=bootstrap_free(j,g,t)
+   if not task_available(a,t) and not root_free:continue
+   if j['role']=='coder':
+    owned=False
+    for p in TASKS.iterdir():
+     if p.name.startswith('.') or not p.is_file() or not opaque(p.name):continue
+     other=task_record(p.name)
+     if p.name==a and root_free:continue
+     if other and other['fields'][1]==j['bean'] and not task_available(p.name,other) and 'reviewer' not in p.name:owned=True;break
+    if owned:continue
+   dependency(j,g,t)
+   expected=t['sha256'] if t else '-'
+   attempts+=1
+   d.mkdir()
+   r={**j,'dispatch_ts':now(),'task':None,'delivery':'REGISTERING'}
+   atom(d/'job',f"{j['id']}\n{j['bean']}\n{j['role']}\n{j['report']}\n".encode());atom(d/'dispatch_ts',str(r['dispatch_ts']).encode());put(d/'reservation.json',r)
+   rc,_=bounded([TRACK,'dispatch',a,j['bean'],j['report'],j['branch'],expected])
+   if rc:
+    # Failed writer may have partially changed state; hold it, never clear a TASK or retry a prompt.
+    r['delivery']='REGISTRATION_FAILED';put(d/'reservation.json',r);notice(j['id'],'reg-fail',f"registration failed for {a}/{j['bean']}; no prompt");continue
+   nt=task_record(a)
+   if nt is None or nt['fields'][1]!=j['bean'] or nt['fields'][3]!=j['report'] or int(nt['fields'][0])<r['dispatch_ts'] or nt['fields'][2]!=g['source_sha'][:len(nt['fields'][2])]:
+    notice(j['id'],'reg-fail',f'registration not observable for {a}; no prompt');continue
+   r['task']=nt;r['dispatch_ts']=int(nt['fields'][0]);atom(d/'dispatch_ts',str(r['dispatch_ts']).encode());r['delivery']='SENDING';put(d/'reservation.json',r)
+   # Recheck founder holds immediately before sending, after registration.
+   if (ST/'land-paused').exists() or not memory_clear() or seat_held(a):r['delivery']='HELD';put(d/'reservation.json',r);continue
+   rc,out=bounded([HERDR,'agent','prompt',a,'Lead: read '+j['brief']+' and complete the root-approved assignment. Reply with the report path.','--wait','--until','working','--timeout','4000'],max(.1,min(5,float(config.get('SAFE_PROMPT_BOUND','5')))))
+   try:ack=json.loads(out)
+   except ValueError:ack={}
+   if rc in [124,125] or b'timeout' in out.lower():delivery='UNKNOWN_DELIVERY'
+   elif rc==0 and isinstance(ack.get('result'),dict) and ack['result'] and not ack.get('error'):delivery='ROUTED'
+   else:delivery='SEND_FAILED'
+   r['delivery']=delivery;r['prompt_rc']=rc;r['prompt_output_sha256']=digest(out);put(d/'reservation.json',r)
+   log(f"{delivery} {j['id']} -> {a} rc={rc}; reserved")
+   if delivery!='ROUTED':notice(j['id'],'send-fail',f'{delivery} for {a}/{j["bean"]}; no blind resend')
+  except (Refused,OSError,ValueError,KeyError):log(f"REFUSED {j['id']} ownership/grant/dependency")
+ if not list((R/'queue').glob('*.job')):notice('queue','empty','finite approved queue empty; lead must register jobs')
+def inflight():
+ ids={}
+ rdir=R/'reserved'
+ if not rdir.exists():return ids
+ for d in rdir.iterdir():
+  if d.is_dir() and not d.is_symlink() and opaque(d.name):
+   try:ids[reservation(d.name).get('id')]=d.name
+   except (Refused,OSError,KeyError):pass
+ return ids
+def validate():
+ gen,_=generation();rows=[];running=inflight();seen=set()
+ for p in sorted((R/'queue').glob('*.job'))[:100]:
+  jid=p.stem;row={'job':jid,'reason':'ready'}
+  if jid in seen or jid in running:row['reason']='duplicate';rows.append(row);continue
+  seen.add(jid)
+  try:j=parse_job(jid,read(p),gen)
+  except Refused as e:
+   row['reason']='changed' if 'brief changed' in str(e) else 'invalid';rows.append(row);continue
+  except (OSError,ValueError):row['reason']='invalid';rows.append(row);continue
+  a=j['agent']
+  if seat_held(a):row['reason']='occupied';rows.append(row);continue
+  if (R/'reserved'/a).exists():row['reason']='occupied';rows.append(row);continue
+  try:g=grant_for(j,R/'grants'/(jid+'.json'))
+  except Refused as e:
+   row['reason']='expired' if 'expired' in str(e) else 'invalid';rows.append(row);continue
+  if j['mode']=='bootstrap' and not bootstrap_free(j,g,task_record(a)):
+   try:
+    t=task_record(a);rp=path(t['fields'][3],REPORTS)
+    held=not (rp.is_file() and digest(read(rp,4194304))==g.get('bootstrap_report_sha256'))
+   except (Refused,OSError,TypeError):held=True
+   row['reason']='changed' if held else 'invalid';rows.append(row);continue
+  rows.append(row)
+ return {'jobs':rows,'reason':'empty' if not rows else 'ok'}
+def main():
+ command=sys.argv[1] if len(sys.argv)>1 else 'tick'
+ if command=='validate':
+  try:print(json.dumps(validate()));return 0
+  except (Refused,OSError,ValueError,KeyError) as e:print(json.dumps({'jobs':[],'reason':'invalid','error':str(e)}));return 2
+ if command=='status':
+  q=sorted(p.name for p in (R/'queue').glob('*.job')) if (R/'queue').exists() else []
+  d=sorted(p.name for p in (R/'reserved').iterdir()) if (R/'reserved').exists() else []
+  print(json.dumps({'jobs':q,'reserved':d}));return 0
+ if command not in ['tick','register']:print('usage: fleet-safe-route tick|status|validate|register ID JOB_FILE ROOT_GRANT_JSON',file=sys.stderr);return 2
+ for sub in ['queue','reserved','completed','lead','consumed','grants','holds']:(R/sub).mkdir(parents=True,exist_ok=True)
+ lock=R/'tick.lock'
+ try:lock.mkdir()
+ except FileExistsError:return 0 if command=='tick' else 75
+ try:
+  if command=='tick':
+   tick()
+   # bean-hhy2: finite callback while the existing tick lock remains held.
+   helper=config.get('FLEET_LEAD_ATTENTION',str(HOME/'.local/bin/fleet-lead-attention'))
+   if Path(helper).is_file():
+    rc,out=bounded([sys.executable,helper,'tick'],seconds=12,cap=16384)
+    log('LEAD_ATTENTION '+str(rc)+' '+out.decode(errors='replace').strip())
+  else:
+   if len(sys.argv)!=5:raise Refused('registration arguments')
+   gen,_=generation();jid=sys.argv[2];raw=read(Path(sys.argv[3]));j=parse_job(jid,raw,gen);gp=Path(sys.argv[4]);g=grant_for(j,gp)
+   if j['mode']=='bootstrap' and not bootstrap_free(j,g,task_record(j['agent'])):raise Refused('bootstrap free snapshot invalid')
+   if (R/'queue'/(jid+'.job')).exists() or any(load(d/'reservation.json').get('id')==jid for d in (R/'reserved').iterdir() if d.is_dir()):raise Refused('duplicate job id')
+   atom(R/'grants'/(jid+'.json'),read(gp));atom(R/'queue'/(jid+'.job'),raw)
+  return 0
+ except (Refused,OSError,ValueError,KeyError) as e:
+  log('REFUSED '+str(e));return 2
+ finally:lock.rmdir()
+if __name__=='__main__':sys.exit(main())

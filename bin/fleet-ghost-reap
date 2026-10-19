@@ -19,6 +19,12 @@ Env: DROVER_GHOST_GRACE_MIN  minutes a ghost must sit untouched (default 30)
   fleet-ghost-reap            reset ghosts to todo (+ a verify-first note) and commit on main
   fleet-ghost-reap --dry-run  list ghosts and which already have commits on main; change nothing
 """
+
+import sys as _fleet_sys
+from pathlib import Path as _FleetPath
+_fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1]/"lib"))
+from fleet_usage import gate as _fleet_gate
+_fleet_gate(_fleet_sys.argv, __file__)
 import datetime, glob, json, os, subprocess, sys, time
 
 

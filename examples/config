@@ -17,12 +17,8 @@ DROVER_LEAD_SEATS="${DROVER_LEAD_SEATS:-lead lead-backup}"
 # its pinned model, so a restart cannot quietly move e.g. the judge to the harness default.
 DROVER_SEAT_MODELS="${DROVER_SEAT_MODELS:-}"   # e.g. 'judge=<model-id> architect=<model-id>'
 
-# Observer mode (fleet-observe). Harnesses whose idle seats pick their own work from the board when no queued
-# line fits them (docs/self-serve-playbook.md). Empty = idle seats just raise the idle alert.
-DROVER_SELF_SERVE="${DROVER_SELF_SERVE:-}"            # e.g. 'opencode'
-# Areas a single seat owns alone (`area:owner-seat`, space-separated). Self-serve prompts to every OTHER seat say
-# never to take a bean in them. Empty = no owned areas.
-DROVER_OWNED_AREAS="${DROVER_OWNED_AREAS:-}"          # e.g. 'billing:billing-reviewer'
+# Automatic self-serve fallback is retired. Use an explicit lead queue or finite root-granted job.
+# Historical DROVER_SELF_SERVE / DROVER_OWNED_AREAS settings no longer schedule work.
 # A command, run in DROVER_REPO, that prints one "PENDING <number>_<name>" line per unapplied migration.
 # fleet-observe alerts hourly on any not listed in state/migrations-held. Empty = check off.
 DROVER_MIGRATIONS_STATUS="${DROVER_MIGRATIONS_STATUS:-}"   # e.g. 'npx tsx scripts/migrate.mts --status'
@@ -90,3 +86,42 @@ DROVER_GENERATED="${DROVER_GENERATED:-}"
 # DROVER_SWEEP_SCRATCHPADS="${DROVER_SWEEP_SCRATCHPADS:-0}"
 # Seats bypass approval prompts; 0 turns that off
 # DROVER_YOLO="${DROVER_YOLO:-1}"
+
+# Display callsigns: TAB-separated seat and display name. The native seat name remains its identity.
+# DROVER_CALLSIGNS="${DROVER_CALLSIGNS:-$HOME/.config/drover/callsigns.tsv}"
+# Example file line: architect<TAB>Navigator
+# DROVER_SEAT_MODELS='architect=<model-id>' also applies at initial `fleet up`, not only restart.
+
+# Lockfile-keyed immutable npm cache. Opt in for npm projects using root/backend/frontend package roots.
+# A persistent seat relinks to ITS locks after every prep, preserving old real directories in backups.
+# DROVER_SHARED_NM=1
+# FLEET_NM_CACHE="$HOME/.cache/drover/nm"
+# FLEET_NM_BACKUPS="$DROVER_HOME/dependency-backups"
+# DROVER_GRAPH_DIR=''                 # one centrally built graphify-out directory; no per-seat rebuild
+
+# Native ownership, dispatch skips and dedicated-seat inventory (independent of advisory file claims).
+# DROVER_OWNERS_FILE="$DROVER_CONFIG_DIR/assigned-owners.txt"
+# DROVER_DISPATCH_SKIP="$DROVER_CONFIG_DIR/dispatch-skip"
+# DROVER_DEDICATED_FILE=''             # one seat per line, in addition to the configured lead/dedicated seats
+# DROVER_DISPATCH_TZ='America/New_York' # timezone for bare WAITING-UNTIL stamps
+
+# Optional read-only operational checks. No application endpoint, database or log group is built in.
+# DROVER_PROD_LOG_GROUP=''             # CloudWatch log group, enables the stale-job check
+# DROVER_JOB_SWEEP_BEANS=''            # sweep/tracking beans that must never count as a job's owner
+# DROVER_STALE_JOBS_COMMAND=''         # command printing stale jobs + owner evidence, for standup
+# DROVER_MIGRATIONS_DIR=''             # migration directory relative to DROVER_REPO; required for allocator/inventory
+# DROVER_MIGRATIONS_STATUS=''          # status-only command, prints applied/pending/total summary + pending filenames
+# DROVER_HELD_MIGRATIONS="$DROVER_CONFIG_DIR/held-migrations.txt"
+
+# Main tripwire uses the existing fleet-slot + fleet-verify-main by default. A project adapter can use
+# the SAME DB provisioning/manifest/lease path as its push gate; infrastructure refusals are UNAVAILABLE.
+# DROVER_TRIPWIRE_GATE=''              # shell command, run in an isolated checkout of the evaluated SHA
+# DROVER_TRIPWIRE_TIMEOUT=1800
+# TRIPWIRE_STATE="$DROVER_HOME/main-tripwire"
+# TRIPWIRE_ALERTS="$FLEET_STATE/alerts"
+
+# Optional brief augmentation: no qualified rulebook policy => the whole rules file; no precedent => none.
+# FLEET_PRECEDENT=off                  # disables historical precedent blocks
+# FLEET_RULEBOOK=off                   # keeps the entire rules file
+# FLEET_RULEBOOK_POLICY=''             # locally qualified policy; no private tuned corpus is shipped
+# FLEET_LESSONS="$DROVER_HOME/rulebook/lessons.jsonl" # an evidence/check ledger owned by this fleet

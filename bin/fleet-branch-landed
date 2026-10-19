@@ -6,6 +6,12 @@
 # Exit 0 = all landed or nothing to land; 1 = unlanded (stdout: "AGE <min of the oldest> NEWEST <min of the newest>" then the subjects);
 # 2 = could not determine (stderr says why). Runs in the current directory's repository unless FLEET_LANDED_REPO names one.
 # (`fleet-landed-check` is the other tool: it audits COMPLETED beans; this one audits a BRANCH.)
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/drover-env"
 br="${1:-HEAD}"; bean="${2:-}"
 [ -z "${FLEET_LANDED_REPO:-}" ] || cd "$FLEET_LANDED_REPO" 2>/dev/null || { echo "fleet-branch-landed: cannot cd to $FLEET_LANDED_REPO" >&2; exit 2; }

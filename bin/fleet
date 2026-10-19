@@ -27,6 +27,12 @@
 #      FLEET_SEED_WIP=1 FLEET_ADOPT=0 FLEET_OPENCODE_MODEL FLEET_CLAUDE_MODEL FLEET_AGY_MODEL FLEET_FORCE=1 (rm dirty)
 #      FLEET_BOOTSTRAP="cmd" FLEET_TIMEOUT(ms) FLEET_TAIL FLEET_STALE_MIN=10 (minutes) FLEET_HEAVY_MB=2048
 #      DROVER_CLONE_DIRS DROVER_COPY_FILES DROVER_BUILD DROVER_TEST — see examples/config
+_fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
+_fleet_rc=0
+python3 "$_fleet_lib" --gate "$0" "$@" || _fleet_rc=$?
+case $_fleet_rc in 10) ;; *) exit $_fleet_rc ;; esac
+unset _fleet_lib _fleet_rc
+
 set -euo pipefail
 
 # Tests stub transport with FLEET_HERDR. Real runs use the herdr on PATH.
@@ -86,7 +92,20 @@ done
 if ((${#FLEET_ARGS[@]})); then set -- "${FLEET_ARGS[@]}"; else set --; fi
 
 agents() { herdr agent list | jq -c '.result.agents[]'; }
-ws_by_label() { herdr workspace list | jq -r --arg l "$1" '.result.workspaces[] | select(.label == $l) | .workspace_id' | head -1; }
+ws_by_label() { herdr workspace list | jq -r --arg l "$1" '.result.workspaces[] | select(.label == $l or ((.label // "") | endswith(" · " + $l))) | .workspace_id' | head -1; }
+# 2026-10-18: a display label is not the seat's identity.
+seat_label() {
+  local c
+  c=$(awk -F'\t' -v n="$1" '$1==n{print $2; exit}' "$DROVER_CALLSIGNS" 2>/dev/null) || true
+  printf '%s' "${c:+$c · }$1"
+}
+seat_model() {
+  local pair
+  for pair in $DROVER_SEAT_MODELS; do
+    [ "${pair%%=*}" != "$1" ] || { printf '%s' "${pair#*=}"; return; }
+  done
+  return 0
+}
 kind_of() { local s; for s in $FLEET; do [ "${s%%:*}" = "$1" ] && { printf '%s' "${s##*:}"; return; }; done; echo "unknown agent: $1" >&2; return 1; }
 
 cmd_help() {
@@ -344,7 +363,7 @@ cwd_of() { [ "$FLEET_DRY_RUN" = 1 ] && { printf '%s' "WORKTREE"; return 0; }; he
 state_of() { herdr agent get "$1" 2>/dev/null | jq -r '.result.agent.agent_status // "missing"'; }
 log() { mkdir -p "$(dirname "$LEDGER")"; printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$@" >> "$LEDGER"; }  # event agent harness role bean note
 
-agent_args() {  # kind -> native CLI args: no approval prompts (+ model pin for opencode)
+agent_args() {  # kind [seat] -> native CLI args: no approval prompts (+ model pin for opencode)
   [ "$FLEET_YOLO" = 1 ] || return 0
   case $1 in
     claude)   printf '%s' "--dangerously-skip-permissions${FLEET_CLAUDE_MODEL:+ --model $FLEET_CLAUDE_MODEL}" ;;
@@ -354,6 +373,9 @@ agent_args() {  # kind -> native CLI args: no approval prompts (+ model pin for 
     grok)     printf '%s' "--always-approve" ;;
     agy)      printf '%s' "--dangerously-skip-permissions${FLEET_AGY_MODEL:+ --model $FLEET_AGY_MODEL}" ;;
   esac
+  local pinned; pinned=$(seat_model "${2:-}")
+  [ -z "$pinned" ] || printf ' --model %s' "$pinned"
+  return 0
 }
 
 # Which MODEL each agent is actually running -- read from the harness's own state files,
@@ -397,7 +419,7 @@ cmd_models() {
 }
 cmd_status() {
   local rc=0 live
-  live=$(agents)
+  live=$(agents | python3 "$DROVER_SRC/lib/fleet_activity.py")
   printf '%-18s %-9s %-8s %-7s %-24s %s\n' NAME KIND STATE PANE CWD TITLE
   for spec in $FLEET; do
     local name=${spec%%:*} kind=${spec##*:} row
@@ -410,7 +432,7 @@ cmd_status() {
     [ "$(jq -r .agent_status <<<"$row")" = unknown ] && rc=1
   done
   jq -r --arg roster " $FLEET " 'select((.name // "") as $n | ($n == "" or ($roster | contains(" " + $n + ":") | not)))
-      | [(.name // "-"), .agent, .agent_status, .pane_id, (.cwd|split("/")|last), "(not on roster)"] | @tsv' <<<"$live" \
+      | [(.name // "-"), .agent, .agent_status, .pane_id, (.cwd|split("/")|last), ((.landing_label // "") + " (not on roster)")] | @tsv' <<<"$live" \
       | awk -F'\t' '{printf "%-18s %-9s %-8s %-7s %-24s %s\n",$1,$2,$3,$4,$5,$6}'
   herdr integration status --outdated-only 2>/dev/null | sed 's/^/integration outdated: /' || true
   # seat questions waiting for a decision (fleet-answer <id> <choice>); never typed into a pane
@@ -430,7 +452,7 @@ fleet_workspace() {
 }
 tab_pane() {
   local tid
-  tid=$(herdr tab list --workspace "$1" | jq -r --arg l "$2" '.result.tabs[] | select(.label == $l) | .tab_id' | head -1)
+  tid=$(herdr tab list --workspace "$1" | jq -r --arg l "$2" '.result.tabs[] | select(.label == $l or ((.label // "") | endswith(" · " + $l))) | .tab_id' | head -1)
   [ -n "$tid" ] || return 0
   herdr pane list --workspace "$1" | jq -r --arg t "$tid" '[.result.panes[] | select(.tab_id == $t)][0].pane_id // empty'
 }
@@ -481,8 +503,8 @@ worktree_pane() {  # <name> -> root pane of the agent's own workspace (reused if
   local name=$1 ws; ws=$(ws_by_label "$name")
   if [ -z "$ws" ]; then
     local out
-    out=$(herdr worktree open --cwd "$FLEET_ROOT" --branch "fleet/$name" --label "$name" --no-focus 2>/dev/null) \
-      || out=$(herdr worktree create --cwd "$FLEET_ROOT" --branch "fleet/$name" --label "$name" --no-focus)
+    out=$(herdr worktree open --cwd "$FLEET_ROOT" --branch "fleet/$name" --label "$(seat_label "$name")" --no-focus 2>/dev/null) \
+      || out=$(herdr worktree create --cwd "$FLEET_ROOT" --branch "fleet/$name" --label "$(seat_label "$name")" --no-focus)
     ws=$(jq -r .result.workspace.workspace_id <<<"$out")
   fi
   local p; p=$(herdr pane list --workspace "$ws" | jq -c '.result.panes[0] | {pane_id, cwd}')
@@ -491,7 +513,7 @@ worktree_pane() {  # <name> -> root pane of the agent's own workspace (reused if
 }
 
 start_agent() {  # name kind pane — a fresh shell needs a moment before it is "available"
-  local err args; err=$(mktemp); args=$(agent_args "$2")
+  local err args; err=$(mktemp); args=$(agent_args "$2" "$1")
   # the seat shell (and so the agent and everything it runs) gets a per-user process ceiling and a two-worker jest
   # default BEFORE the agent starts. ulimit only lowers; FLEET_NPROC_LIMIT=0 skips it.
   if [ "${FLEET_NPROC_LIMIT:-1500}" != 0 ]; then
@@ -512,7 +534,15 @@ cmd_up() {
   live=$(agents)
   for spec in $FLEET; do
     local name=${spec%%:*} kind=${spec##*:}
-    if jq -e --arg n "$name" 'select(.name == $n)' <<<"$live" >/dev/null; then echo "$name: already running"; continue; fi
+    if jq -e --arg n "$name" 'select(.name == $n)' <<<"$live" >/dev/null; then
+      local workspace label
+      workspace=$(jq -r --arg n "$name" 'select(.name == $n) | .workspace_id // empty' <<<"$live" | head -1)
+      label=$(seat_label "$name")
+      if [ -n "$workspace" ] && [ "$(herdr workspace get "$workspace" | jq -r '.result.workspace.label // ""')" != "$label" ]; then
+        herdr workspace rename "$workspace" "$label" >/dev/null
+      fi
+      echo "$name: already running"; continue
+    fi
     if [ "$FLEET_ADOPT" = 1 ]; then
       local orphan; orphan=$(jq -r --arg k "$kind" '[select(.agent == $k and (.name // "") == "")][0].pane_id // empty' <<<"$live" | head -1)
       if [ -n "$orphan" ]; then herdr agent rename "$orphan" "$name" >/dev/null && echo "$name: adopted $orphan"; live=$(agents); continue; fi
@@ -579,6 +609,12 @@ check_beans() {
 }
 
 coder_prompt() {  # name kind bean scope
+  local publication
+  if [ "$(cat "$DROVER_PUBLISH_MODE_FILE" 2>/dev/null || echo direct)" = direct ]; then
+    publication="Land your own tested commits through the project's landing command and push gate before reporting DONE or BLOCKED. Rebase onto origin/main and prove the published SHA is its ancestor. Publication is yours; a waiver cannot delegate it."
+  else
+    publication="Commit your tested changes and report them to the configured batch lander. Do not push directly in lander mode."
+  fi
   cat <<P
 You are $1, the $2 CODER on a fleet team. Team lead = \`lead\` (a Claude session); the human is not watching you. Your job: bean $3.
 Role rules (short, read first): $SKILLS_SRC/roles/coder.md
@@ -590,14 +626,14 @@ Work ONLY in this worktree ($(cwd_of "$1")). Your branch for THIS bean is \`flee
 3. Verify, and keep the output — you will paste it. Run ${DROVER_BUILD:-the project build} and the tests you added or affected${DROVER_TEST:+ ($DROVER_TEST)}. A build that did not finish is not a passing build; wait for it. Grep compiler output for the real error shape (TypeScript errors start with a file path, not with the word error).
 3a. JEST RULE: run jest only as \`npx jest --runInBand --cacheDirectory /tmp/jest-cache-\$USER <files>\`. In a read-only sandbox point --cacheDirectory at a writable directory. Never run jest through \`node -e\` or patch jest internals: jest-worker forks children that re-run the inline script and fork more, without bound.
 3b. PROVE THE FIX FIRES. Revert your change, watch your new test fail, restore it, watch it pass. A test you have never seen fail is not a test. This is what caught a fail-open gate in the lead's own commit this week.
-4. This worktree may start with the human's pre-existing UNCOMMITTED changes, seeded so it builds like the main checkout. Do not review, modify, revert or commit them. Commit ONLY files you changed plus the bean file: \`git add <your files> .beans/<bean file>\` then \`git commit -m "<conventional message>"\` on branch fleet/$1-$3. You MAY \`git fetch\` and \`git merge main\` (step 0 requires it). Never git checkout/reset/stash the human's files, never commit to main, never push, never apply DB migrations, never start the dev server.
+4. Preserve the human's pre-existing changes. Commit ONLY files you changed plus the bean file on branch fleet/$1-$3. $publication Never reset/stash the human's files, apply database migrations or start a shared dev server.
 5. Keep the bean checklist current with \`beans update $3 --body-replace-old '- [ ] ...' --body-replace-new '- [x] ...'\`.
 6. When done, write $REPORTS/$1-$3.md: summary, files changed, decisions, open questions, and the PASTED output of the build and the tests. A command you did not run cannot appear there.
 6b. THEN ANNOUNCE IT. Run exactly:
       fleet-done $1 $3 DONE \"<one line: what changed and whether it is landable>\" $REPORTS/$1-$3.md
     Use BLOCKED instead of DONE if you cannot proceed, or CHANGES if you are handing back a fix round. This is how the lead learns you finished — it does not watch your pane and it does not trust the status field, which reports \`done\` while an agent is still mid-turn. If you skip this, your work sits unnoticed.
     End the report with exactly these three lines:
-REBASED: YES | NO — output of \`git merge-base --is-ancestor main HEAD && echo YES\` (local main, not origin/main)
+REBASED: YES | NO — output of \`git merge-base --is-ancestor origin/main HEAD && echo YES\` (fetched remote main)
 VERIFIED: BUILD <exit> TESTS <passed>/<total> — and the revert-test-restore result from 3b
 DONE $REPORTS/$1-$3.md
 REBASED: NO means the work is not finished. Go back to step 0 — do not hand a stale branch to a reviewer.
@@ -639,6 +675,29 @@ Never assert a negative — \"no work exists\", \"this was fabricated\", \"nothi
 Do not modify code, do not commit, do not message other agents.
 $VOICE
 P
+}
+rulebook_for() {
+  local out peers="${FLEET_RULEBOOK_PEERS:-$RULES}"
+  if [ -x "${DROVER_RULEBOOK_TOOL:-$DROVER_BIN/fleet-rulebook}" ] && out=$("${DROVER_RULEBOOK_TOOL:-$DROVER_BIN/fleet-rulebook}" "$1" 2>/dev/null) && [ -n "$out" ]; then
+    printf '%s\n' "$out"
+  elif [ -r "$peers" ]; then
+    printf '## Fleet rules for this bean\n\nfleet-rulebook failed or is missing, so all of %s follows.\n\n' "$peers"
+    cat "$peers" || true
+  else
+    printf '## Fleet rules for this bean\n\nfleet-rulebook failed or is missing and %s could not be read: load the fleet-peers rules before starting.\n' "$peers"
+  fi
+  return 0
+}
+# 2026-10-19: the landed beans most like this one, after the rules. fleet-precedent prints nothing when
+# no similar landed bean exists and nothing at all when FLEET_PRECEDENT=off, so this appends nothing then.
+# Unlike the rulebook there is no whole-file fallback: a precedent that cannot be read is not invented.
+precedent_for() {
+  [ "${FLEET_PRECEDENT:-on}" = off ] && return 0
+  local out
+  if [ -x "${DROVER_PRECEDENT_TOOL:-$DROVER_BIN/fleet-precedent}" ] && out=$("${DROVER_PRECEDENT_TOOL:-$DROVER_BIN/fleet-precedent}" "$1" 2>/dev/null) && [ -n "$out" ]; then
+    printf '%s\n' "$out"
+  fi
+  return 0
 }
 cmd_assign() {
   local bean=$1 coder=${2:-} scope=${3:-} kind bf prev pb pbf pst
@@ -692,8 +751,9 @@ cmd_assign() {
   bf="$BRIEFS/assign-$coder-$bean.txt"
   mkdir -p "$REPORTS"
   ensure_brief_dir "$bf"
-  coder_prompt "$coder" "$kind" "$bean" "$scope" | write_brief "$bf"
+  { coder_prompt "$coder" "$kind" "$bean" "$scope"; rulebook_for "$bean"; precedent_for "$bean"; } | write_brief "$bf"
   log assign "$coder" "$kind" coder "$bean" "$scope"
+  "$DROVER_BIN/fleet-dispatch" --record-owner "$bean" "$coder" >/dev/null 2>&1 || true
   # --wait is what makes the prompt actually land. Without it the dispatch
   # returns before the agent has taken the message and the turn is silently
   # dropped; measured 2026-09-07, six of six parallel dispatches lost.
@@ -705,7 +765,7 @@ cmd_assign() {
   # them — which is how a bean gets dispatched to a second agent. Both dispatch
   # paths must leave identical state. Measured 2026-09-08: a coder was hand-assigned
   # one bean and fleet-track still reported the bean it had finished 4h earlier.
-  "$DROVER_BIN/fleet-track" dispatch "$coder" "$bean" >/dev/null 2>&1
+  "$DROVER_BIN/fleet-track" dispatch "$coder" "$bean" "$REPORTS/$coder-$bean.md" "fleet/$coder-$bean" >/dev/null 2>&1
 }
 cmd_review() {
   # usage: fleet review <coder> [reviewer] [bean]  — bean overrides the ledger's last assign (REVIEW_BEAN_OVERRIDE)
@@ -852,7 +912,7 @@ cmd_stale() {
     shells+="$pane"$'\t'"$name"$'\t'"$state"$'\t'"$sp"$'\n'
   done < <(jq -r '.result.agents[] | [.pane_id, (.name // .pane_id), .agent_status] | @tsv' <<<"$live")
   ps_out=$(mktemp); ps -axo pid=,ppid=,etime=,rss=,args= > "$ps_out"
-  STALE_MIN=${FLEET_STALE_MIN:-10} HEAVY_MB=${FLEET_HEAVY_MB:-2048} MODE=$mode SHELLS=$shells python3 - "$ps_out" <<'PY'
+  STALE_MIN=${FLEET_STALE_MIN:-10} HEAVY_MB=${FLEET_HEAVY_MB:-2048} MODE=$mode SHELLS=$shells FLEET_DAEMONS_LIB="$DROVER_SRC/lib" python3 - "$ps_out" <<'PY'
 import os, re, sys, signal, subprocess, collections
 STALE_MIN = float(os.environ["STALE_MIN"]); HEAVY_MB = int(os.environ["HEAVY_MB"]); MODE = os.environ["MODE"]
 shells = [l.split("\t") for l in os.environ["SHELLS"].splitlines() if l.strip()]
@@ -874,7 +934,9 @@ def desc(pid):
     while st:
         p = st.pop(); out.append(p); st += kids[p]
     return out
-MCP  = re.compile(r"tessl mcp|codegraph|mcp-server|-mcp\b|mcp[-_]|server-(github|sequential)")
+sys.path.insert(0, os.environ["FLEET_DAEMONS_LIB"])
+from fleet_daemons import MCP_PATTERN
+MCP = re.compile(MCP_PATTERN)
 DEV  = re.compile(r"\bjest\b|playwright|\bvite\b|\btsx\b|next dev|npm (run|test|exec)|node .*\b(server|dev|watch)\b")
 TOOL = re.compile(r"\.herdr/worktrees/|\.omo/|" + MCP.pattern + "|" + DEV.pattern)
 rows, seen, kill = [], set(), []
