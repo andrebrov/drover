@@ -95,3 +95,10 @@ def test_demo_can_be_rerecorded_offline(tmp_path):
     transcript=''.join(json.loads(x)[2] for x in target.read_text().splitlines()[1:])
     assert 'fleet-claims-audit: OK' in transcript and 'DUPLICATE_CURRENT_SEATS' in transcript
     assert 'exit 2' in transcript
+
+def test_source_code_uses_schema_org_target_product_for_the_os():
+    # https://schema.org/SoftwareSourceCode, read 2026-10-19:
+    # operatingSystem belongs to SoftwareApplication, not SoftwareSourceCode.
+    ld=json.loads(''.join(homepage().ld))
+    assert 'operatingSystem' not in ld
+    assert ld['targetProduct']=={'@type':'SoftwareApplication','name':'macOS'}
