@@ -12,6 +12,8 @@ config=configure(export=__name__=="__main__")
 from fleet_usage import gate as _fleet_gate
 _fleet_gate(_fleet_sys.argv, __file__)
 
+from fleet_delivery import delivery_gate, Held, delivered, transport
+
 import contextlib
 import hashlib
 import json
@@ -311,15 +313,22 @@ def dispatch(roster, off):
         if DRY:
             print(f"WOULD-DISPATCH {bean} -> {seat}")
             continue
-        with open(os.path.join(TASKS, seat), "w") as handle:
-            handle.write(f"{int(NOW)}\t{bean}\tnone\t{report}\n")
-        outcome = subprocess.run(["herdr", "agent", "prompt", seat,
-                                  prompt + f" Report to {report} (first line = verdict + pushed SHA)."],
-                                 capture_output=True, text=True, timeout=60)
-        if outcome.returncode != 0:
-            os.remove(os.path.join(TASKS, seat))
+        try:
+            with delivery_gate(seat) as target_pane:
+                with open(os.path.join(TASKS, seat), "w") as handle:
+                    handle.write(f"{int(NOW)}\t{bean}\tnone\t{report}\n")
+                outcome = subprocess.run([transport(), "agent", "prompt", target_pane["pane_id"],
+                                          prompt + f" Report to {report} (first line = verdict + pushed SHA).",
+                                          "--wait", "--until", "working", "--timeout", "10000"],
+                                         capture_output=True, text=True, timeout=60)
+        except Held as hold:
             lines.insert(pick, f"{bean}\t{target}\t{prompt}")
-            print(f"DISPATCH-FAILED {seat} {bean}")
+            print(f"HOLD delivery {seat}: {hold.reason}")
+            continue
+        if outcome.returncode != 0 or not delivered(outcome.stdout, target_pane):
+            # A transport failure can occur after typing. Keep the task and do
+            # not requeue: a human must inspect before any retry.
+            print(f"UNKNOWN_DELIVERY {seat} {bean}; task retained, no blind resend")
             continue
         print(f"DISPATCH {bean} -> {seat}")
     if not DRY:

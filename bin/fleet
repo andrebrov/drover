@@ -44,6 +44,10 @@ herdr() {
   fi
 }
 
+# Normal prompts share a fail-closed native delivery gate.
+prompt_agent() { FLEET_STATE="$FLEET_STATE" FLEET_HERDR="${FLEET_HERDR:-}" python3 "$(dirname "$0")/../lib/fleet_delivery.py" "$@"; }
+check_delivery() { FLEET_STATE="$FLEET_STATE" FLEET_HERDR="${FLEET_HERDR:-}" python3 "$(dirname "$0")/../lib/fleet_delivery.py" --check "$1"; }
+
 # shellcheck source=drover-env
 . "$(dirname "$0")/drover-env"
 FLEET_ROOT="${FLEET_ROOT:-${DROVER_REPO:-}}"
@@ -704,6 +708,7 @@ cmd_assign() {
   [ -n "$coder" ] || coder=$(pick_least coder assign)
   refuse_dispatch "$coder" "$bean"
   if [ "${FLEET_DRY_RUN:-0}" = 1 ]; then echo "DRY RUN: would assign $bean to $coder (scope: ${scope:-none}); nothing was prepared, written or sent"; return 0; fi
+  check_delivery "$coder" || return $?
   # Orphaned-review guard. Reassigning a seat that just reported on a DIFFERENT bean silently
   # strands that work: the report exists, the bean is still open, and no reviewer was ever
   # routed. Measured 2026-09-08 — a finished bean sat landable and unreviewed for an hour
@@ -758,7 +763,7 @@ cmd_assign() {
   # returns before the agent has taken the message and the turn is silently
   # dropped; measured 2026-09-07, six of six parallel dispatches lost.
   # Dispatch SERIALLY for the same reason — parallel `&` loses prompts.
-  herdr agent prompt "$coder" "New bean: read $bf and follow it exactly. It assigns you $bean. Start from origin/main: git fetch origin; git merge origin/main --no-edit (never local main; on conflict git merge --abort and rebase your own commits onto origin/main)" --wait --until working --until done --until blocked --timeout 100000 | jq -r --arg b "$bean" '"\(.result.agent.name) <- \($b): \(.result.agent.agent_status)"'
+  prompt_agent "$coder" "New bean: read $bf and follow it exactly. It assigns you $bean. Start from origin/main: git fetch origin; git merge origin/main --no-edit (never local main; on conflict git merge --abort and rebase your own commits onto origin/main)" --wait --until working --until done --until blocked --timeout 100000 | jq -r --arg b "$bean" '"\(.result.agent.name) <- \($b): \(.result.agent.agent_status)"'
   # The lead's manual `fleet assign` wrote ONLY the ledger, while the watcher's
   # auto-dispatch writes the ledger AND the task file. fleet-track and the
   # reaper both read the TASK FILE, so a hand-assigned seat looked stale to
@@ -798,6 +803,7 @@ cmd_review() {
   refuse_dispatch "$rev" "$bean"
   kind=$(kind_of "$rev") || exit 2
   [ "$kind" != "$ck" ] || { echo "refusing: $rev runs the same harness ($ck) as $coder"; return 1; }
+  check_delivery "$rev" || return $?
   bf="$BRIEFS/review-$rev-$bean.txt"
   ensure_brief_dir "$bf"
   reviewer_prompt "$rev" "$kind" "$coder" "$bean" | write_brief "$bf"
@@ -805,7 +811,7 @@ cmd_review() {
   # Long multi-line prompts silently fail to reach an agent; short ones land.
   # Write the brief to a file and send a one-line pointer. Measured 2026-09-06:
   # three of four review dispatches were lost this way before the change.
-  herdr agent prompt "$rev" "Review task: read $bf and follow it exactly. It reviews $bean on branch fleet/$coder-$bean (fall back to fleet/$coder if that ref does not exist)." | jq -r --arg b "$bean" --arg c "$coder" '"\(.result.agent.name) <- review \($b) (by \($c)): \(.result.agent.agent_status)"'
+  prompt_agent "$rev" "Review task: read $bf and follow it exactly. It reviews $bean on branch fleet/$coder-$bean (fall back to fleet/$coder if that ref does not exist)." | jq -r --arg b "$bean" --arg c "$coder" '"\(.result.agent.name) <- review \($b) (by \($c)): \(.result.agent.agent_status)"'
 }
 cmd_finish() {
   local kind
@@ -892,7 +898,8 @@ cmd_task() {
   local name=$1 prompt=$2 out rc=0
   kind_of "$name" >/dev/null || exit 2
   check_beans "$prompt"
-  out=$(herdr agent prompt "$name" "$prompt" --wait --timeout "$FLEET_TIMEOUT" 2>&1) || rc=$?
+  check_delivery "$name" || return $?
+  out=$(prompt_agent "$name" "$prompt" --wait --timeout "$FLEET_TIMEOUT" 2>&1) || rc=$?
   echo "== $name -> $(jq -r '.result.agent.agent_status // .error.code // "?"' <<<"$out" 2>/dev/null || echo "?")"
   herdr agent read "$name" --source visible --lines "${FLEET_TAIL:-40}"
   return $rc
@@ -1061,9 +1068,10 @@ case "${1:-}" in
   followup)
     kind=$(kind_of "$2") || exit 2
     check_beans "${3:-}"
+    check_delivery "$2" || exit $?
     r=$(role_of "$2"); ev=assign; [ "$r" = reviewer ] && ev=review
     log "$ev" "$2" "$kind" "$r" "$(last_bean "$2")" "followup: ${3:0:80}"
-    herdr agent prompt "$2" "$3" --wait --until working --until done --until blocked | jq -r '"\(.result.agent.name): \(.result.agent.agent_status)"'
+    prompt_agent "$2" "$3" --wait --until working --until done --until blocked | jq -r '"\(.result.agent.name): \(.result.agent.agent_status)"'
     ;;
   usage)   cmd_usage ;;
   rules)   cmd_rules ;;
@@ -1074,9 +1082,10 @@ case "${1:-}" in
   send)
     kind=$(kind_of "$2") || exit 2
     check_beans "${3:-}"
+    check_delivery "$2" || exit $?
     bean=$(printf '%s' "${3:-}" | grep -oE "$DROVER_BEAN_RE" | head -1 || true)
     log assign "$2" "$kind" "$(role_of "$2")" "${bean:--}" "send: ${3:0:60}"
-    herdr agent prompt "$2" "$3" --wait --until working --until done --until blocked | jq -r '"\(.result.agent.name): \(.result.agent.agent_status)"'
+    prompt_agent "$2" "$3" --wait --until working --until done --until blocked | jq -r '"\(.result.agent.name): \(.result.agent.agent_status)"'
     ;;
   read)    herdr agent read "$2" --source visible --lines "${3:-60}" ;;
   wait)    if [ -n "${3:-}" ]; then herdr agent wait "$2" --until "$3"; else herdr agent wait "$2"; fi ;;

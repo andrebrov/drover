@@ -41,13 +41,20 @@ import sys,json,time
 from pathlib import Path
 p=Path('''+repr(str(self.p))+''')
 if sys.argv[1:3]==['agent','list']:print((p/'agents.json').read_text());sys.exit(0)
+if sys.argv[1:3]==['agent','get']:
+ print(json.dumps({'result':{'agent':dict(name=sys.argv[3],agent='codex',agent_status='idle',pane_id='w1:p'+sys.argv[3],terminal_id='term'+sys.argv[3],cwd=str(p/'repo'),state_change_seq=1,interactive_ready=True)}}));sys.exit(0)
+if sys.argv[1:3]==['agent','explain']:
+ print(json.dumps(dict(state='idle',visible_blocker=False,skip_state_update=False)));sys.exit(0)
+if sys.argv[1:3]==['agent','read']:
+ print((p/'screen').read_text() if (p/'screen').exists() else '›\\n ? for shortcuts');sys.exit(0)
 if sys.argv[1:3]!=['agent','prompt']:sys.exit(2)
 with (p/'prompts').open('a') as f:f.write(json.dumps(sys.argv[3:])+'\\n')
 mode=(p/'prompt-mode').read_text().strip()
 if mode=='timeout':print(json.dumps({'error':{'code':'timeout','message':'ack timeout'}}));sys.exit(1)
 if mode=='outer':time.sleep(3);sys.exit(0)
 if mode=='fail':print(json.dumps({'error':{'code':'missing','message':'unknown agent'}}));sys.exit(1)
-print(json.dumps({'result':{'accepted':True}}))
+name=sys.argv[3].removeprefix('w1:p')
+print(json.dumps({'result':{'agent':dict(name=name,agent='codex',agent_status='working',pane_id=sys.argv[3],terminal_id='term'+name,cwd=str(p/'repo'),state_change_seq=2,interactive_ready=True)}}))
 ''',True)
  def run_git(self,*a):return subprocess.run(['/usr/bin/git','--git-dir='+str(self.repo/'.git'),'--work-tree='+str(self.repo),*a],text=True,capture_output=True,check=True,env=self.env)
  def call(self,*a,watch=False,check=True):
@@ -68,6 +75,9 @@ print(json.dumps({'result':{'accepted':True}}))
  def announce(self,report,ts=None,state='DONE',a='opencode-coder',bean='bean-uhrt',name=None):
   ts=int(time.time()) if ts is None else ts; m=self.inbox/(name or f'{ts}-{a}-{bean}.msg');write(m,f'{ts}\t{a}\t{bean}\t{state}\tfixture done\t{report}\n');return m
  def finish(self,report):write(report,'Verified fixture report\n');return self.announce(report)
+ def test_idle_roster_with_draft_never_prompts_or_reserves(self):
+  self.job();write(self.p/'screen','› protect this draft\n ? for shortcuts\n');self.call(watch=True)
+  self.assertEqual(self.count(),0);self.assertFalse((self.r/'reserved/opencode-coder').exists());self.assertIn('HOLD delivery opencode-coder draft_present',(self.r/'log').read_text())
  def test_actual_watch_budget_dispatch_once(self):
   self.job();self.call(watch=True);self.call(watch=True);self.assertEqual(self.count(),1);self.assertIn('opencode-coder opencode idle OK',(self.st/'budget-seat').read_text());self.assertIn('-n kern.memorystatus_vm_pressure_level',(self.p/'sysctl.calls').read_text())
  def test_actual_watch_unknown_memory_holds(self):

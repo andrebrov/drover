@@ -266,13 +266,28 @@ pick_reviewer(){ local ck r; ck=$(kind_of "$1")
     # so the bean sits waiting on a verdict that will never come. The dispatch path got
     # this guard first; the review path needs the same one. Measured 2026-09-08: a review
     # was routed to an architect seat while it was out of usage credits.
-    r=$("$DROVER_BIN"/fleet status 2>/dev/null | awk -v ck="$ck" -v pat="$pat" 'NR>1 && $3!="MISSING" && $3!="blocked" && $1 ~ pat && $2!=ck {print $1}' | while read -r r; do [ -f "$TASKS/$r" ] && continue; harness_ok "$r" || continue; "$DROVER_BIN"/fleet read "$r" 12 2>/dev/null | grep -qiE "out of usage credits|/usage-credits|Buy more credits|keep using Grok Build|hit your usage limit|purchase more credits" && continue; echo "$r"; break; done)
+    r=$("$DROVER_BIN"/fleet status 2>/dev/null | awk -v ck="$ck" -v pat="$pat" 'NR>1 && $3!="MISSING" && $3!="blocked" && $1 ~ pat && $2!=ck {print $1}' | while read -r r; do [ -f "$TASKS/$r" ] && continue; [ -f "$STATE/hold/$r" ] && continue; harness_ok "$r" || continue; "$DROVER_BIN"/fleet read "$r" 12 2>/dev/null | grep -qiE "out of usage credits|/usage-credits|Buy more credits|keep using Grok Build|hit your usage limit|purchase more credits" && continue; echo "$r"; break; done)
     [ -n "$r" ] && { echo "$r"; return; }
   done; }
-route_review(){ local a=$1 bean=$2 rev; rev=$(pick_reviewer "$a")
+route_review(){ local a=$1 bean=$2 rev outcome rc reason; rev=$(pick_reviewer "$a")
   if [ -n "$rev" ]; then
-    (cd "$REPO" && "$DROVER_BIN"/fleet review "$a" "$rev" "$bean" >/dev/null 2>&1) && log "ROUTED review of $bean ($a) -> $rev"
-    printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$bean" none "$REPORTS/$rev-review-$bean-by-$a.md" > "$TASKS/$rev"; rm -f "$STATE/reviews/$bean"
+    # Write the busy marker only when the route happened: `fleet review` REFUSES a second reviewer on a bean
+    # already under review, and a task file written anyway pinned a seat to a review it never received.
+    if outcome=$(cd "$REPO" && "$DROVER_BIN"/fleet review "$a" "$rev" "$bean" 2>&1); then
+      log "ROUTED review of $bean ($a) -> $rev"
+      printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$bean" none "$REPORTS/$rev-review-$bean-by-$a.md" > "$TASKS/$rev"; rm -f "$STATE/reviews/$bean"
+    else
+      rc=$?
+      if [ "$rc" -eq 76 ]; then
+        mkdir -p "$STATE/hold"; : > "$STATE/hold/$rev"; rm -f "$STATE/reviews/$bean"
+        printf '%s %s UNKNOWN_DELIVERY reviewer=%s — inspect before retry\n' "$a" "$bean" "$rev" >> "$STATE/blocked"
+        log "UNKNOWN_DELIVERY $bean -> $rev — held for inspection, no automatic resend"
+      else
+        mkdir -p "$STATE/reviews"; printf '%s\n' "$a" > "$STATE/reviews/$bean"
+        reason=$(printf '%s\n' "$outcome" | grep -E '^HELD [A-Za-z0-9_.-]+: [a-z_]+$' | tail -1 || true)
+        log "REVIEW ROUTE of $bean -> $rev refused or failed — seat left free, bean stays queued${reason:+ ($reason)}"
+      fi
+    fi
   else mkdir -p "$STATE/reviews"; printf '%s\n' "$a" > "$STATE/reviews/$bean"; log "no free cross-harness reviewer for $bean — queued for retry"; fi; }
 retry_reviews(){ for f in "$STATE"/reviews/*; do [ -f "$f" ] || continue
   if [ -f "$STATE/approved/$(basename "$f")" ]; then rm -f "$f"; log "DROPPED re-review of $(basename "$f") — already approved"; continue; fi

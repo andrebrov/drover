@@ -11,6 +11,8 @@ config=configure(export=__name__=="__main__")
 from fleet_usage import gate as _fleet_gate
 _fleet_gate(_fleet_sys.argv, __file__)
 
+from fleet_delivery import delivery_gate, Held, delivered
+
 import base64,hashlib,json,os,re,selectors,signal,stat,subprocess,sys,tempfile,time
 from pathlib import Path
 HOME=Path.home()
@@ -295,7 +297,7 @@ def tick():
  if rc:log('HOLD roster unavailable');return
  try:agents=roster(out)
  except (ValueError,KeyError,TypeError):log('HOLD roster unknown');return
- attempts=0;limit=max(1,min(2,int(config.get('SAFE_MAX_PER_TICK','1'))))
+ attempts=0;limit=max(1,min(2,int(os.environ.get('SAFE_MAX_PER_TICK','1'))))
  for j in jobs:
   if attempts>=limit:break
   if not (R/'queue'/(j['id']+'.job')).exists():continue
@@ -315,30 +317,32 @@ def tick():
      if other and other['fields'][1]==j['bean'] and not task_available(p.name,other) and 'reviewer' not in p.name:owned=True;break
     if owned:continue
    dependency(j,g,t)
-   expected=t['sha256'] if t else '-'
-   attempts+=1
-   d.mkdir()
-   r={**j,'dispatch_ts':now(),'task':None,'delivery':'REGISTERING'}
-   atom(d/'job',f"{j['id']}\n{j['bean']}\n{j['role']}\n{j['report']}\n".encode());atom(d/'dispatch_ts',str(r['dispatch_ts']).encode());put(d/'reservation.json',r)
-   rc,_=bounded([TRACK,'dispatch',a,j['bean'],j['report'],j['branch'],expected])
-   if rc:
-    # Failed writer may have partially changed state; hold it, never clear a TASK or retry a prompt.
-    r['delivery']='REGISTRATION_FAILED';put(d/'reservation.json',r);notice(j['id'],'reg-fail',f"registration failed for {a}/{j['bean']}; no prompt");continue
-   nt=task_record(a)
-   if nt is None or nt['fields'][1]!=j['bean'] or nt['fields'][3]!=j['report'] or int(nt['fields'][0])<r['dispatch_ts'] or nt['fields'][2]!=g['source_sha'][:len(nt['fields'][2])]:
-    notice(j['id'],'reg-fail',f'registration not observable for {a}; no prompt');continue
-   r['task']=nt;r['dispatch_ts']=int(nt['fields'][0]);atom(d/'dispatch_ts',str(r['dispatch_ts']).encode());r['delivery']='SENDING';put(d/'reservation.json',r)
-   # Recheck founder holds immediately before sending, after registration.
-   if (ST/'land-paused').exists() or not memory_clear() or seat_held(a):r['delivery']='HELD';put(d/'reservation.json',r);continue
-   rc,out=bounded([HERDR,'agent','prompt',a,'Lead: read '+j['brief']+' and complete the root-approved assignment. Reply with the report path.','--wait','--until','working','--timeout','4000'],max(.1,min(5,float(config.get('SAFE_PROMPT_BOUND','5')))))
+   with delivery_gate(a, command=HERDR) as target_pane:
+    expected=t['sha256'] if t else '-'
+    attempts+=1
+    d.mkdir()
+    r={**j,'dispatch_ts':now(),'task':None,'delivery':'REGISTERING'}
+    atom(d/'job',f"{j['id']}\n{j['bean']}\n{j['role']}\n{j['report']}\n".encode());atom(d/'dispatch_ts',str(r['dispatch_ts']).encode());put(d/'reservation.json',r)
+    rc,_=bounded([TRACK,'dispatch',a,j['bean'],j['report'],j['branch'],expected])
+    if rc:
+     # Failed writer may have partially changed state; hold it, never clear a TASK or retry a prompt.
+     r['delivery']='REGISTRATION_FAILED';put(d/'reservation.json',r);notice(j['id'],'reg-fail',f"registration failed for {a}/{j['bean']}; no prompt");continue
+    nt=task_record(a)
+    if nt is None or nt['fields'][1]!=j['bean'] or nt['fields'][3]!=j['report'] or int(nt['fields'][0])<r['dispatch_ts'] or nt['fields'][2]!=g['source_sha'][:len(nt['fields'][2])]:
+     notice(j['id'],'reg-fail',f'registration not observable for {a}; no prompt');continue
+    r['task']=nt;r['dispatch_ts']=int(nt['fields'][0]);atom(d/'dispatch_ts',str(r['dispatch_ts']).encode());r['delivery']='SENDING';put(d/'reservation.json',r)
+    # Recheck founder holds immediately before sending, after registration.
+    if (ST/'land-paused').exists() or not memory_clear() or seat_held(a):r['delivery']='HELD';put(d/'reservation.json',r);continue
+    rc,out=bounded([HERDR,'agent','prompt',target_pane['pane_id'],'Lead: read '+j['brief']+' and complete the root-approved assignment. Reply with the report path.','--wait','--until','working','--timeout','4000'],max(.1,min(5,float(os.environ.get('SAFE_PROMPT_BOUND','5')))))
    try:ack=json.loads(out)
    except ValueError:ack={}
    if rc in [124,125] or b'timeout' in out.lower():delivery='UNKNOWN_DELIVERY'
-   elif rc==0 and isinstance(ack.get('result'),dict) and ack['result'] and not ack.get('error'):delivery='ROUTED'
+   elif rc==0:delivery='ROUTED' if delivered(out,target_pane) else 'UNKNOWN_DELIVERY'
    else:delivery='SEND_FAILED'
    r['delivery']=delivery;r['prompt_rc']=rc;r['prompt_output_sha256']=digest(out);put(d/'reservation.json',r)
    log(f"{delivery} {j['id']} -> {a} rc={rc}; reserved")
    if delivery!='ROUTED':notice(j['id'],'send-fail',f'{delivery} for {a}/{j["bean"]}; no blind resend')
+  except Held as hold:log(f'HOLD delivery {a} {hold.reason}')
   except (Refused,OSError,ValueError,KeyError):log(f"REFUSED {j['id']} ownership/grant/dependency")
  if not list((R/'queue').glob('*.job')):notice('queue','empty','finite approved queue empty; lead must register jobs')
 def inflight():

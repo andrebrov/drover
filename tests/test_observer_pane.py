@@ -168,6 +168,38 @@ class ObserverPaneTest(unittest.TestCase):
                 observer.check()
             self.assertFalse((tasks / "coder").exists())
 
+    def test_idle_roster_with_draft_keeps_queue_and_task_unclaimed(self):
+        import tempfile
+        import subprocess
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root=pathlib.Path(directory)
+            tasks=root/'tasks'; tasks.mkdir()
+            reports=root/'reports'; reports.mkdir()
+            queue=root/'queue'; queue.write_text('bean-demo\tcoder\tdo the task\n')
+            pool=root/'pool'; pool.write_text('coder:named\n')
+            prompts=[]
+            def native(args, **kwargs):
+                if args[1:3]==['agent','prompt']:
+                    prompts.append(args); return subprocess.CompletedProcess(args,0,'{}','')
+                if args[1:3]==['agent','get']:
+                    value={'result':{'agent':dict(name='coder',agent='codex',agent_status='idle',pane_id='w1:p1',terminal_id='t1',cwd='/fixture',state_change_seq=1,interactive_ready=True)}}
+                elif args[1:3]==['agent','explain']:
+                    value=dict(state='idle',visible_blocker=False,skip_state_update=False)
+                elif args[1:3]==['agent','read']:
+                    return subprocess.CompletedProcess(args,0,'› protect this draft\n ? for shortcuts','')
+                else: raise AssertionError(args)
+                return subprocess.CompletedProcess(args,0,json.dumps(value),'')
+            with patch.object(observer,'TASKS',str(tasks)), patch.object(observer,'REPORTS',str(reports)), \
+                 patch.object(observer,'QUEUE',str(queue)), patch.object(observer,'POOL',str(pool)), \
+                 patch.object(observer,'STATE',str(root/'state')), patch.object(observer,'DRY',False), \
+                 patch.object(observer,'ledger',return_value=[]), patch.object(observer.subprocess,'run',side_effect=native), \
+                 patch.dict(__import__('os').environ, FLEET_STATE=str(root/'state')):
+                observer.dispatch({'coder':dict(agent='codex',agent_status='idle')},set())
+            self.assertEqual(prompts,[])
+            self.assertEqual(list(tasks.iterdir()),[])
+            self.assertEqual(queue.read_text(),'bean-demo\tcoder\tdo the task\n')
+
     def test_failed_dispatch_preserves_named_target(self):
         import tempfile
         from types import SimpleNamespace

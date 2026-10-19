@@ -32,7 +32,13 @@ class BriefFixture(unittest.TestCase):
             subprocess.run(['git','-C',str(self.repo),*args],env=self.env,check=True,capture_output=True)
         (self.root / 'board/config').mkdir(parents=True)
         transport = self.root / 'herdr-stub'
-        transport.write_text('#!/bin/sh\nprintf \'{"result":{"agent":{"name":"fixture","cwd":"WORKTREE","agent_status":"done"}}}\\n\'\n')
+        transport.write_text("""#!/usr/bin/env python3
+import json,sys
+row=dict(name='fixture',cwd='WORKTREE',agent='codex',agent_status='done',pane_id='w1:p1',terminal_id='t1',state_change_seq=1,interactive_ready=True)
+if sys.argv[2]=='explain': print(json.dumps(dict(state='done',visible_blocker=False,skip_state_update=False)))
+elif sys.argv[2]=='read': print('›\\n ? for shortcuts')
+else: print(json.dumps({'result':{'agent':dict(row,agent_status='working') if sys.argv[2]=='prompt' else row}}))
+""")
         transport.chmod(0o755)
         self.env['FLEET_HERDR'] = str(transport)
         self.tool('fleet-track', '', 0)
