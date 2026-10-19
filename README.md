@@ -1,35 +1,69 @@
-# drover
+# drover — run a team of coding agents in parallel
 
-drover turns [herdr](https://herdr.dev) into a self-running team of coding agents: a lead assigns beans
-(tasks), coders work in their own git worktrees, a reviewer on a *different* harness reviews, and a watcher
-loop moves work between them without the lead in the path.
+![Drover: dispatch, build, cross-harness review, verified landing](docs/assets/banner.svg)
 
-It is a set of bash scripts, a launchd job, and an agent skill. It was extracted from one person's fleet —
-10 to 25 agents across Claude Code, Codex, opencode, Grok, Cursor and Antigravity, working on one production
-codebase — and it carries that fleet's scar tissue: almost every guard in it has a dated comment saying what
-broke before it existed.
+[![CI](https://github.com/andrebrov/drover/actions/workflows/ci.yml/badge.svg)](https://github.com/andrebrov/drover/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platform: macOS](https://img.shields.io/badge/platform-macOS-303844.svg)](#requirements)
+[![Release](https://img.shields.io/github/v/release/andrebrov/drover)](https://github.com/andrebrov/drover/releases/latest)
 
-## Why
+**drover is an MIT-licensed macOS toolkit for developers who run teams of coding agents in parallel in Herdr, with task dispatch, isolated Git worktrees and cross-harness review.**
 
-herdr already hosts the agents: each coding CLI runs in a named pane, and `herdr agent list|read|prompt`
-drives them. What it does not do is notice when one of them has finished. Before drover, the lead did the
-noticing, and the ledger says what that cost:
+It is for developers operating more than one coding CLI on the same repository. It is not a coding model, hosted IDE or security sandbox. It coordinates Claude Code, Codex, OpenCode and other configured Herdr harnesses; you supply their accounts and your project's gates.
 
-- **44 minutes median** between one dispatch and the next to the same agent (p90: 285 minutes), measured over
-  650 gaps, for tasks that take 10–20 minutes. Every transition — done → review → next task — waited for the
-  lead, who polled in 8-minute sleeps.
-- `fleet status` reported `done` for agents that were mid-turn, and pane text kept stale error banners after
-  they were fixed. When opencode's credits ran out, **10 agents reported `done` with no work, no report and no
-  error**, and were dispatched into again.
-- Reports announced "DONE, landable" **for the ninth time** — each one a paid round that re-verified
-  commits that already existed.
-- opencode spent **$290, then $376** on two consecutive days, against $27–$82 on each of the four days before.
-  The first meter built to watch it (`opencode stats --days 1`) reported **$952**: it adds up the lifetime
-  cost of every session touched in the window. The cap now sums per-message cost since midnight.
+[Website](https://andrebrov.github.io/drover/) · [Get started](#quickstart) · [FAQ](#faq) · [Alternatives](#drover-vs-alternatives) · [LLM-readable index](https://andrebrov.github.io/drover/llms.txt) · [Cite a version](CITATION.cff)
 
-drover's answers: agents announce completion (`fleet-done`) instead of being polled; state is judged by
-artifacts (a commit on the branch, a report on disk), never by status fields; a watcher reacts within a
-minute; and each of those failures now has a guard (a spend cap, a no-op detector, credit-dead seat detection).
+> [!CAUTION]
+> Drover was extracted from one operator’s fleet, not a general reliability benchmark. Agents use your local credentials and configured native permissions. Inspect `install.sh --dry-run`, configuration and permission settings before enabling automation. macOS is the supported operating environment.
+
+## What happened in one real fleet
+
+These are historical observations from the maintainer’s fleet, not promised improvements or independent benchmarks. The public lessons preserve their dates; raw operational ledgers are not distributed.
+
+- **2026-09-07 — 44-minute median dispatch gap.** Across 650 gaps between dispatches to the same seat, the median was 44 minutes and p90 was 285 minutes, while tasks took 10–20 minutes. The lead had been polling in eight-minute sleeps. Drover replaced that handoff with explicit completion announcements. [Dated source](https://github.com/andrebrov/drover/blob/5f8a056328d83f5b7465bf955643f3fecfe1e4b1/docs/LESSONS.md#announce-when-you-finish--push-not-poll-2026-09-07).
+- **2026-09-07 — 10 “done” seats produced no work.** After OpenCode credits ran out, ten agents reported done with no commit, report or error. That incident is why status alone does not release ownership and budget checks inspect provider-limit evidence. [Dated source](https://github.com/andrebrov/drover/blob/5f8a056328d83f5b7465bf955643f3fecfe1e4b1/docs/LESSONS.md#staying-inside-the-budget-2026-09-07).
+- **2026-09-18 — the $952 daily-meter bug.** `opencode stats --days 1` counted lifetime session cost for sessions touched in the window. At one checked instant it read $856.01 while the message cost inside 24 hours was $212.60. The guard changed to summing message cost since local midnight. [Dated source](https://github.com/andrebrov/drover/blob/5f8a056328d83f5b7465bf955643f3fecfe1e4b1/docs/LESSONS.md#a-spend-cap-measured-in-2026-09-18).
+
+## A 15-second fixture demo
+
+[Download the asciinema recording](docs/assets/demo.cast) and run `asciinema play demo.cast`; [read the transcript](docs/DEMO.md). It records real `fleet-claims-audit` invocations against **synthetic local fixtures**, first with matching ownership and then conflicting seats. It does not show a live fleet, paid agent calls or measured throughput.
+
+## drover vs alternatives
+
+First-party descriptions read **2026-10-19**. These are workflow differences, not benchmark rankings. Projects evolve; check their linked sources.
+
+| Project | Documented workflow | Source |
+|---|---|---|
+| drover | A local Herdr fleet loop: task dispatch, budget/ownership evidence, cross-harness review and gated publication. | [Operating model](docs/OPERATING-MODEL.md), [source](bin/fleet-watch) |
+| herdr-synapse | A Herdr plugin with a shared team board, human-owned charter and idle-gated message delivery. | [First-party source](https://github.com/vitalysim/herdr-synapse/blob/main/README.md) |
+| Claude Squad | A terminal app using tmux and Git worktrees to run coding agents on separate tasks and review changes. | [First-party source](https://github.com/smtg-ai/claude-squad/blob/main/README.md) |
+| Conductor | Its official docs describe parallel coding agents in isolated workspaces, with diff review and pull-request workflows. | [First-party source](https://www.conductor.build/docs) |
+| Vibe Kanban | Its README describes kanban planning, agent workspaces and inline diff review; it also announces the project is sunsetting. | [First-party source](https://github.com/BloopAI/vibe-kanban/blob/main/README.md) |
+| Claude Code agent teams | Anthropic documents a lead session coordinating Claude Code teammates through shared tasks and inter-agent messages. | [First-party source](https://code.claude.com/docs/en/agent-teams) |
+
+Conductor’s public [release repository](https://github.com/meltylabs/conductor-releases) has no product README, so the row cites its official docs; its [tutorial README](https://github.com/meltylabs/conductor-tutorial/blob/main/README.md) is a learning project. Claude Code’s [own README](https://github.com/anthropics/claude-code/blob/main/README.md) links its official docs; the agent-teams behavior above comes from that feature’s documentation. [Source audit](docs/SOURCES.md).
+
+## FAQ
+
+### How do I run multiple Claude Code agents in parallel?
+
+Install Herdr and authenticate your coding CLIs, inspect Drover’s install dry-run, configure a lead plus separate coder/reviewer seats in examples/config, then run fleet up. Each assigned coder works in its own Git worktree. Start with two seats and one task; inspect the result before enabling watcher automation.
+
+### How do I stop coding agents double-dispatching?
+
+Choose one assignment authority. Drover projects native task ownership and the fetched main board before dispatching; fleet-claims-audit reports disagreement as UNKNOWN. Check the task and artifact evidence before releasing an owner. A stale pane or a done status alone is not proof of completion.
+
+### How do I set up cross-harness code review with Codex and Claude?
+
+Configure coder and reviewer seats on different harnesses, for example a Codex coder and a Claude reviewer. Drover routes the named commits for execution of the build and affected tests. Keep the same-harness review guard enabled; a prose approval is not evidence that tests ran.
+
+### Is Drover a model, hosted IDE or security sandbox?
+
+No. It is local orchestration around existing CLIs in Herdr. You supply their accounts and your project’s build/test commands. Worktrees separate branches, not operating-system permissions. Review automation and native CLI permission settings before running it.
+
+### Does Drover support Linux or Windows?
+
+The full operating loop targets macOS: launchd, BSD utilities and APFS clone operations are assumed. Portable individual scripts do not establish support for the complete fleet on Linux or Windows.
 
 ## The loop
 

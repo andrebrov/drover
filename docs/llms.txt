@@ -1,0 +1,20 @@
+# drover
+
+> drover is an MIT-licensed macOS toolkit for developers who run teams of coding agents in parallel in Herdr, with task dispatch, isolated Git worktrees and cross-harness review.
+
+Website: https://andrebrov.github.io/drover/
+Repository: https://github.com/andrebrov/drover
+License: MIT. Operating environment: macOS. Release: v0.2.0.
+Drover is local orchestration around existing coding CLIs, not a model or security sandbox.
+
+## Documentation
+- [Overview and FAQ](https://andrebrov.github.io/drover/): Definition, workflow, limitations and first-party comparison links.
+- [README](https://github.com/andrebrov/drover/blob/main/README.md): Installation and full operating loop.
+- [Historical observations](https://github.com/andrebrov/drover/blob/main/docs/LESSONS.md): Dated single-fleet reports, not independent benchmarks.
+- [Source audit](https://andrebrov.github.io/drover/SOURCES.md): Source URLs and date read for factual comparisons.
+- [Demo transcript](https://andrebrov.github.io/drover/DEMO.md): Synthetic fixture disclosure and reproducible terminal demo.
+- [Release v0.2.0](https://github.com/andrebrov/drover/releases/tag/v0.2.0): Versioned release notes.
+- [Citation](https://github.com/andrebrov/drover/blob/main/CITATION.cff): Software citation metadata.
+
+## Scope
+You provide Herdr, authenticated coding CLIs and project gates. Agents use local credentials and native permissions. Original numbers (44-minute median/650 dispatch gaps, ten empty done seats and the $952 meter error) are attributed to the maintainer’s dated retrospective; their raw ledgers are not public. No ranking, speedup or reliability benchmark is claimed.

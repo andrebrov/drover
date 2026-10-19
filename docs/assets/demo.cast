@@ -1,0 +1,7 @@
+{"version": 2, "width": 100, "height": 18, "title": "drover — synthetic ownership audit; real CLI output, edited timing", "env": {"TERM": "xterm-256color"}}
+[0, "o", "drover / synthetic fixtures / real CLI output\r\nPlayback dwell time edited for reading; no live agents.\r\n\r\n"]
+[1, "o", "$ fleet-claims-audit --fixture clean\r\n"]
+[2, "o", "fleet-claims-audit: OK — current owner and native task sources agree\r\nexit 0\r\n\r\n"]
+[7, "o", "$ fleet-claims-audit --fixture duplicate\r\n"]
+[8, "o", "fleet-claims-audit: UNKNOWN DUPLICATE_CURRENT_SEATS bean=bean-a001 seats=['alpha', 'beta'] — competing current sources; ownership is unknown\r\nfleet-claims-audit: UNKNOWN OWNER_TASK_DISAGREEMENT seat=alpha owner_bean=None task_bean=bean-a001 — latest bean owner differs from this task snapshot\r\nexit 2\r\n\r\n"]
+[15, "o", "Check evidence before dispatch. Resolve UNKNOWN; do not release a seat by status alone.\r\n"]

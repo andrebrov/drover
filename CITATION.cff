@@ -1,0 +1,16 @@
+{
+  "cff-version": "1.2.0",
+  "message": "If you use this software, cite the version you used.",
+  "title": "drover: a local fleet loop for parallel coding agents",
+  "type": "software",
+  "authors": [
+    {
+      "family-names": "andrebrov"
+    }
+  ],
+  "version": "0.2.0",
+  "date-released": "2026-10-19",
+  "license": "MIT",
+  "repository-code": "https://github.com/andrebrov/drover",
+  "url": "https://andrebrov.github.io/drover/"
+}
