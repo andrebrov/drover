@@ -368,4 +368,4 @@ MIT — see [LICENSE](LICENSE).
 
 Callsigned seats, lockfile-keyed dependencies, guarded installation, native ownership audits, stamped measurements, a read-only kanban observatory, finite opt-in routing, precedent-aware briefs and a project-configurable main tripwire are included. See [the update and revision accounting](docs/UPDATES-2026-10-19.md) and [configuration](examples/config).
 
-Run the complete offline fixture suite with `bash tests/run-all.sh`. Installation refuses uncommitted sources or unknown installed-only drift; `--force` does not waive that check.
+Run the complete offline fixture suite with `bash tests/run-all.sh`. It requires Python 3.12+, pytest/pytest-subtests, Bash, Git, Node, jq and the real Beans CLI (v0.4.2 tested); cloud/Herdr transports use fixtures. CI installs Beans through its official Homebrew tap. Installation refuses uncommitted sources or unknown installed-only drift; `--force` does not waive that check.
