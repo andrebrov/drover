@@ -19,6 +19,8 @@ MARK="$DROVER_HOME/.standup-mark"
 SINCE_ARGS=(); [ -f "$MARK" ] && SINCE_ARGS=(-newer "$MARK")
 echo "== agents =="
 "$DROVER_BIN"/fleet status 2>/dev/null | awk 'NR>1 && $1!="-" && $1!="lead" {printf "  %-19s %-9s %s\n",$1,$2,$3}' | sort -k3
+echo "== board =="
+"$DROVER_BIN"/fleet-dispatch --dry-run 2>/dev/null | grep -E '^(board_ready=|BOARD_DRY|  dry )' | sed 's/^/  /'
 echo "== new since last standup =="
 find "$FLEET_REPORTS" -maxdepth 1 -name '*.md' "${SINCE_ARGS[@]}" -mmin -720 2>/dev/null | sort | while read -r f; do
   b=$(basename "$f" .md)

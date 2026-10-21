@@ -753,13 +753,14 @@ def main():
                           and (m.group(1) not in revived or s['busy_reasons'])
                           and (s['busy_reasons'] or s['status'] in ('working', 'blocked') or not seat_finished_bean(s.get('name') or '', m.group(1)))},
     }
-    reasons, dispatchable = {}, []
+    reasons, reason_ids, dispatchable = {}, {}, []
     for b in ready:
         r = classify(b, ctx)
         if r is None:
             dispatchable.append(b)
         else:
             reasons[r] = reasons.get(r, 0) + 1
+            reason_ids.setdefault(r, []).append(b['id'])
     n_ready, n_disp = len(ready), len(dispatchable)
     if as_json:
         if n_ready != n_disp + sum(reasons.values()):
@@ -785,6 +786,15 @@ def main():
     if n_ready != n_disp + sum(reasons.values()):
         print(f'INVARIANT VIOLATED: board_ready={n_ready} != dispatchable={n_disp} + reasons={sum(reasons.values())}')
         sys.exit(3)
+    # retro 2026-10-20: 1-3 dispatchable of ~190 with ten idle seats looked like a healthy board
+    # because nothing named the shortage. Under three, say so and name the exclusions that caused it, with ids:
+    # a lead check can no longer read a thin board as fine.
+    if n_disp < 3:
+        print(f'BOARD_DRY dispatchable={n_disp}')
+        top = sorted(reason_ids.items(), key=lambda kv: -len(kv[1]))[:5]
+        for reason, ids in top:
+            shown = ','.join(ids[:8]) + (f',+{len(ids) - 8}' if len(ids) > 8 else '')
+            print(f'  dry {reason} n={len(ids)} beans={shown}')
     if n_disp == 0 and n_ready > 0:
         top = sorted(reasons.items(), key=lambda kv: -kv[1])[:3]
         print('dispatchable=0 while board_ready>0; top reasons: ' + ', '.join(f'{k}={v}' for k, v in top))

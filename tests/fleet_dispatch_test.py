@@ -61,6 +61,25 @@ class T(unittest.TestCase):
         self.assertEqual(len(self.b.assigned()), 3)
         self.assertNotIn('no work', r.stdout.lower())
 
+    def test_board_dry_names_the_shortage_and_the_exclusion_ids(self):
+        """2 dispatchable of 4 was the retro shape; it must not read as a healthy board."""
+        self.b.bean('bean-0001'); self.b.bean('bean-0002')
+        self.b.bean('bean-0003', body='## Checklist\n- [ ] FOUNDER: approve the plan')
+        self.b.bean('bean-0004', body='## Checklist\n- [ ] founder decides the vendor')
+        self.b.seat('s1')
+        r = self.b.run('--dry-run')
+        self.assertIn('board_ready=4 dispatchable=2', r.stdout)
+        self.assertIn('BOARD_DRY dispatchable=2', r.stdout)
+        self.assertIn('dry all_open_items_gated n=2 beans=bean-0003,bean-0004', r.stdout)
+
+    def test_five_dispatchable_is_not_board_dry(self):
+        for i in range(5):
+            self.b.bean(f'bean-000{i}')
+        self.b.seat('s1')
+        r = self.b.run('--dry-run')
+        self.assertIn('dispatchable=5', r.stdout)
+        self.assertNotIn('BOARD_DRY', r.stdout)
+
     def test_known_good_working_seat_bean_and_skip_listed_are_never_dispatched(self):
         self.b.bean('bean-0001'); self.b.bean('bean-0002'); self.b.bean('bean-0003')
         self.b.seat('busy', 'working', 'fleet/busy-bean-0001')
