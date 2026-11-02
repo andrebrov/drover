@@ -665,11 +665,13 @@ Work ONLY in this worktree ($(cwd_of "$1")). Steps:
 2. With BR set to the branch you resolved above: \`git diff main...\$BR --stat\` then \`git diff main...\$BR\`. Judge against the bean's checklist and the repository's own agent rules (CLAUDE.md / AGENTS.md or equivalent).
 3. To build/test their code: \`git checkout --detach \$BR\` in THIS worktree (if git refuses because of local changes: \`git stash -u\` first (INCLUDE untracked — the pre-seeded WIP has tracked and untracked parts that only compile together; this worktree is yours alone) and \`git stash pop\` after returning with \`git checkout fleet/$1\`). Run ${DROVER_BUILD:-the project build} and the relevant tests${DROVER_TEST:+ ($DROVER_TEST)}.
 3b. JEST RULE: run jest only as \`npx jest --runInBand --cacheDirectory /tmp/jest-cache-\$USER <files>\`. In a read-only sandbox point --cacheDirectory at a writable directory. Never run jest through \`node -e\` or patch jest internals: jest-worker forks children that re-run the inline script and fork more, without bound.
-4. Write $REPORTS/$1-review-$4-by-$3.md: findings as CRITICAL/HIGH/MEDIUM/LOW, each with file:line, why it is wrong and the concrete fix; what you verified (commands + results, PASTED — a command you did not run cannot appear here); unchecked bean items the coder missed. End with exactly these three lines:
+4. Write $REPORTS/$1-review-$4-by-$3.md: findings as CRITICAL/HIGH/MEDIUM/LOW, each with file:line, why it is wrong and the concrete fix; what you verified (commands + results, PASTED — a command you did not run cannot appear here); unchecked bean items the coder missed. End with exactly these four lines:
+REVIEWED: <the full commit SHA of \$BR you built and tested: \`git rev-parse \$BR\`>
 BEAN: MET | UNMET — <checklist items not met, or "all">
 LANDABLE: YES | NO — <blocker: build|tests|rebase|schema|none>
 VERDICT: APPROVE | APPROVE-WITH-FOLLOWUP <new-bean-id> | CHANGES
-APPROVE = BEAN MET and LANDABLE YES and the build + related-tests output is pasted in the report.
+APPROVE = BEAN MET and LANDABLE YES and the build + related-tests output is pasted in the report. The landing gate accepts
+your APPROVE only for the REVIEWED commit (or a bean-only descendant or byte-identical rebase of it); a later code change needs a new review.
 APPROVE-WITH-FOLLOWUP = BEAN MET, LANDABLE YES, and every remaining finding is MEDIUM or LOW, touches no bean checklist item, and is filed as the named bean. A HIGH or CRITICAL can NEVER be a follow-up.
 CHANGES = anything else. If LANDABLE is NO for a reason that is not the coder's code (rebase, catalog drift, harness timeout), say so on the LANDABLE line so the lead routes a rebase rather than a fix.
 Never assert a negative — \"no work exists\", \"this was fabricated\", \"nothing populates this\" — without pasting the command that proves it. If you cannot run it, write \"I could not verify\".

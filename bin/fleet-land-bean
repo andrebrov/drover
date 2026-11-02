@@ -8,6 +8,7 @@
 # git isolation: MAIN() acts on the repo checkout (branch main); WT() acts on the scratch worktree's
 # OWN HEAD. NEVER pass --git-dir with -C <worktree> — it overrides the worktree and hits main.
 #
+# Review gate: lib/fleet_review_gate.py must find a cross-harness APPROVE receipt for the branch (DROVER_REVIEW_GATE=0: off).
 # Gates (all optional; set in ~/.config/drover/config; empty = skipped):
 #   DROVER_TYPECHECK     fast per-bean typecheck, run at the worktree root     (e.g. 'npx tsc --noEmit')
 #   DROVER_TEST_CHANGED  per-bean tests for the changed files, with $CHANGED = the space-separated
@@ -71,6 +72,16 @@ if [ -z "$picks" ]; then
 fi
 n_picks=$(printf '%s\n' "$picks" | grep -c .)
 [ "$n_picks" -gt 40 ] && { flag "$n_picks commits ahead — stale branch, land manually"; exit 1; }
+
+# Review gate: a source-changing land needs a cross-harness APPROVE receipt that covers the branch tip (the exact
+# commit, a bean-only descendant, or a byte-identical rebase). The approved marker alone is not evidence of review.
+# DROVER_REVIEW_GATE=0 turns it off for a fleet whose reviewers do not write receipts yet.
+if [ "${DROVER_REVIEW_GATE:-1}" != 0 ]; then
+  author=${owner:-$(printf '%s' "${br#fleet/}" | sed "s/-${bean}\$//")}
+  if ! gate_out=$(python3 -B "$DROVER_SRC/lib/fleet_review_gate.py" check --head "$br" --base main --author "$author" "$REPO" "$bean" 2>&1); then
+    flag "$(printf '%s' "$gate_out" | tail -1)"; exit 1
+  fi
+fi
 
 # ISOLATED scratch worktree at current main; cherry-pick there. WT() = the worktree's own HEAD.
 wt="$STATE/land-wt/$bean.$$"

@@ -1468,3 +1468,15 @@ the reset time parsed out of it; dispatch, `pick_least`, the refill loop and rev
 clears at its reset, or as soon as the seat is seen idle/done with an OK budget verdict; a banner with no parseable time
 falls back to six hours. An UNKNOWN budget read never clears a mark. When no reviewer is free, the log names the
 usage-limited reviewers and their reset times instead of a bare "none free".
+
+## The landing checks the review receipt, not the word "approved" (2026-11-02)
+A seat landed source changes with a review receipt it wrote itself under the name "lead", and nothing at landing
+looked at the receipt: an approved marker, or a report that said APPROVE, was enough. Now `fleet-review-gate` runs
+before every source-changing land (`fleet-land-bean` calls it; a seat that lands itself runs it before pushing). It
+accepts only a receipt named `<reviewer>-review-<bean>-by-<coder>.md` whose reviewer is a roster seat on a different
+harness from the coder and is not the author, whose newest verdict is APPROVE, and whose `REVIEWED:` commit covers the
+landing head: the same commit, an ancestor followed only by bean-file commits, or a byte-identical rebase (binary diff
+with full blob ids; only hunk line numbers normalised, so a whitespace edit, moved file or swapped binary does not
+match). A newer CHANGES that covers the head refuses even when an older APPROVE exists. Each accepted receipt is
+logged with its sha256 and mtime, and a landing whose audit line cannot be written is refused. Author identity comes
+from the branch first, so a process variable cannot make another seat's work look like the reviewer's own.

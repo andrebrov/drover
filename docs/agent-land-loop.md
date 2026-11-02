@@ -50,7 +50,12 @@ Repo: `$DROVER_REPO`. You run in your own worktree (`$DROVER_WORKTREES/fleet-<yo
    real (1)-(3) item → fix it and repeat that final review once; if it still finds one, report BLOCKED
    with the finding. Endless new-phrasing or polish findings are NOT blockers: file them as a follow-up
    bean and push anyway.
-8. Push: `git push origin HEAD:main`. The pre-push hook builds, runs the related tests, and holds a
+8. Save the review as `$FLEET_REPORTS/<reviewer-seat>-review-<bean>-by-<you>.md`, ending with `REVIEWED: <full sha
+   of the reviewed HEAD>` and the `VERDICT:` line, then run `fleet-review-gate check . <bean>`; it must exit 0. It
+   accepts only a cross-harness APPROVE for this HEAD (or a bean-only descendant, or a byte-identical rebase of the
+   reviewed commit) and refuses self-review and non-seat reviewer names such as `lead`. Never write a receipt under
+   another seat's name: the receipt is the evidence that a different model reviewed this diff.
+   Push: `git push origin HEAD:main`. The pre-push hook builds, runs the related tests, and holds a
    fleet-wide push lock (it waits while another push runs — do not kill it; see
    `examples/pre-push-lock.sh`; with `fleet-slot run --push` the push gate takes one of `FLEET_PUSH_SLOTS` slots,
    default 1, in a pool separate from general runs). NEVER skip the hook, and no environment variable or alternate hooks path overrides it. Non-fast-forward →

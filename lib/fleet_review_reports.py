@@ -20,10 +20,15 @@ NOT_A_FINDING = re.compile(r"\b(resolved|pre-existing|not introduced here)\b", r
 # a main SHA) is not one: the report then names no commit and joins its coder's round. Measured on 120 hand-labelled
 # report headers (cycle-detect/eval-2026-09-29.json).
 _SHA = r"`?([0-9a-f]{7,40})\b"
+# The explicit, machine-readable form a reviewer is asked to write: `REVIEWED: <full sha>` on its own line, anywhere
+# in the report. It wins over every prose form below.
+REVIEWED_LINE = re.compile(r"^(?:REVIEWED|COMMIT)\s*:\s*`?([0-9a-f]{7,40})\b", re.I)
 REVIEWED = [
     re.compile(r"fleet/[\w.\-]+`?\s*(?:,\s*tip(?: commit)?|@|=|\((?:tip commit|commit)?|at(?: commit)?|resolves to)\s*" + _SHA),
     re.compile(r"(?i)(?:branch tip(?: tested)?|reviewed (?:commit|head)|\*\*(?:commit|sha):?\*\*:?|(?<!round-\d )(?<!my )\btip(?: commit)?)"
                r"\s*[:=]?\s*" + _SHA),
+    # a report title such as "# Review <bean> — <sha>", tried last
+    re.compile(r"(?im)^#\s*Review:?\s+(?:of\s+)?\S+[^\n]*?\b([0-9a-f]{7,40})\b"),
 ]
 HEADER_LINES = 15
 
@@ -37,7 +42,7 @@ def reviewed_commit(header):
 
 def parse_report(path):
     """{'verdict', 'findings': [(severity, title)], 'commit'} of one review report."""
-    verdict, findings, header = None, [], []
+    verdict, findings, header, explicit = None, [], [], None
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for n, line in enumerate(f):
@@ -49,9 +54,12 @@ def parse_report(path):
                 v = VERDICT.search(line)
                 if v:
                     verdict = v.group(1).upper()
+                if explicit is None:
+                    m = REVIEWED_LINE.match(line.strip())
+                    explicit = m.group(1) if m else None
     except OSError:
         pass
-    return {"verdict": verdict, "findings": findings, "commit": reviewed_commit("".join(header))}
+    return {"verdict": verdict, "findings": findings, "commit": explicit or reviewed_commit("".join(header))}
 
 
 def reports_for(bean, reports_dir, until=None):
