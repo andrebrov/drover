@@ -21,6 +21,6 @@ live=$(lsof -a -d cwd -Fpn 2>/dev/null | awk -v w="$here" '/^p/{p=substr($0,2)} 
   if printf '%s' "$c" | grep -Eq 'claude|codex|opencode|agy|cursor|gemini|herdr'; then continue; fi
   # A seat's own language server or MCP daemon is not work (bean-0s1x, list owned by lib/fleet_daemons.py).
   if python3 "$lib/fleet_daemons.py" --match "$c"; then continue; fi
-  if basename "$(ps -o comm= -p "$pid" 2>/dev/null || true)" | grep -Eqx 'node|npm|npx|tsc|tsx|jest|vite|playwright'; then echo "$pid $c"; fi
+  if basename -- "$(ps -o comm= -p "$pid" 2>/dev/null || true)" | grep -Eqx 'node|npm|npx|tsc|tsx|jest|vite|playwright'; then echo "$pid $c"; fi
 done | head -3)
 [ -z "$live" ] || { printf '%s\n' "$live"; exit 7; }

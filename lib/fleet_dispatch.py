@@ -94,6 +94,11 @@ class _NotSeats:
         return name in names or _NS.match(name)
 NOT_SEATS = _NotSeats()
 FREE_STATES = {'idle', 'done'}
+# A seat that has just taken a brief answers `idle` until its first turn starts, indistinguishable from a seat with
+# nothing to do: the next pass handed it a second bean and cut its branch. Its newest assignment holds it until it
+# writes a final DONE/BLOCKED report for that bean newer than the assignment, or the record ages past this bound.
+ASSIGNMENT_HOLD_S = 15 * 60
+BRIEFS = os.path.join(FIX, 'briefs') if FIX else config['FLEET_BRIEFS']
 # An item is gated only when its OWNER is named up front (FOUNDER:/LEAD:/OPERATOR:/ROOT, '(founder ...)') rather than matching an integration name anywhere in the item.
 # A substring anywhere ('approved', 'the merchant sees') hid real coding beans: bean-8s4w (critical) sat undispatched.
 GATED = re.compile(r'^\s*-\s*\[ \]\s*(\*\*)?\(?\s*(founder|lead|operator|root|architect|human|merchant)\b', re.I)
@@ -229,6 +234,27 @@ def diagnostic(message):
     print(message, file=sys.stderr if '--json' in sys.argv else sys.stdout)
 
 
+def recent_assignments(owner_rows):
+    """seat -> (bean, epoch) of its newest hand-off, from the native records `fleet assign` leaves: the owner row and
+    the brief's mtime (assign-<seat>-<bean>.txt, rewritten on every assign). Either one is enough."""
+    by_seat = {}
+
+    def remember(bean, seat, at):
+        if seat not in by_seat or at >= by_seat[seat][1]:
+            by_seat[seat] = (bean, at)
+    for _, bean, seat, at in owner_rows:
+        remember(bean, seat, at)
+    bean_re = config.get('DROVER_BEAN_RE', r'[a-z0-9]+-[a-z0-9]+')
+    for path in glob.glob(os.path.join(BRIEFS, 'assign-*.txt')):
+        m = re.fullmatch(r'assign-(.+)-(' + bean_re + r')\.txt', os.path.basename(path))
+        try:
+            if m:
+                remember(m.group(2), m.group(1), os.path.getmtime(path))
+        except OSError:
+            continue
+    return by_seat
+
+
 def free_seat_reasons(status, seats, asking):
     """(free names, seat -> the first reason it is not free). Every seat left out of free carries a printed reason:
     a seat dropped silently (a non-idle status, a dedicated list) looked like a seat the dispatcher had forgotten."""
@@ -249,6 +275,10 @@ def free_seat_reasons(status, seats, asking):
     for seat, why in asking.items():
         if seat in free:
             reasons[seat] = why
+            free.discard(seat)
+    for seat, (bean, at) in recent_assignments(read_owners()).items():
+        if seat in free and NOW - at < ASSIGNMENT_HOLD_S and not seat_finished_bean(seat, bean, since=at):
+            reasons[seat] = f'assigned {bean} {NOW - at:.0f}s ago, no final report for it yet'
             free.discard(seat)
     return free, reasons
 
@@ -632,10 +662,11 @@ def open_items(body):
     return [l for l in body.splitlines() if re.match(r'^\s*(?:[-*]\s*)?\[ \]', l)], len(re.findall(r'^\s*(?:[-*]\s*)?\[[xX]\]', body, re.M))
 
 
-def seat_finished_bean(seat, bean):
-    """True when this seat's newest report for the bean ends in a final DONE/BLOCKED line (the seat let it go)."""
+def seat_finished_bean(seat, bean, since=None):
+    """True when this seat's newest report for the bean ends in a final DONE/BLOCKED line (the seat let it go).
+    With `since`, a report older than that answers an earlier attempt, not this one."""
     files = sorted(glob.glob(os.path.join(REPORTS, f'{seat}-{bean}*.md')), key=os.path.getmtime)
-    if not files:
+    if not files or (since is not None and os.path.getmtime(files[-1]) <= since):
         return False
     lines = [l.strip() for l in open(files[-1], errors='replace').read().splitlines() if l.strip()]
     return bool(lines) and bool(re.match(r'^(DONE|BLOCKED)\b', lines[-1]))

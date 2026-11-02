@@ -44,7 +44,7 @@ HKW='HUMAN:|FOUNDER|needs (a |the )?human|human must|needs founder|admin to unlo
 WKW='gate opens|window opens|not before|opens on|wait until|until 20[0-9]{2}-'
 resolved=0 escalated=0 leadq=0 redispatched=0 kept=0 waited=0
 for f in "$STATE/noop-held"/*; do
-  [ -e "$f" ] || continue; b=$(basename "$f")
+  [ -e "$f" ] || continue; b=$(basename -- "$f")
   st=$(cd "$REPO" && beans show "$b" --json 2>/dev/null | python3 -c 'import sys,json
 try:
     d=json.load(sys.stdin); x=d if isinstance(d,dict) and "status" in d else (d.get("bean") or d); print(x.get("status") or "")

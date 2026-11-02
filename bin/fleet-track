@@ -103,7 +103,7 @@ case "${1:-check}" in
     printf -- '---------------------------------------------------------------\n'
     for f in "$TASKS"/*; do
       [ -f "$f" ] || continue
-      a=$(basename "$f")
+      a=$(basename -- "$f")
       IFS=$'\t' read -r t bean sha rp < "$f"
       now=$(date +%s); age=$(( (now - t) / 60 ))
       br=$(branch_of "$a")

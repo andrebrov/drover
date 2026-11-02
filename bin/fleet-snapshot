@@ -47,7 +47,7 @@ ts=$(date +%Y%m%d-%H%M%S)
 total=0; trees=0
 for wt in "$WT_ROOT"/*; do
   [ -d "$wt/.git" ] || [ -f "$wt/.git" ] || continue
-  name=$(basename "$wt")
+  name=$(basename -- "$wt")
   # Tracked-and-modified only. Untracked files survive reset --hard, so they are not the
   # loss this guards against, and copying them would sweep in node_modules-scale noise.
   files=$(git -C "$wt" diff --name-only 2>/dev/null; git -C "$wt" diff --cached --name-only 2>/dev/null)

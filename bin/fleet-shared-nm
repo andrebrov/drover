@@ -100,7 +100,7 @@ link(){ # $1 repo $2 worktree $3 archive-real (0/1)
   done
   for d in node_modules backend/node_modules frontend/node_modules; do
     if [ -e "$2/$d" ] && [ ! -L "$2/$d" ]; then
-      if [ -z "$backup" ]; then mkdir -p "$backup_root"; backup=$(mktemp -d "$backup_root/$(basename "$2").XXXXXX"); fi
+      if [ -z "$backup" ]; then mkdir -p "$backup_root"; backup=$(mktemp -d "$backup_root/$(basename -- "$2").XXXXXX"); fi
       mkdir -p "$backup/$(dirname "$d")"
       mv "$2/$d" "$backup/$d"
       echo "fleet-shared-nm: preserved $2/$d at $backup/$d" >&2

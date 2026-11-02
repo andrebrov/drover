@@ -82,7 +82,7 @@ HOSTS="claude codex grok opencode"
 
 # Strip global flags so `fleet assign --help` and `fleet land --yes` work
 # without changing existing positional call shapes.
-FLEET_HELP=0 FLEET_DRY_RUN=0 FLEET_YES=0 FLEET_SKILLS_ONLY=0
+FLEET_HELP=0 FLEET_DRY_RUN=0 FLEET_YES=0 FLEET_SKILLS_ONLY=0 FLEET_FORCE_AFTER_LAND=0
 FLEET_ARGS=()
 for _fleet_a in "$@"; do
   case $_fleet_a in
@@ -90,6 +90,7 @@ for _fleet_a in "$@"; do
     --dry-run) FLEET_DRY_RUN=1 ;;
     --yes|-y) FLEET_YES=1 ;;
     --skills) FLEET_SKILLS_ONLY=1 ;;
+    --force-after-land) FLEET_FORCE_AFTER_LAND=1 ;;
     *) FLEET_ARGS+=("$_fleet_a") ;;
   esac
 done
@@ -117,6 +118,8 @@ cmd_help() {
     assign) cat <<'H'
 fleet assign <bean> [coder] [scope]
 Give a bean to a coder. Writes a brief and prompts the agent.
+Refuses a seat that runs in the shared checkout, and a seat whose HEAD holds unlanded commits for another bean.
+--force-after-land  override the unlanded-work refusal; the old commits are retained
 --dry-run  print agent, brief, branch, prompt; do nothing
 H
       ;;
@@ -764,11 +767,49 @@ precedent_for() {
   fi
   return 0
 }
+# A seat's HEAD may carry commits for a bean it was given earlier that never landed. Switching it to a new bean strands
+# them. Judge the seat's actual HEAD: `git cherry` identifies patches already landed under another SHA, and a subject
+# naming another bean (or, for an unnamed commit, the branch's bean) identifies the owner. Unreadable evidence refuses.
+refuse_unlanded_assignment() {
+  local coder=$1 bean=$2 wt=$3 cherry branch_log cur sha subj owned id foreign misses=""
+  if ! cherry=$(git -C "$wt" cherry origin/main HEAD 2>/dev/null) ||
+     ! branch_log=$(git -C "$wt" log origin/main..HEAD --no-merges --format=$'%H\t%s' 2>/dev/null) ||
+     ! cur=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null); then
+    echo "fleet assign: cannot verify unlanded work for $coder in $wt; NOT dispatching" >&2
+    return 3
+  fi
+  while IFS=$'\t' read -r sha subj; do
+    [ -n "$sha" ] || continue
+    printf '%s\n' "$cherry" | grep -qxF "+ $sha" || continue
+    owned=$(printf '%s\n' "$subj" | grep -oE "\\b${DROVER_BEAN_RE}\\b" | sort -u) || true
+    [ -n "$owned" ] || owned=$(printf '%s\n' "$cur" | grep -oE "${DROVER_BEAN_RE}\$" | sort -u) || true
+    foreign=""
+    while IFS= read -r id; do
+      [ "$id" = "$bean" ] || foreign="${foreign}${foreign:+, }${id:-unidentified bean}"
+    done <<< "$owned"
+    [ -z "$foreign" ] || misses="${misses}${misses:+
+}  $foreign: $sha $subj"
+  done <<< "$branch_log"
+  [ -n "$misses" ] || return 0
+  if [ "$FLEET_FORCE_AFTER_LAND" = 1 ]; then
+    printf 'fleet assign: --force-after-land overrides unlanded work for %s (commits retained):\n%s\n' "$coder" "$misses" >&2
+    return 0
+  fi
+  printf 'fleet assign: %s has unlanded work for another bean; NOT dispatching %s:\n%s\nLand it first, then retry; explicit override: --force-after-land\n' "$coder" "$bean" "$misses" >&2
+  return 3
+}
+
 cmd_assign() {
-  local bean=$1 coder=${2:-} scope=${3:-} kind bf prev pb pbf pst
+  local bean=$1 coder=${2:-} scope=${3:-} kind bf prev pb pbf pst wt
   [ -n "$coder" ] || coder=$(pick_least coder assign)
   refuse_dispatch "$coder" "$bean"
   if [ "${FLEET_DRY_RUN:-0}" = 1 ]; then echo "DRY RUN: would assign $bean to $coder (scope: ${scope:-none}); nothing was prepared, written or sent"; return 0; fi
+  wt=$(cwd_of "$coder")
+  # A seat whose cwd is the shared checkout would work in the tree every other seat and the human depend on.
+  if [ -n "$wt" ] && [ -d "$wt" ] && [ "$(cd "$wt" && pwd -P)" = "$(cd "$FLEET_ROOT" && pwd -P)" ]; then
+    echo "fleet assign: $coder runs in the shared checkout $FLEET_ROOT; NOT dispatching (give the seat its own worktree)" >&2; return 2
+  fi
+  if [ -d "$wt" ]; then refuse_unlanded_assignment "$coder" "$bean" "$wt" || return $?; fi   # no readable cwd: nothing to strand here
   check_delivery "$coder" || return $?
   # Orphaned-review guard. Reassigning a seat that just reported on a DIFFERENT bean silently
   # strands that work: the report exists, the bean is still open, and no reviewer was ever
@@ -779,7 +820,7 @@ cmd_assign() {
   # reads. The case this guards is narrow — the seat just finished X and is being handed Y.
   for prev in $(ls -1t "$REPORTS/$coder-$DROVER_BEAN_PREFIX"*.md 2>/dev/null | head -1); do
     [ -f "$prev" ] || continue
-    pb=$(basename "$prev" .md); pb=${pb#"$coder"-}
+    pb=$(basename -- "$prev" .md); pb=${pb#"$coder"-}
     [ "$pb" = "$bean" ] && continue
     # and only if it is recent enough to be this seat's last job, not archaeology
     [ -n "$(find "$prev" -mmin -180 2>/dev/null)" ] || continue
@@ -852,7 +893,7 @@ cmd_review() {
     # silently, which is worse than not having it. Third grep-exit-status trap today.
     holder=$(grep -l -- "	$bean	" "$tdir"/*reviewer* "$tdir"/*analyst* "$tdir"/*architect* 2>/dev/null | head -1 || true)
     if [ -n "$holder" ]; then
-      holder=$(basename "$holder")
+      holder=$(basename -- "$holder")
       [ "$holder" = "${rev:-}" ] || {
         echo "REFUSED: $bean is already under review by $holder. Re-routing would burn a second reviewer seat." >&2
         echo "         Set FLEET_SECOND_OPINION=1 if a second opinion is genuinely what you want." >&2

@@ -260,7 +260,7 @@ gate() {  # <tip> [force] -> 0 pass, 1 fail, 2 env failure. Memoised per tip unl
   local tip=$1 force=${2:-} log memo=$RUN/gate.${1}
   if [ -z "$force" ] && [ -f "$memo" ]; then return "$(cat "$memo")"; fi
   GATE_N=$((GATE_N+1))
-  log=$LOGDIR/$(basename "$RUN")-gate$GATE_N-${tip:0:9}.log
+  log=$LOGDIR/$(basename -- "$RUN")-gate$GATE_N-${tip:0:9}.log
   GATE_LOG=$log
   wreset "$tip" || { echo 2 > "$memo"; return 2; }
   GATE_RECEIPTS=$RUN/receipts-gate$GATE_N; mkdir -p "$GATE_RECEIPTS"
@@ -272,7 +272,7 @@ gate() {  # <tip> [force] -> 0 pass, 1 fail, 2 env failure. Memoised per tip unl
   echo "$rc" > "$memo"; echo "$GATE_N $tip $rc" >> "$RUN/gates"
   return $rc
 }
-gate_log_of() { ls -t "$LOGDIR"/"$(basename "$RUN")"-gate*-"${1:0:9}".log 2>/dev/null | head -1; }
+gate_log_of() { ls -t "$LOGDIR"/"$(basename -- "$RUN")"-gate*-"${1:0:9}".log 2>/dev/null | head -1; }
 
 # A red stack is only a branch's fault if origin/main itself is green. Run the baseline check once, on the bare target tip, with the
 # test files the stack's gate named as failing (a build error needs none). Red baseline -> blame nobody.
@@ -280,7 +280,7 @@ BASELINE_DONE=""; BASELINE_RC=0
 baseline_check() {  # <failing gate log> -> 0 green, 1 red, 2 env
   [ -n "$BASELINE_DONE" ] && return $BASELINE_RC
   BASELINE_DONE=1
-  local log=$LOGDIR/$(basename "$RUN")-baseline.log
+  local log=$LOGDIR/$(basename -- "$RUN")-baseline.log
   BASELINE_LOG=$log
   # failing test files come from the gate's printed output AND from the jest-style JSON receipts it left (a failure held only in a
   # receipt must not produce an empty list); paths are made project-relative for backend/ and frontend/ alike

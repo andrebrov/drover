@@ -51,7 +51,7 @@ trap 'rm -f "$tmp"' EXIT
       found=1
       first=""
       IFS= read -r first < "$task" || true
-      printf -- '- `%s`: %s\n' "$(basename "$task")" "${first:0:180}"
+      printf -- '- `%s`: %s\n' "$(basename -- "$task")" "${first:0:180}"
     done
   fi
   if [ "$found" -eq 0 ]; then echo "- none"; fi
@@ -64,7 +64,7 @@ trap 'rm -f "$tmp"' EXIT
     report_count=$((report_count + 1))
     heading=""
     IFS= read -r heading < "$report" || true
-    printf -- '- `%s`: %s\n' "$(basename "$report")" "${heading:0:180}"
+    printf -- '- `%s`: %s\n' "$(basename -- "$report")" "${heading:0:180}"
   done < <(find "$REPORT_DIR" -maxdepth 1 -type f -name '*.md' -mmin -65 ! -name 'standup-auto-*' -print 2>/dev/null | sort)
   if [ "$report_count" -eq 0 ]; then echo "- none"; fi
   echo

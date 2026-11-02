@@ -1524,3 +1524,16 @@ dropped from both launch paths. Its model is pinned in OpenCode's own configurat
   dedicated list or a non-idle status printed nothing, and a stale-question notice on stdout made the JSON snapshot
   unparseable for its consumers. `free_exclusions` names each excluded seat (status, busy evidence, usage limit,
   unanswered question); human notices go to stderr under `--json`.
+
+## An assignment is ownership before the seat says anything (2026-10-20 .. 2026-10-26)
+- **A seat that just took a brief is not free.** A freshly restarted seat answers `idle` until its first turn starts, so
+  the next dispatch pass handed a hand-assigned seat a second bean and cut its branch. The seat's newest hand-off (owner
+  record or brief mtime; either one is enough) now holds it for 15 minutes unless it writes a final DONE/BLOCKED report
+  for that bean newer than the hand-off. A report older than the hand-off answers an earlier attempt, not this one.
+- **Never assign over unlanded work.** `fleet assign` reads the seat's actual HEAD: a commit not yet on origin/main by
+  patch (`git cherry`), whose subject names another bean (or, unnamed, sits on another bean's branch), refuses the
+  assignment; `--force-after-land` overrides explicitly and keeps the commits. Unreadable evidence refuses.
+- **A seat in the shared checkout gets no dispatch.** A seat whose cwd resolved to the shared checkout skipped its
+  worktree preparation and still received a brief, so it worked in the tree everyone depends on.
+- **`basename --` everywhere.** A login shell's process name is `-zsh`; `basename "-zsh"` reads it as an option and
+  fails, which broke an assignment path. Every shell `basename` call now ends option parsing first.

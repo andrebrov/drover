@@ -229,7 +229,7 @@ owner_blocks(){ local bean="$1" seat="$2" own f="$STATE/owner/$1"
   return 0; }
 # Record owners lazily from coder task files (covers hand dispatches too) and flag any bean held by two coders.
 owner_sync(){ mkdir -p "$STATE/owner" "$STATE/double"; local f s b seen=""
-  for f in "$TASKS"/*; do [ -f "$f" ] || continue; s=$(basename "$f")
+  for f in "$TASKS"/*; do [ -f "$f" ] || continue; s=$(basename -- "$f")
     case "$s" in *coder|*coder-[0-9]*) ;; *) continue;; esac
     b=$(cut -f2 "$f"); [ -n "$b" ] || continue
     [ -f "$STATE/owner/$b" ] || printf '%s\n' "$s" > "$STATE/owner/$b"
@@ -244,7 +244,7 @@ owner_sync(){ mkdir -p "$STATE/owner" "$STATE/double"; local f s b seen=""
   local lof loage
   for lof in "$STATE"/lead-owned/*; do [ -f "$lof" ] || continue
     loage=$(( ($(date +%s) - $(stat -f %m "$lof" 2>/dev/null || echo 0)) / 3600 ))
-    [ "$loage" -ge 24 ] && { rm -f "$lof"; log "LEAD-OWNED TTL: released $(basename "$lof") (${loage}h old, orphaned)"; }
+    [ "$loage" -ge 24 ] && { rm -f "$lof"; log "LEAD-OWNED TTL: released $(basename -- "$lof") (${loage}h old, orphaned)"; }
   done
   # Auto-release STALE owner markers — owner seat NOT working, marker >30min old — so the bean can
   # re-dispatch instead of sitting owned forever. NEVER touch a bean in the land/review pipeline.
@@ -254,7 +254,7 @@ owner_sync(){ mkdir -p "$STATE/owner" "$STATE/double"; local f s b seen=""
   for of in "$STATE"/owner/*; do
     [ -f "$of" ] || continue; [ "$chk" -ge 12 ] && break
     oag=$(( ($(date +%s) - $(stat -f %m "$of" 2>/dev/null || echo 0)) / 60 )); [ "$oag" -lt 30 ] && continue
-    ob=$(basename "$of"); oo=$(cat "$of" 2>/dev/null | tr -d '[:space:]'); [ -n "$oo" ] || continue
+    ob=$(basename -- "$of"); oo=$(cat "$of" 2>/dev/null | tr -d '[:space:]'); [ -n "$oo" ] || continue
     case "$wk" in *" $oo "*) continue;; esac   # owner is mid-task — never yank an active bean
     { [ -f "$STATE/approved/$ob" ] || [ -f "$STATE/reviews/$ob" ]; } && continue
     chk=$((chk+1)); obr="fleet/${oo}-${ob}"; on=0
@@ -298,8 +298,8 @@ route_review(){ local a=$1 bean=$2 rev outcome rc reason limited; rev=$(pick_rev
     fi
   else mkdir -p "$STATE/reviews"; printf '%s\n' "$a" > "$STATE/reviews/$bean"; limited=$(FLEET_STATE="$STATE" python3 -B "$LIVENESS" list 2>/dev/null | awk -F'\t' '$1 ~ /reviewer$/ {printf "%s (%s); ", $1, $2}'); log "no free cross-harness reviewer for $bean — queued for retry${limited:+; usage-limited: ${limited%; }}"; fi; }
 retry_reviews(){ for f in "$STATE"/reviews/*; do [ -f "$f" ] || continue
-  if [ -f "$STATE/approved/$(basename "$f")" ]; then rm -f "$f"; log "DROPPED re-review of $(basename "$f") — already approved"; continue; fi
-  route_review "$(cat "$f")" "$(basename "$f")"; done; }
+  if [ -f "$STATE/approved/$(basename -- "$f")" ]; then rm -f "$f"; log "DROPPED re-review of $(basename -- "$f") — already approved"; continue; fi
+  route_review "$(cat "$f")" "$(basename -- "$f")"; done; }
 
 # --- 1. inbox: route reviews, surface blockers -------------------------------
 # --- no-op round detector (fleet-judge / TypeSafe). Two no-op rounds in a row hold the bean for the lead
@@ -342,7 +342,7 @@ review_verdict(){ local st="$1" sum="$2" rep="$3" v p
 seat_scan(){ local st="$STATE/seat-scan.stamp" now f s r cls conf ts bean rest rep coder
   now=$(date +%s); [ -f "$st" ] && [ $(( now - $(stat -f %m "$st") )) -lt 600 ] && return 0; : > "$st"
   mkdir -p "$STATE/seat-flag" "$STATE/credit-dead" "$STATE/reviews"
-  for f in "$TASKS"/*; do [ -f "$f" ] || continue; s=$(basename "$f")
+  for f in "$TASKS"/*; do [ -f "$f" ] || continue; s=$(basename -- "$f")
     IFS=$'\t' read -r ts bean rest rep < "$f"; [ -n "$bean" ] || continue
     [ $(( now - ${ts:-now} )) -ge 1200 ] || continue
     [ -f "$STATE/credit-dead/$s" ] && continue
@@ -427,7 +427,7 @@ reap_tasks(){
   for f in "$TASKS"/*; do
     [ -f "$f" ] || continue
     local a bean ts age bf st holder state idle_min rep4 coder free
-    a=$(basename "$f"); bean=$(cut -f2 "$f"); ts=$(cut -f1 "$f"); age=$(( ($(date +%s) - ts) / 60 ))
+    a=$(basename -- "$f"); bean=$(cut -f2 "$f"); ts=$(cut -f1 "$f"); age=$(( ($(date +%s) - ts) / 60 ))
     [ -n "$bean" ] || continue
     [ "$age" -ge 20 ] || continue
     state=$(printf '%s' "$STAT" | awk -v a="$a" '$1==a{print $3}')
@@ -449,7 +449,7 @@ reap_tasks(){
       case "$st" in completed|scrapped) rm -f "$f"; log "RELEASED $a — $bean is $st on main (held ${age}m)"; continue;; esac
     fi
     holder=$(grep -l -- "	$bean	" "$TASKS"/* 2>/dev/null | grep -v "/$a$" | head -1 || true)
-    if [ -n "$holder" ]; then rm -f "$f"; log "RELEASED $a — $bean was re-routed to $(basename "$holder") (held ${age}m)"; continue; fi
+    if [ -n "$holder" ]; then rm -f "$f"; log "RELEASED $a — $bean was re-routed to $(basename -- "$holder") (held ${age}m)"; continue; fi
     if [ -n "$(ls "$REPORTS"/$a-*"$bean"*.md 2>/dev/null)" ] && [ "$free" = 1 ]; then
       rm -f "$f"; log "RELEASED $a — already reported on $bean and idle (held ${age}m)"; continue
     fi
@@ -573,14 +573,14 @@ auto_announce(){
   local st t a b rep v
   st=$("$DROVER_BIN"/fleet status 2>/dev/null)
   for t in "$TASKS"/*; do
-    [ -f "$t" ] || continue; a=$(basename "$t"); b=$(cut -f2 "$t" | head -1); [ -n "$b" ] || continue
+    [ -f "$t" ] || continue; a=$(basename -- "$t"); b=$(cut -f2 "$t" | head -1); [ -n "$b" ] || continue
     printf '%s\n' "$st" | awk -v n="$a" '$1==n && ($3=="done" || $3=="idle"){f=1} END{exit !f}' || continue
     rep=$(ls -t "$REPORTS/$a-$b"*.md 2>/dev/null | grep -v -- '-review-' | head -1); [ -n "$rep" ] || continue
     [ "$rep" -nt "$t" ] || continue
     [ $(( $(date +%s) - $(stat -f %m "$rep") )) -ge 300 ] || continue
     v=$(grep -oE '^(DONE|BLOCKED|PARTIAL|CHANGES)\b' "$rep" | tail -1); v=${v:-DONE}
     "$DROVER_BIN"/fleet-done "$a" "$b" "$v" "auto-announced by watcher: seat idle with a newer report (never ran fleet-done)" "$rep" >/dev/null 2>&1 \
-      && log "AUTO-ANNOUNCE $a $b $v (idle, report $(basename "$rep") newer than task)"
+      && log "AUTO-ANNOUNCE $a $b $v (idle, report $(basename -- "$rep") newer than task)"
   done
 }
 

@@ -27,7 +27,7 @@ queue)
 show)
   for d in "$Q"/*/; do [ -d "$d" ] || continue
     n=$(ls "$d" 2>/dev/null | wc -l | tr -d ' ')
-    [ "$n" -gt 0 ] && printf '%-20s %s pending: %s\n' "$(basename "$d")" "$n" \
+    [ "$n" -gt 0 ] && printf '%-20s %s pending: %s\n' "$(basename -- "$d")" "$n" \
       "$(head -c 60 "$(ls -1 "$d" | head -1 | sed "s|^|$d|")" 2>/dev/null | tr '\n' ' ')"; done ;;
 run)
   sent=0

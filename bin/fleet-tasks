@@ -48,7 +48,7 @@ sync_tasks() {
     fi
     [ -n "$bean" ] && [ "$bean" != "-" ] && landed=$(git -C "$ROOT" log --oneline origin/main --grep "$bean" 2>/dev/null | head -1 | awk '{print $1}')
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$id" "$agent" "$role" "$harness" "${bean:--}" "$ts" "${fin:--}" "$(basename "${rep:--}")" "${verdict:--}" "${rounds:-1}" "${landed:--}" >> "$DB"
+      "$id" "$agent" "$role" "$harness" "${bean:--}" "$ts" "${fin:--}" "$(basename -- "${rep:--}")" "${verdict:--}" "${rounds:-1}" "${landed:--}" >> "$DB"
   done
   echo "ledger rows: $(( $(wc -l < "$DB") - 1 ))"
 }

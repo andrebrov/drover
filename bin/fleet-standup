@@ -23,7 +23,7 @@ echo "== board =="
 "$DROVER_BIN"/fleet-dispatch --dry-run 2>/dev/null | grep -E '^(board_ready=|BOARD_DRY|  dry )' | sed 's/^/  /'
 echo "== new since last standup =="
 find "$FLEET_REPORTS" -maxdepth 1 -name '*.md' "${SINCE_ARGS[@]}" -mmin -720 2>/dev/null | sort | while read -r f; do
-  b=$(basename "$f" .md)
+  b=$(basename -- "$f" .md)
   if [[ $b == *review* ]]; then
     printf "  %-52s %s\n" "$b" "$(grep -m1 '^VERDICT' "$f" || echo 'VERDICT: (none)')"
   else

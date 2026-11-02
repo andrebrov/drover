@@ -137,6 +137,21 @@ class T(unittest.TestCase):
         self.assertEqual(payload['free_seats'], ['free'])
         self.assertEqual(payload['free_exclusions'], {'asker': 'unanswered question q1 about bean-0001', 'busy': 'status=working'})
 
+    def test_a_seat_that_just_took_a_brief_is_not_free_until_it_answers(self):
+        self.b.bean('bean-0001'); self.b.bean('bean-0002')
+        self.b.seat('fresh')
+        briefs = self.b.root / 'briefs'
+        briefs.mkdir()
+        (briefs / 'assign-fresh-bean-0009.txt').write_text('brief')     # the brief alone is enough evidence
+        r = self.b.run('--dry-run')
+        self.assertRegex(r.stdout, r'seat not free: fresh \(assigned bean-0009 \d+s ago, no final report for it yet\)')
+        self.assertNotIn('would assign', r.stdout)
+        (self.b.root / 'reports' / 'fresh-bean-0009.md').write_text('done\nDONE landed\n')
+        later = time.time() + 5
+        os.utime(self.b.root / 'reports' / 'fresh-bean-0009.md', (later, later))
+        r = self.b.run('--dry-run')
+        self.assertIn('would assign bean-0001 -> fresh', r.stdout)
+
     def test_json_without_dry_run_refuses_without_assigning(self):
         self.b.bean('bean-0001')
         self.b.seat('free')

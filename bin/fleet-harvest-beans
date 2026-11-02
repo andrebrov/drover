@@ -15,7 +15,7 @@ REPO="${DROVER_REPO:?set DROVER_REPO (env or ~/.config/drover/config) to your pr
 new=()
 for f in "$DROVER_WORKTREES"/*/.beans/"$DROVER_BEAN_PREFIX"*--*.md; do
   [ -f "$f" ] || continue
-  b=$(basename "$f"); id=${b%%--*}
+  b=$(basename -- "$f"); id=${b%%--*}
   compgen -G "$REPO/.beans/$id--*" >/dev/null && continue   # already on the board (or harvested this run)
   cp -p "$f" "$REPO/.beans/$b"; new+=(".beans/$b")
 done
