@@ -2,7 +2,7 @@
 # fleet — lead-managed team of coding agents inside herdr (one coder + one reviewer per harness).
 #
 #   fleet status                   roster table (exit 1 if an agent is missing/unknown)
-#   fleet up                       spawn missing roster agents — own git worktree (branch fleet/<name>), yolo mode
+#   fleet up [seat]                spawn missing roster agents (own worktree, branch fleet/<name>) into EMPTY shell panes; lead excluded
 #   fleet assign <bean> [coder] [scope-note]
 #                                  give a bean to the least-loaded idle coder (or the named one); ledger + prompt
 #   fleet review <coder> [reviewer] send <coder>'s branch to a reviewer on a DIFFERENT harness (least-loaded); ledger
@@ -160,8 +160,9 @@ Send a fix-round prompt and log it as a job. Mutating.
 H
       ;;
     up) cat <<'H'
-fleet up
-Spawn missing roster agents. Mutating.
+fleet up [seat]
+Spawn missing roster agents, or exactly the named seat, in empty shell panes. Mutating.
+Lead seats (DROVER_LEAD_SEATS) are excluded. A pane whose foreground is not its own shell is refused.
 --dry-run  print agent list; do not spawn
 H
       ;;
@@ -516,14 +517,46 @@ worktree_pane() {  # <name> -> root pane of the agent's own workspace (reused if
   jq -r .pane_id <<<"$p"
 }
 
+pane_shell_ready() {  # <pane> — a pane with no registered agent is not evidence of an empty shell
+  local info executable shell_name
+  # Keep only native identity and process ids. Never read or report argv/cmdline: the pane may hold a live session.
+  if ! info=$(herdr pane process-info --pane "$1" 2>/dev/null | jq -ce '
+    .result.process_info | {pane_id, shell_pid, foreground_process_group_id,
+      foreground_processes: [.foreground_processes[]? | {pid}]}'); then
+    echo "$1: pane process state unavailable; not spawning"; return 1
+  fi
+  if ! jq -e --arg pane "$1" '
+    .pane_id == $pane and (.shell_pid | type == "number" and . > 0 and floor == .)
+    and .foreground_process_group_id == .shell_pid
+    and (.foreground_processes | length) == 1
+    and .foreground_processes[0].pid == .shell_pid' <<<"$info" >/dev/null; then
+    echo "$1: occupied by foreground process group $(jq -r '.foreground_process_group_id // "unknown"' <<<"$info"); not spawning"
+    return 1
+  fi
+  # exec keeps the shell's pid and group while replacing its executable; comm is the executable name only.
+  if ! executable=$(ps -p "$(jq -r .shell_pid <<<"$info")" -o comm= 2>/dev/null) || [ -z "$executable" ]; then
+    echo "$1: shell executable unavailable; not spawning"; return 1
+  fi
+  shell_name=${executable##*/}; shell_name=${shell_name#-}
+  case "$shell_name" in
+    sh|bash|zsh|dash|ksh|csh|tcsh|fish|nu|pwsh|xonsh|elvish) ;;
+    *) echo "$1: occupied by executable $executable; not spawning"; return 1 ;;
+  esac
+}
+
 start_agent() {  # name kind pane — a fresh shell needs a moment before it is "available"
+  pane_shell_ready "$3" || return 1
   local err args; err=$(mktemp); args=$(agent_args "$2" "$1")
   # the seat shell (and so the agent and everything it runs) gets a per-user process ceiling and a two-worker jest
   # default BEFORE the agent starts. ulimit only lowers; FLEET_NPROC_LIMIT=0 skips it.
   if [ "${FLEET_NPROC_LIMIT:-1500}" != 0 ]; then
-    herdr pane run "$3" "export JEST_MAX_WORKERS=\${JEST_MAX_WORKERS:-2}; ulimit -u ${FLEET_NPROC_LIMIT:-1500}; clear" >/dev/null 2>&1; sleep 1
+    if ! herdr pane run "$3" "export JEST_MAX_WORKERS=\${JEST_MAX_WORKERS:-2}; ulimit -u ${FLEET_NPROC_LIMIT:-1500}; clear" >/dev/null 2>&1; then
+      rm -f "$err"; echo 'shell initialization failed; not spawning'; return 1
+    fi
+    sleep 1
   fi
   for _ in $(seq 1 30); do
+    pane_shell_ready "$3" || { rm -f "$err"; return 1; }
     # shellcheck disable=SC2086
     if herdr agent start "$1" --kind "$2" --pane "$3" --timeout 120000 ${args:+-- $args} >/dev/null 2>"$err"; then rm -f "$err"; return 0; fi
     local code; code=$(jq -r '.error.code // "error"' "$err" 2>/dev/null || echo error)
@@ -533,10 +566,26 @@ start_agent() {  # name kind pane — a fresh shell needs a moment before it is 
   rm -f "$err"; echo agent_pane_busy; return 1
 }
 
-cmd_up() {
-  local live ws=""
-  live=$(agents)
+up_specs() {  # [seat] -> the roster specs `fleet up` may start; lead seats are never started here
+  if [ $# -gt 1 ]; then echo 'usage: fleet up [seat]' >&2; return 2; fi
+  local spec lead
   for spec in $FLEET; do
+    for lead in $DROVER_LEAD_SEATS; do
+      [ "${spec%%:*}" = "$lead" ] && { [ $# -eq 0 ] && echo "$lead: lead seat excluded from fleet up" >&2; continue 2; }
+    done
+    [ $# -eq 0 ] || [ "${spec%%:*}" = "$1" ] && printf '%s\n' "$spec"
+  done
+  if [ $# -eq 1 ]; then
+    for lead in $DROVER_LEAD_SEATS; do [ "$1" = "$lead" ] && { echo "$1: lead seat excluded from fleet up" >&2; return 2; }; done
+    kind_of "$1" >/dev/null || return 2
+  fi
+}
+
+cmd_up() {
+  local live specs ws="" rc=0
+  specs=$(up_specs "$@") || return 2
+  live=$(agents)
+  for spec in $specs; do
     local name=${spec%%:*} kind=${spec##*:}
     if jq -e --arg n "$name" 'select(.name == $n)' <<<"$live" >/dev/null; then
       local workspace label
@@ -561,8 +610,9 @@ cmd_up() {
     fi
     printf '%s: starting %s in %s ... ' "$name" "$kind" "$pane"
     local code
-    if code=$(start_agent "$name" "$kind" "$pane"); then echo ok; else echo "FAILED ($code) — check: fleet read $name"; fi
+    if code=$(start_agent "$name" "$kind" "$pane"); then echo ok; else echo "FAILED ($code) — check: fleet read $name"; rc=1; fi
   done
+  return $rc
 }
 
 cmd_rm() {
@@ -1063,7 +1113,7 @@ case "${1:-}" in
   stale)   cmd_stale "${2:-}" ;;
   status)  cmd_status ;;
   models)  [ "${2:-}" = --report ] && REPORT=1; cmd_models ;;
-  up)      cmd_up ;;
+  up)      shift; cmd_up "$@" ;;
   assign)  cmd_assign "$2" "${3:-}" "${4:-}" ;;
   review)  cmd_review "$2" "${3:-}" "${4:-}" ;;
   finish)  cmd_finish "$2" "${3:-}" ;;

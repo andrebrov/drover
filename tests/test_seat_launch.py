@@ -15,11 +15,13 @@ if args[:2]==['agent','list']: doc={'result':{'agents':[]}}
 elif args[:2]==['workspace','list']:doc={'result':{'workspaces':[]}}
 elif args[:2]==['worktree','open']:doc={'result':{'workspace':{'workspace_id':'ws'}}}
 elif args[:2]==['pane','list']:doc={'result':{'panes':[{'pane_id':'ws:p','cwd':'/nonexistent'}]}}
+elif args[:2]==['pane','process-info']:doc={'result':{'process_info':{'pane_id':args[3],'shell_pid':100,'foreground_process_group_id':100,'foreground_processes':[{'pid':100}]}}}
 else:doc={'result':{}}
 print(json.dumps(doc))
 ''');stub.chmod(0o755)
+  ps=self.root/'ps';ps.write_text('#!/bin/sh\necho -zsh\n');ps.chmod(0o755)
   self.env={k:v for k,v in os.environ.items() if not k.startswith(('DROVER_','FLEET_','GIT_'))}
-  self.env.update(HOME=str(self.root),DROVER_CONFIG='/nonexistent',FLEET_HERDR=str(stub),FLEET='architect:codex',DROVER_REPO=str(self.root),FLEET_SEED_WIP='0',CALLS=str(self.root/'calls'),DROVER_CALLSIGNS=str(self.root/'names.tsv'),DROVER_SEAT_MODELS='architect=example-model')
+  self.env.update(HOME=str(self.root),DROVER_CONFIG='/nonexistent',FLEET_HERDR=str(stub),FLEET='architect:codex',DROVER_REPO=str(self.root),FLEET_SEED_WIP='0',CALLS=str(self.root/'calls'),DROVER_CALLSIGNS=str(self.root/'names.tsv'),DROVER_SEAT_MODELS='architect=example-model',PATH=str(self.root)+os.pathsep+os.environ['PATH'])
   (self.root/'names.tsv').write_text('architect\tNavigator\n')
  def test_callsign_labels_worktree_without_renaming_seat_and_pin_reaches_spawn(self):
   r=subprocess.run(['bash',str(ROOT/'bin/fleet'),'up'],env=self.env,text=True,capture_output=True)

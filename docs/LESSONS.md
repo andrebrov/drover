@@ -1491,3 +1491,12 @@ timestamp, the same message and the same whitespace-preserving patch id over the
 on `patch-id --stable`, which ignores whitespace: an indentation-only twin (different behaviour in Python) would have
 been accepted as the landed form. A token with no unique equivalent stays as written, so a commit that never landed is
 still refused, and the landed bean gets a `LANDED_COMMITS:` line naming exactly what was published.
+
+## An unregistered pane is not an empty shell (2026-11-01)
+`fleet up` typed a seat's launch command into a pane that had no registered agent and was taken to be free: it held a
+live session, and the keystrokes went into it. Absence of a registration is not evidence of an empty shell. Before the
+shell setup line and before every native start retry, `fleet up` now reads the pane's process state and proceeds only
+when the shell is the sole foreground process group and its executable is a shell; an unreadable or malformed answer,
+an extra foreground process, or a shell replaced by `exec` is refused with "not spawning", and the reason never prints
+argv or environment. A failed setup line stops the launch. Lead seats are never started by `fleet up`, and
+`fleet up <seat>` starts exactly that seat.
