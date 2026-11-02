@@ -1459,3 +1459,12 @@ lock and only the queue head may try a slot; the admission lock is released befo
 number of push gates still run in parallel. Liveness is the ticket's own flock, not its PID: a stopped waiter keeps its
 turn, a killed one is skipped, and a reused PID cannot keep an abandoned ticket alive. Fairness does not shorten a gate
 or bound waits under sustained overload; measure the wait distribution again after a day before claiming an improvement.
+
+## A usage-limited seat is not free until its reset (2026-11-02)
+A seat waiting out a provider usage limit reports `done`, so dispatch and review routing kept choosing it. The old
+`credit-dead` marker had a fixed 30-minute TTL: a two-day limit was cleared every half hour and work went back to the
+same dead seat. Now one helper (`lib/seat_liveness.py`) owns the mark. The watcher writes it from the pane banner with
+the reset time parsed out of it; dispatch, `pick_least`, the refill loop and reviewer selection all read it. The mark
+clears at its reset, or as soon as the seat is seen idle/done with an OK budget verdict; a banner with no parseable time
+falls back to six hours. An UNKNOWN budget read never clears a mark. When no reviewer is free, the log names the
+usage-limited reviewers and their reset times instead of a bare "none free".

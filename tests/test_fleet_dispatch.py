@@ -104,6 +104,26 @@ class T(unittest.TestCase):
         self.assertEqual([b['id'] for b in payload['dispatchable']], ['bean-0003'])
         self.assertEqual(self.b.assigned(), [])
 
+    def test_a_usage_limited_seat_is_never_free(self):
+        """A seat waiting out a usage limit reports done; its limit mark keeps it out of dispatch until the reset."""
+        state = self.b.root / 'limit-state'
+        (state / 'credit-dead').mkdir(parents=True)
+        (state / 'credit-dead' / 'limited').write_text(json.dumps({'reset_at': time.time() + 86400, 'at': time.time()}))
+        self.b.bean('bean-0001')
+        self.b.bean('bean-0002')
+        self.b.seat('limited', 'done')
+        self.b.seat('free')
+        with mock.patch.dict(os.environ, FLEET_STATE=str(state)):
+            r = self.b.run()
+        self.assertIn('seat held: limited (usage limit until', r.stdout)
+        self.assertEqual([a.split()[1] for a in self.b.assigned()], ['free'])
+        (state / 'credit-dead' / 'limited').write_text(json.dumps({'reset_at': time.time() - 60, 'at': time.time()}))
+        self.b.bean('bean-0003')
+        self.b.bean('bean-0004')
+        with mock.patch.dict(os.environ, FLEET_STATE=str(state)):
+            self.b.run()
+        self.assertIn('limited', [a.split()[1] for a in self.b.assigned()], 'a past reset must free the seat')
+
     def test_json_without_dry_run_refuses_without_assigning(self):
         self.b.bean('bean-0001')
         self.b.seat('free')

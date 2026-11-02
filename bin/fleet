@@ -587,6 +587,7 @@ pick_least() {  # <role> <event> [exclude-kind] -> least-loaded idle agent of th
     [ "$(role_of "$name")" = "$role" ] || continue; [ "$kind" != "$xk" ] || continue
     n=$(count_events "$ev" "$name"); st=$(state_of "$name")
     has_open_job "$name" && continue   # already holds an unfinished assignment/review
+    python3 -B "$DROVER_SRC/lib/seat_liveness.py" busy "$name" >/dev/null 2>&1 && continue   # usage-limited: reports done, cannot work
     [ "$n" -lt "$fbn" ] && { fallback=$name; fbn=$n; }
     case $st in idle|done) [ "$n" -lt "$bestn" ] && { best=$name; bestn=$n; } ;; esac
   done

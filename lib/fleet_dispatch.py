@@ -48,6 +48,7 @@ _fleet_sys.path.insert(0, str(_FleetPath(__file__).resolve().parents[1] / "lib")
 from fleet_config import configure
 config=configure(export=__name__=="__main__")
 from fleet_ownership import current_assignments as _current_assignments
+from seat_liveness import limit_reason
 from fleet_usage import gate as _fleet_gate
 _fleet_gate(_fleet_sys.argv, str(_FleetPath(__file__).resolve().parents[1]/"bin/fleet-dispatch"))
 
@@ -675,6 +676,9 @@ def main():
     status = {s['name']: s['status'] for s in seats}
     free_names = {n for n, st in status.items() if st in FREE_STATES and not NOT_SEATS.match(n)}
     free_names -= held
+    # A usage-limited seat reports done; the limit mark written from its pane banner is the truth.
+    limited = {n: r for n in free_names if (r := limit_reason(n))}
+    free_names -= set(limited)
     free_names -= asking_seats(beans)  # a seat waiting on a fleet-ask answer still owns its bean
     working = {n for n, st in status.items() if st == 'working'} | held
 
@@ -771,10 +775,13 @@ def main():
                           'skip_ignored': [e for e in skip_entries if not e['skips']],
                           'waiting_until_ignored': [e for e in waiting.values() if e['why']],
                           'busy_seats': {s['name']: s['busy_reasons'] for s in seats if s['busy_reasons']},
+                          'usage_limited': limited,
                           'summary': f'board_ready={n_ready} dispatchable={n_disp}'}))
         return
     for s in seats:
         if s['busy_reasons']: print(f"seat held: {s['name']} ({', '.join(s['busy_reasons'])})")
+    for name, why in sorted(limited.items()):
+        print(f'seat held: {name} ({why})')
     for bid, detail in revived.items():
         print(f"{'would revive' if dry else 'revived'} {bid}: {detail['scope']}")
     print_skip(skip_entries, dry)
