@@ -320,6 +320,7 @@ values as `${VAR:-value}` so an environment variable still wins. See [`examples/
 | `DROVER_GENERATED` | empty | ERE of generated paths `fleet-claim` refuses to claim. |
 | `DROVER_LEAD_SEATS` | `lead lead-backup` | Seats `fleet-yolo` never restarts and `fleet-observe` never maps for auto-rename. |
 | `DROVER_SEAT_MODELS` | empty | `seat=model` pairs: a seat with no `--model` of its own is relaunched on its pin by `fleet-yolo`. |
+| `DROVER_REVIEW_GATE` | `1` | `fleet-land-bean` runs `fleet-review-gate` before a source landing; `0` disables it for a fleet whose reviewers do not yet write `REVIEWED:` receipts. |
 | `FLEET_HEAVY_SLOTS`, `FLEET_PUSH_SLOTS` | `2`, `3` | `fleet-slot`: general heavy-run slots are 2..N (`0` disables the limiter); push slots are separate and parallel. |
 | `FLEET_NPROC_LIMIT` | `1500` | Per-user process ceiling for each `fleet-slot run` child and each seat shell started by `fleet` (`ulimit -u`); lower-only; `0` disables. |
 | `DROVER_MIGRATIONS_STATUS` | empty | Command printing `PENDING <n>_<name>` per unapplied migration; `fleet-observe` alerts hourly on any not in `state/migrations-held`. |
