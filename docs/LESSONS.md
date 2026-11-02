@@ -1480,3 +1480,14 @@ with full blob ids; only hunk line numbers normalised, so a whitespace edit, mov
 match). A newer CHANGES that covers the head refuses even when an older APPROVE exists. Each accepted receipt is
 logged with its sha256 and mtime, and a landing whose audit line cannot be written is refused. Author identity comes
 from the branch first, so a process variable cannot make another seat's work look like the reviewer's own.
+
+## A rebase renames commits; the bean must name what landed (2026-11-02)
+Seats wrote their fix SHAs into a bean before landing because a completion that names no commit is refused. The
+lander then rebased or cherry-picked the work, every SHA changed, and the bean named commits that were never on main:
+the completion check refused it, or the landed audit reopened a bean whose code had landed. The lander is the one
+place that knows the published SHAs, so it renames them: after the cherry-pick, each bean token that names a commit
+outside the landing head's history is replaced by the single commit there with the same author name, email and
+timestamp, the same message and the same whitespace-preserving patch id over the binary diff. A first version matched
+on `patch-id --stable`, which ignores whitespace: an indentation-only twin (different behaviour in Python) would have
+been accepted as the landed form. A token with no unique equivalent stays as written, so a commit that never landed is
+still refused, and the landed bean gets a `LANDED_COMMITS:` line naming exactly what was published.

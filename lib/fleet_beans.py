@@ -65,3 +65,107 @@ def bean_from_main(root, bean):
     """(title, body) of .beans/<bean>--*.md on main in root, or ('', '')."""
     _, text = bean_text(root, "main", bean)
     return parse_bean_text(text)
+
+
+# --- Rebased-commit identity -----------------------------------------------------------------------------------------
+# A SHA written into a bean before landing goes stale when the lander rebases or cherry-picks the work: the bean then
+# names a commit that is not on main, and the landed check reopens a bean whose code did land. After the rewrite, a
+# token in a landed bean that names a commit outside the landing head's history is replaced by the ONE commit there
+# that carries the same work: identical author name, email and timestamp, identical message (a `cherry picked from`
+# trailer aside) and an identical whitespace-preserving patch id, read as bytes end to end. A token with no unique
+# equivalent stays as written, so a commit that never landed is still visible to every check that judges it.
+HEX = re.compile(r'[0-9a-f]{7,40}')
+PICKED = re.compile(rb'\n*\(cherry picked from commit [0-9a-f]{40}\)\n*\Z')
+
+
+def _git(root, *args, binary=False, check=True):
+    p = subprocess.run(['git', '-C', str(root), *args], capture_output=True, timeout=60, check=check)
+    return p.stdout if binary else p.stdout.decode('utf-8', 'replace').strip()
+
+
+def _commit_of(root, token):
+    p = subprocess.run(['git', '-C', str(root), 'rev-parse', '--verify', '-q', token + '^{commit}'], capture_output=True, timeout=30)
+    return p.stdout.decode().strip() if p.returncode == 0 else None
+
+
+def _is_ancestor(root, sha, of):
+    return subprocess.run(['git', '-C', str(root), 'merge-base', '--is-ancestor', sha, of], capture_output=True, timeout=30).returncode == 0
+
+
+def patch_id(root, sha):
+    """`--verbatim` keeps every byte of the changed lines (`--stable` strips whitespace, so an indentation-only change
+    with different behaviour would collide) and still ignores hunk line numbers, which is what a clean rebase changes."""
+    diff = _git(root, 'show', '--format=', '--no-color', '--no-ext-diff', '--binary', '--full-index', sha, binary=True)
+    if not diff.strip():
+        return None
+    out = subprocess.run(['git', 'patch-id', '--verbatim'], input=diff, capture_output=True, timeout=60).stdout.split()
+    return out[0].decode('ascii') if out else None
+
+
+def identity(root, sha):
+    """What a rebase or cherry-pick carries over: author name, email, timestamp and the message, as bytes."""
+    raw = _git(root, 'show', '-s', '--format=%an%x00%ae%x00%at%x00%B', sha, binary=True).rstrip(b'\n')
+    return PICKED.sub(b'', raw)
+
+
+def rebased_equivalent(root, sha, head, upstream):
+    """The one commit in upstream..head made from `sha`, or None when there is none or more than one."""
+    pid = patch_id(root, sha)
+    if not pid:
+        return None
+    me = identity(root, sha)
+    candidates = _git(root, 'rev-list', '--no-merges', f'{upstream}..{head}').split()
+    matches = [h for h in candidates if identity(root, h) == me and patch_id(root, h) == pid]
+    return matches[0] if len(matches) == 1 else None
+
+
+def remap_rebased_shas(root, upstream='origin/main', landed_bean=None):
+    """Rewrite stale commit tokens in the beans this landing carries (upstream...HEAD) and, for `landed_bean`, append
+    `LANDED_COMMITS: <shas>` naming exactly what lands. Commits the change as one bean-only commit in `root`.
+    Returns {old token: new token}. Refuses (ValueError) to overwrite an uncommitted bean edit."""
+    from pathlib import Path
+    head = _git(root, 'rev-parse', 'HEAD')
+    published = _git(root, 'rev-list', '--reverse', '--no-merges', f'{upstream}..HEAD').split()
+    paths = [p for p in _git(root, 'diff', '--name-only', f'{upstream}...HEAD', '--', '.beans/').splitlines() if p.endswith('.md')]
+    if landed_bean:
+        own = [p for p in _git(root, 'ls-files', '--', '.beans/').splitlines() if Path(p).name.startswith(landed_bean + '--')]
+        paths += [p for p in own if p not in paths]
+    mapping, changed = {}, []
+    for relative in paths:
+        path = Path(root) / relative
+        if not path.is_file() or path.is_symlink():
+            continue
+        text = path.read_text(encoding='utf-8')
+        for token in dict.fromkeys(HEX.findall(text)):
+            if token in mapping:
+                continue
+            sha = _commit_of(root, token)
+            if not sha or _is_ancestor(root, sha, head):
+                continue
+            new = rebased_equivalent(root, sha, head, upstream)
+            if new:
+                mapping[token] = new[:max(len(token), 10)]
+        rewritten = HEX.sub(lambda m: mapping.get(m.group(0), m.group(0)), text)
+        if landed_bean and published and Path(relative).name.startswith(landed_bean + '--'):
+            rewritten = rewritten.rstrip('\n') + '\n\nLANDED_COMMITS: ' + ' '.join(published) + '\n'
+        if rewritten != text:
+            if _git(root, 'status', '--porcelain', '--', relative):
+                raise ValueError(f'uncommitted bean evidence in {relative}')
+            path.write_text(rewritten, encoding='utf-8')
+            changed.append(relative)
+    if changed:
+        beans = sorted({Path(p).name.split('--', 1)[0] for p in changed})
+        _git(root, 'commit', '-q', '--no-verify', '--only', '-m', 'chore(beans): name the landed commits in ' + ' '.join(beans), '--', *changed)
+    return mapping
+
+
+if __name__ == '__main__':
+    import sys
+    if not 3 <= len(sys.argv) <= 5 or sys.argv[1] != 'remap':
+        sys.exit('usage: fleet_beans.py remap <worktree> [<upstream> [<landed-bean>]]  (upstream defaults to origin/main)')
+    root, upstream, landed = sys.argv[2], (sys.argv[3:4] or ['origin/main'])[0], (sys.argv[4:5] or [None])[0]
+    try:
+        for old, new in remap_rebased_shas(root, upstream, landed).items():
+            print(f'remapped {old} -> {new}')
+    except (ValueError, subprocess.CalledProcessError) as err:
+        sys.exit(f'remap refused: {err}')

@@ -104,6 +104,12 @@ for c in $picks; do   # SHAs are single tokens — word-splitting is safe here
     fi
   fi
 done
+# The cherry-pick gave every commit a new SHA. A bean that names its pre-land commits would now name commits that are
+# not on main, and the landed check would reopen it: rename them to their landed equivalents (identical author, date,
+# message and byte patch) and record LANDED_COMMITS, in one bean-only commit. A token with no unique equivalent stays.
+WT diff --quiet HEAD -- .beans 2>/dev/null || { cleanup; flag "uncommitted bean files in the land worktree"; exit 1; }
+python3 -B "$DROVER_SRC/lib/fleet_beans.py" remap "$wt" main "$bean" >"$STATE/land-$bean-remap.log" 2>&1 \
+  || { cleanup; flag "bean commit remap failed ($STATE/land-$bean-remap.log)"; exit 1; }
 tip=$(WT rev-parse HEAD)
 diffnames=$(WT diff --name-only main "$tip")
 
