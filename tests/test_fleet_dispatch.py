@@ -115,7 +115,7 @@ class T(unittest.TestCase):
         self.b.seat('free')
         with mock.patch.dict(os.environ, FLEET_STATE=str(state)):
             r = self.b.run()
-        self.assertIn('seat held: limited (usage limit until', r.stdout)
+        self.assertIn('seat not free: limited (usage limit until', r.stdout)
         self.assertEqual([a.split()[1] for a in self.b.assigned()], ['free'])
         (state / 'credit-dead' / 'limited').write_text(json.dumps({'reset_at': time.time() - 60, 'at': time.time()}))
         self.b.bean('bean-0003')
@@ -123,6 +123,19 @@ class T(unittest.TestCase):
         with mock.patch.dict(os.environ, FLEET_STATE=str(state)):
             self.b.run()
         self.assertIn('limited', [a.split()[1] for a in self.b.assigned()], 'a past reset must free the seat')
+
+    def test_json_stays_parseable_and_names_every_seat_left_out(self):
+        self.b.bean('bean-0001'); self.b.bean('bean-0002', status='completed', ready=False)
+        self.b.seat('asker'); self.b.seat('busy', 'working'); self.b.seat('free')
+        q = self.b.root / '.local/share/drover/reports/questions'
+        q.mkdir(parents=True)
+        (q / 'q1.json').write_text(json.dumps({'id': 'q1', 'seat': 'asker', 'bean': 'bean-0001'}))
+        (q / 'q2.json').write_text(json.dumps({'id': 'q2', 'seat': 'free', 'bean': 'bean-0002'}))   # stale: bean closed
+        r = self.b.run('--dry-run', '--json')
+        payload = json.loads(r.stdout)
+        self.assertIn('stale question ignored: free bean-0002 q2', r.stderr)
+        self.assertEqual(payload['free_seats'], ['free'])
+        self.assertEqual(payload['free_exclusions'], {'asker': 'unanswered question q1 about bean-0001', 'busy': 'status=working'})
 
     def test_json_without_dry_run_refuses_without_assigning(self):
         self.b.bean('bean-0001')
@@ -615,12 +628,55 @@ class InstalledRouting(unittest.TestCase):
         self.b.run()
         self.assertEqual(self.b.assigned(), [])
 
+    def test_a_blocked_handback_by_the_pinned_seat_releases_its_pin(self):
+        self.b.bean('bean-0001')
+        self.b.seat('idler')
+        pins = self.b.root / 'config' / 'refill-pins.txt'
+        pins.write_text('idler\tbean-0001 @%d\n' % (time.time() - 3600))
+        (self.b.root / 'reports' / 'idler-bean-0001.md').write_text('tried\nBLOCKED needs the lead to pick a vendor\n')
+        r = self.b.run('--dry-run')
+        self.assertIn('pin would be removed: idler bean-0001 (owner reported BLOCKED)', r.stdout)
+
+    def test_another_seats_blocked_report_or_an_older_one_keeps_the_pin(self):
+        self.b.bean('bean-0001')
+        self.b.seat('idler'); self.b.seat('other')
+        pins = self.b.root / 'config' / 'refill-pins.txt'
+        (self.b.root / 'reports' / 'other-bean-0001.md').write_text('BLOCKED x\n')
+        old = self.b.root / 'reports' / 'idler-bean-0001.md'
+        old.write_text('BLOCKED earlier\n')
+        os.utime(old, (time.time() - 7200, time.time() - 7200))
+        pins.write_text('idler\tbean-0001 @%d\n' % (time.time() - 3600))
+        r = self.b.run('--dry-run')
+        self.assertNotIn('pin would be removed', r.stdout)
+
+    def test_a_legacy_pin_age_is_frozen_on_rewrite(self):
+        self.b.bean('bean-0001'); self.b.bean('bean-done', status='completed', ready=False)
+        self.b.seat('busy', 'working')
+        pins = self.b.root / 'config' / 'refill-pins.txt'
+        pins.write_text('busy\tbean-0001\nbusy\tbean-done\n')
+        then = time.time() - 5000
+        os.utime(pins, (then, then))
+        self.b.run()
+        text = pins.read_text()
+        self.assertNotIn('bean-done', text)
+        self.assertRegex(text, r'busy\tbean-0001 @%d' % int(then))
+
     def test_previous_owner_is_preferred_when_free(self):
         self.b.bean('bean-free1')
         self.b.seat('a-spare'); self.b.seat('z-owner')
         self.b.report('z-owner','bean-free1')
         self.b.run()
         self.assertEqual(self.b.assigned(), ['bean-free1 z-owner'])
+
+    def test_owner_stickiness_never_jumps_a_priority_tier(self):
+        """With room for one, a critical bean with no previous owner wins over a normal bean returning to its owner."""
+        self.b.bean('bean-norm1')
+        self.b.bean('bean-crit1', priority='critical')
+        self.b.seat('a-spare'); self.b.seat('z-owner')
+        self.b.report('z-owner', 'bean-norm1')
+        (self.b.root / 'config' / 'fleet-cap.txt').write_text('cap_working=1\nmin_working=1\n')
+        self.b.run()
+        self.assertEqual([a.split()[0] for a in self.b.assigned()], ['bean-crit1'])
 
     def test_done_seat_keeps_its_branch_until_terminal_report(self):
         self.b.bean('bean-held1'); self.b.seat('owner','done','fleet/owner-bean-held1')
@@ -954,15 +1010,16 @@ class BusySeatEvidence(unittest.TestCase):
             self.assertEqual(done.exception.code, 0)
         self.assertEqual(self.b.assigned(), [])
 
-    def test_scrapped_pin_is_not_a_completed_main_bean(self):
+    def test_a_scrapped_bean_releases_its_pin_like_a_completed_one(self):
+        """Owner records already end at completed OR scrapped; a pin to scrapped work held its seat forever."""
         self.b.bean('bean-old1', status='scrapped', ready=False)
         self.b.seat('reviewer', 'done')
         self.b.bean('bean-new1')
         pins = self.b.root/'config/refill-pins.txt'
         pins.write_text('reviewer bean-old1\n')
         r = self.b.run()
-        self.assertEqual(self.b.assigned(), [], r.stdout)
-        self.assertEqual(pins.read_text(), 'reviewer bean-old1\n')
+        self.assertIn('pin removed: reviewer bean-old1 (bean completed/scrapped on origin/main)', r.stdout)
+        self.assertEqual(pins.read_text(), '')
 
 if __name__ == '__main__':
     unittest.main()

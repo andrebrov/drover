@@ -1510,3 +1510,17 @@ it picks the least-busy free reviewer on another harness, skips usage-limited on
 and writes a ledger row. Questions that do need the lead still go through `fleet-ask`, a file, never the TUI.
 Separately, OpenCode v2 rejects `--model`; after a restart every OpenCode seat failed to start until the flag was
 dropped from both launch paths. Its model is pinned in OpenCode's own configuration.
+
+## Dispatch rules sharpened (2026-10-31 .. 2026-11-02)
+- **Stickiness never jumps a priority tier.** A bean returns to the seat that wrote its newest report, but only within
+  its own priority tier: with room for one, a normal bean going back to its old seat took the slot ahead of a critical
+  bean that had no previous owner.
+- **A pin ends when its own seat hands the bean back.** A pin used to end only when the bean completed on main, so a
+  seat that reported BLOCKED stayed pinned to work it had already let go, and the bean waited on nobody. Now the pinned
+  seat's own newest report for the bean, newer than the pin, ending BLOCKED releases it; another seat's report, an older
+  handback, or a slice DONE does not. A scrapped bean releases its pins like a completed one. An unstamped pin's age is
+  frozen on the first rewrite, because every rewrite moved the file mtime and made old pins look new.
+- **Every seat left out of `free` carries a reason, and `--json` stays one JSON document.** A seat dropped because of a
+  dedicated list or a non-idle status printed nothing, and a stale-question notice on stdout made the JSON snapshot
+  unparseable for its consumers. `free_exclusions` names each excluded seat (status, busy evidence, usage limit,
+  unanswered question); human notices go to stderr under `--json`.

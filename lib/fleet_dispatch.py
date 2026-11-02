@@ -36,7 +36,9 @@ once the time passes. An ISO stamp with `Z` or a numeric offset is absolute; a b
 stamp are read as America/New_York wall time. A line that is not last, or whose time does not parse, never parks the bean: it is
 ignored and an unparseable one is printed as a finding (`waiting_until_ignored` in `--json`).
 
-Pin expiry: a pin is removed (logged) ONLY when its bean is completed on origin/main. Reports, idle status and stale revival do not release a pin.
+Pin expiry: a completed/scrapped bean on origin/main releases its pins. A free pinned seat also releases its pin when its own newest
+report for the bean, newer than the pin, ends BLOCKED. Slice DONE/PARTIAL reports, idle status and stale revival keep the pin.
+Unstamped pin times are frozen to the file mtime on the first non-dry pass, so later rewrites cannot reset their age.
 Free seats: idle/done with no live work child and no unlanded commits (unavailable evidence holds the seat), not the configured dedicated or lead seats.
 A free seat with a pin gets its pinned bean first. Cap: working seats < cap_working and load1 < resume_load_below (~/.config/herdr/fleet-cap.txt).
 
@@ -222,8 +224,37 @@ def current_assignments():
     return _current_assignments(read_owners())
 
 
+def diagnostic(message):
+    """A human line. With --json, stdout stays one JSON document, so these go to stderr."""
+    print(message, file=sys.stderr if '--json' in sys.argv else sys.stdout)
+
+
+def free_seat_reasons(status, seats, asking):
+    """(free names, seat -> the first reason it is not free). Every seat left out of free carries a printed reason:
+    a seat dropped silently (a non-idle status, a dedicated list) looked like a seat the dispatcher had forgotten."""
+    reasons, free = {}, set()
+    for name, st in status.items():
+        if NOT_SEATS.match(name):
+            reasons[name] = 'not a dispatch seat'
+        elif st not in FREE_STATES:
+            reasons[name] = f'status={st}'
+        elif (limited := limit_reason(name)):
+            reasons[name] = limited   # a usage-limited seat reports done; the mark from its pane banner is the truth
+        else:
+            free.add(name)
+    for seat in seats:
+        if seat['name'] in free and seat.get('busy_reasons'):
+            reasons[seat['name']] = 'busy: ' + ', '.join(seat['busy_reasons'])
+            free.discard(seat['name'])
+    for seat, why in asking.items():
+        if seat in free:
+            reasons[seat] = why
+            free.discard(seat)
+    return free, reasons
+
+
 def asking_seats(beans=None):
-    """Seats with an unanswered fleet-ask question (questions/<id>.json without decisions/<id>.*).
+    """Seat -> the unanswered fleet-ask question (questions/<id>.json without decisions/<id>.*) that holds it.
 
     bean-jzex (retro rule 4: a seat owns only its current assignment): a question holds its seat only while it is about
     the seat's CURRENT assignment and that bean is still open. A question about an older bean, or about a bean that is
@@ -233,7 +264,7 @@ def asking_seats(beans=None):
     root = os.path.join(FIX, '.local/share/drover/reports') if FIX else REPORTS
     answered = {os.path.basename(p).split('.')[0] for p in glob.glob(os.path.join(root, 'decisions', '*'))}
     current = current_assignments()
-    seats = set()
+    held = {}
     for p in sorted(glob.glob(os.path.join(root, 'questions', '*.json'))):
         try:
             q = json.load(open(p))
@@ -245,11 +276,12 @@ def asking_seats(beans=None):
         row = (beans or {}).get(bean) if bean else None
         closed = bool(row) and row['status'] in ('completed', 'scrapped')
         superseded = bool(bean) and seat in current and current[seat] != bean
+        qid = q.get('id') or os.path.basename(p)[:-5]
         if closed or superseded:
-            print(f"stale question ignored: {seat} {bean} {q.get('id') or os.path.basename(p)[:-5]}")
+            diagnostic(f"stale question ignored: {seat} {bean} {qid}")
             continue
-        seats.add(seat)
-    return seats
+        held.setdefault(seat, f"unanswered question {qid} about {bean or 'unknown bean'}")
+    return held
 
 
 def load_seats():
@@ -433,7 +465,7 @@ def print_skip(entries, dry):
 
 
 def read_pins():
-    """-> list of (line, seat, bean, set_at)"""
+    """-> list of (line, seat, bean, set_at, has_stamp). An unstamped (legacy) row's age is the file mtime."""
     pins = []
     if not os.path.exists(PINS):
         return pins
@@ -445,11 +477,11 @@ def read_pins():
         parts = s.split()
         if len(parts) < 2:
             continue
-        at = mtime
+        at, has_stamp = mtime, False
         for p in parts[2:]:
-            if p.startswith('@') and p[1:].isdigit():
-                at = float(p[1:])
-        pins.append((line, parts[0], parts[1], at))
+            if re.fullmatch(r'@\d+(?:\.\d+)?', p):
+                at, has_stamp = float(p[1:]), True
+        pins.append((line, parts[0], parts[1], at, has_stamp))
     return pins
 
 
@@ -504,8 +536,8 @@ def report_done(bean):
     return bool(lines) and lines[-1].strip().startswith('DONE')
 
 
-def newest_report(bean):
-    files = [f for f in glob.glob(os.path.join(REPORTS, f'*{bean}*.md'))]
+def newest_report(bean, seat=None):
+    files = glob.glob(os.path.join(REPORTS, f'{seat}-{bean}*.md' if seat is not None else f'*{bean}*.md'))
     return max(files, key=os.path.getmtime) if files else None
 
 
@@ -674,21 +706,25 @@ def main():
     held = {s['name'] for s in seats if s['busy_reasons']}
     revived = revived_beans(beans, ready_ids, seats, repo)
     status = {s['name']: s['status'] for s in seats}
-    free_names = {n for n, st in status.items() if st in FREE_STATES and not NOT_SEATS.match(n)}
-    free_names -= held
-    # A usage-limited seat reports done; the limit mark written from its pane banner is the truth.
-    limited = {n: r for n in free_names if (r := limit_reason(n))}
-    free_names -= set(limited)
-    free_names -= asking_seats(beans)  # a seat waiting on a fleet-ask answer still owns its bean
+    # a seat waiting on a fleet-ask answer still owns its bean; every seat left out of free carries a reason
+    free_names, free_exclusions = free_seat_reasons(status, seats, asking_seats(beans))
     working = {n for n, st in status.items() if st == 'working'} | held
 
     # pin expiry (before classification: an expired pin must not block its bean)
     kept, removed = [], []
-    for line, seat, bean, at in read_pins():
+    pin_rows = read_pins()
+    legacy_times = {line: at for line, _, _, at, has_stamp in pin_rows if not has_stamp}
+    for line, seat, bean, at, _ in pin_rows:
         b = beans.get(bean)
-        done_bean = bool(b) and b['status'] == 'completed'
-        if done_bean:
-            removed.append((line, seat, bean, 'bean completed on origin/main'))
+        done_bean = bool(b) and b['status'] in ('completed', 'scrapped')
+        # A pin reserves the bean until its OWN seat hands it back: that seat is free and its newest report for the
+        # bean, newer than the pin, ends BLOCKED. Another seat's report, an older handback or a slice DONE keep it;
+        # without this a blocked handback left the bean pinned to a seat that had already let it go.
+        rep = newest_report(bean, seat=seat)
+        released = (status.get(seat) in FREE_STATES and rep is not None and os.path.getmtime(rep) > at
+                    and _last_report_line(rep).startswith('BLOCKED'))
+        if done_bean or released:
+            removed.append((line, seat, bean, 'bean completed/scrapped on origin/main' if done_bean else 'owner reported BLOCKED'))
         else:
             kept.append((line, seat, bean))
     if not as_json:
@@ -726,12 +762,20 @@ def main():
             lines = f.readlines()
         write_owners([l for l in lines if l not in drop])
 
-    if removed and not dry and os.path.exists(PINS):
+    if (removed or legacy_times) and not dry and os.path.exists(PINS):
         drop = {l for l, *_ in removed}
         with open(PINS) as f:
             lines = f.readlines()
         with open(PINS, 'w') as f:
-            f.writelines(l for l in lines if l not in drop)
+            for line in lines:
+                if line in drop:
+                    continue
+                if line in legacy_times:
+                    # Freeze an unstamped pin's age before this rewrite moves the file mtime, or every rewrite
+                    # would make every legacy pin look newer than the report that released it.
+                    text, mark, comment = line.rstrip('\n').partition('#')
+                    line = f'{text.rstrip()} @{legacy_times[line]}' + (f' #{comment}' if mark else '') + '\n'
+                f.write(line)
 
     ready = [beans[i] for i in ready_ids if i in beans and beans[i]['type'] in TYPES]
     ready.sort(key=lambda b: (PRIORITY.get(b['priority'], 2), b['created'], b['id']))
@@ -775,13 +819,15 @@ def main():
                           'skip_ignored': [e for e in skip_entries if not e['skips']],
                           'waiting_until_ignored': [e for e in waiting.values() if e['why']],
                           'busy_seats': {s['name']: s['busy_reasons'] for s in seats if s['busy_reasons']},
-                          'usage_limited': limited,
+                          'free_seats': sorted(free_names),
+                          'free_exclusions': dict(sorted(free_exclusions.items())),
                           'summary': f'board_ready={n_ready} dispatchable={n_disp}'}))
         return
     for s in seats:
         if s['busy_reasons']: print(f"seat held: {s['name']} ({', '.join(s['busy_reasons'])})")
-    for name, why in sorted(limited.items()):
-        print(f'seat held: {name} ({why})')
+    for name, why in sorted(free_exclusions.items()):
+        if not why.startswith('busy: '):   # busy seats are printed above as "seat held"
+            print(f'seat not free: {name} ({why})')
     for bid, detail in revived.items():
         print(f"{'would revive' if dry else 'revived'} {bid}: {detail['scope']}")
     print_skip(skip_entries, dry)
@@ -826,16 +872,20 @@ def main():
     spare = [s for s in free if s not in {p[1] for p in plan} and not any(seat == s for _, seat, _ in kept)]
     pool = [b for b in dispatchable if b['id'] not in used and b['id'] not in pinned_beans]
     # One owner per bean: a bean goes back to the seat that wrote its newest report when that seat is free
-    # (6hgs and lrxn hopped between seats on 2026-10-15, each new seat re-reading what the last one knew).
-    for b in list(pool):
-        rep = newest_report(b['id'])
-        prev = next((s for s in spare if rep and os.path.basename(rep).startswith(s + '-' + config.get('DROVER_BEAN_PREFIX','bean-'))), None)
-        if prev and len(plan) < room:
-            plan.append((b['id'], prev)); spare.remove(prev); pool.remove(b)
-    for seat in spare:
-        if len(plan) >= room or not pool:
-            break
-        plan.append((pool.pop(0)['id'], seat))
+    # (two beans hopped between seats on 2026-10-15, each new seat re-reading what the last one knew).
+    # Stickiness applies WITHIN a priority tier: a normal bean returning to its old seat must not take the last
+    # room ahead of a critical bean with no previous owner. Pins above stay authoritative.
+    for tier in sorted({PRIORITY.get(b['priority'], 2) for b in pool}):
+        pending = [b for b in pool if PRIORITY.get(b['priority'], 2) == tier]
+        for b in list(pending):
+            rep = newest_report(b['id'])
+            prev = next((s for s in spare if rep and os.path.basename(rep).startswith(s + '-' + config.get('DROVER_BEAN_PREFIX','bean-'))), None)
+            if prev and len(plan) < room:
+                plan.append((b['id'], prev)); spare.remove(prev); pending.remove(b)
+        for b in pending:
+            if len(plan) >= room or not spare:
+                break
+            plan.append((b['id'], spare.pop(0)))
     if room == 0 and n_disp:
         print('no assignment: cap or load limit reached; dispatchable beans stay on the board')
     failed = 0
