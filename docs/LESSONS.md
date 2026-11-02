@@ -1537,3 +1537,12 @@ dropped from both launch paths. Its model is pinned in OpenCode's own configurat
   worktree preparation and still received a brief, so it worked in the tree everyone depends on.
 - **`basename --` everywhere.** A login shell's process name is `-zsh`; `basename "-zsh"` reads it as an option and
   fails, which broke an assignment path. Every shell `basename` call now ends option parsing first.
+
+## A composer placeholder is recognised by how it is drawn, not by its words (2026-10-26, 2026-10-31)
+The empty-composer check compared the prompt line against one exact placeholder string per harness. OpenCode v2 began
+rotating its grey suggestion, and Cursor shows a different placeholder after the first turn; every idle seat of those
+harnesses then read as `draft_present` and refused assignment, one for over twenty minutes. On a styled capture the
+check now blanks the cells drawn as a placeholder (SGR faint, the placeholder grey foreground, and the reverse-video
+cursor cell on a line that carries a placeholder) and treats any text left as a draft. The same words typed in normal
+colour are still a draft, and a lone reverse-video character with no placeholder on the line is a typed character
+under the cursor. Only an unstyled capture, which cannot show rendering, falls back to the known first-turn words.

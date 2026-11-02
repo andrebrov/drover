@@ -82,9 +82,66 @@ def identity(row):
     return tuple(row[k] for k in ('name', 'agent', 'pane_id', 'terminal_id', 'cwd', 'state_change_seq')) + (value,)
 
 
+PLACEHOLDER_GREY = (128, 128, 128)
+
+
+def composer_lines(screen):
+    """(plain lines, same-width lines with placeholder-rendered cells blanked, styled?). A placeholder is recognised
+    by how it is drawn, never by its words: harnesses rotate their suggestions ("Add a follow-up", "Plan, search,
+    build anything", a different hint per launch), and an exact-string match read every new wording as a draft.
+    Blanked: SGR-faint cells, the placeholder grey foreground, and reverse-video cells (the cursor cell drawn on the
+    placeholder's first character) on a line that also carries a placeholder."""
+    rows, styled = [[]], False
+    position, faint, grey, reverse = 0, False, False, False
+
+    def emit(text):
+        for c in text:
+            if c == '\n':
+                rows.append([])
+            else:
+                rows[-1].append((c, faint or grey, reverse))
+    for escape in ANSI.finditer(screen):
+        emit(screen[position:escape.start()])
+        position = escape.end()
+        sequence = escape.group()
+        if not sequence.endswith('m'):
+            continue
+        styled = True
+        parts = [int(x) if x.isdigit() else 0 for x in (sequence[2:-1].split(';') or ['0'])]
+        i = 0
+        while i < len(parts):
+            code = parts[i]
+            if code == 0:
+                faint = grey = reverse = False
+            elif code == 2:
+                faint = True
+            elif code == 22:
+                faint = False
+            elif code == 7:
+                reverse = True
+            elif code == 27:
+                reverse = False
+            elif code == 39 or 30 <= code <= 37 or 90 <= code <= 97:
+                grey = False
+            elif code == 38 and i + 4 < len(parts) and parts[i + 1] == 2:
+                grey = tuple(parts[i + 2:i + 5]) == PLACEHOLDER_GREY
+                i += 4
+            elif code == 38 and i + 2 < len(parts) and parts[i + 1] == 5:
+                grey = False
+                i += 2
+            i += 1
+    emit(screen[position:])
+    plain, masked = [], []
+    for row in rows:
+        placeholder = any(dim for _, dim, _ in row)
+        plain.append(''.join(c for c, _, _ in row))
+        masked.append(''.join(' ' if (dim or (rev and placeholder)) and not c.isspace() else c for c, dim, rev in row))
+    return plain, masked, styled
+
+
 def composer_reason(screen, kind):
     """Recognize empty native composers; absent/unknown layouts always hold."""
-    lines = ANSI.sub('', screen).splitlines()
+    lines, masked, styled = composer_lines(screen)
     if kind not in {'codex', 'claude', 'opencode', 'grok', 'agy', 'cursor'}:
         return 'composer_unavailable'
     glyphs = ('›',) if kind == 'codex' else ('❯', '>') if kind == 'claude' else ('→', '❯', '>', '›')
@@ -104,6 +161,15 @@ def composer_reason(screen, kind):
     region = '\n'.join([prompt, *tail[:footer+1]])
     if DIALOG.search(region):
         return 'dialog_present'
+    if styled:
+        # Rendering decides: text left after blanking placeholder cells is a draft, whatever its words.
+        line = masked[index]
+        start = len(lines[index]) - len(prompt)
+        draft = line[start + 1:].strip()
+        if draft or any(m.strip() for m in masked[index + 1:index + 1 + footer]):
+            return 'draft_present'
+        return None
+    # An unstyled capture cannot show rendering; fall back to the known first-turn placeholder words.
     draft = prompt[1:].strip()
     if kind == 'codex' and draft.strip(' \t'+''.join(chr(n) for n in range(0x2800, 0x2900))) == 'Ask Codex to do anything':
         draft = ''

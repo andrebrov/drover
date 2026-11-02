@@ -183,6 +183,23 @@ class DeliveryGate(unittest.TestCase):
         for kind,screen,expected in cases:
             with self.subTest(kind=kind,screen=screen): self.assertEqual(self.gate.composer_reason(screen,kind),expected)
 
+    def test_a_placeholder_is_recognised_by_rendering_not_wording(self):
+        faint, grey, rev, off = '\x1b[2m', '\x1b[38;2;128;128;128m', '\x1b[7m', '\x1b[0m'
+        cases = [
+            # rotated suggestions, drawn faint or placeholder-grey, are empty whatever they say
+            ('opencode', f'Done\n→ {faint}What is the tech stack of this project?{off}\n ctrl+t variants', None),
+            ('opencode', f'Done\n→ {grey}Fix a TODO in the codebase{off}\n ctrl+t variants', None),
+            # the cursor cell drawn in reverse video on the placeholder's first character
+            ('cursor', f'Done\n→ {rev}A{off}{faint}dd a follow-up{off}\n ctrl+t', None),
+            # the placeholder's words typed in normal colour are a draft
+            ('opencode', f'Done\n→ {off}Add a follow-up\n ctrl+t variants', 'draft_present'),
+            # a typed character under the cursor, with no placeholder on the line, is a draft
+            ('cursor', f'Done\n→ {rev}x{off}\n ctrl+t', 'draft_present'),
+        ]
+        for kind, screen, expected in cases:
+            with self.subTest(kind=kind, screen=screen):
+                self.assertEqual(self.gate.composer_reason(screen, kind), expected)
+
     def test_same_seat_concurrent_gate_refused(self):
         with self.enter():
             with self.assertRaisesRegex(self.gate.Held,'delivery_in_flight'):
