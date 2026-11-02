@@ -1500,3 +1500,13 @@ when the shell is the sole foreground process group and its executable is a shel
 an extra foreground process, or a shell replaced by `exec` is refused with "not spawning", and the reason never prints
 argv or environment. A failed setup line stops the launch. Lead seats are never started by `fleet up`, and
 `fleet up <seat>` starts exactly that seat.
+
+## A seat never waits in a question box (2026-11-01)
+Codex seats called the harness's synchronous user-input tool at review time ("which reviewer should I use?"), and the
+turn froze until someone typed into that pane; the watcher saw a seat that was neither working nor done. Two changes:
+codex seats launch with `tools.experimental_request_user_input.enabled=false` (both `fleet up` and `fleet-yolo`
+restarts, which must pass the same flags), and a coder at REVIEW-READY runs `fleet review-request <me> <bean>` itself:
+it picks the least-busy free reviewer on another harness, skips usage-limited ones and names them when none is free,
+and writes a ledger row. Questions that do need the lead still go through `fleet-ask`, a file, never the TUI.
+Separately, OpenCode v2 rejects `--model`; after a restart every OpenCode seat failed to start until the flag was
+dropped from both launch paths. Its model is pinned in OpenCode's own configuration.

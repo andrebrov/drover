@@ -5,6 +5,7 @@
 #   fleet up [seat]                spawn missing roster agents (own worktree, branch fleet/<name>) into EMPTY shell panes; lead excluded
 #   fleet assign <bean> [coder] [scope-note]
 #                                  give a bean to the least-loaded idle coder (or the named one); ledger + prompt
+#   fleet review-request <coder> <bean> [reviewer]  a coder routes its own review (different harness, ledgered)
 #   fleet review <coder> [reviewer] send <coder>'s branch to a reviewer on a DIFFERENT harness (least-loaded); ledger
 #   fleet finish <agent> [note]    record that the agent's current job ended (usage minutes)
 #   fleet followup <agent> "<msg>" send a fix-round / follow-up prompt AND log it as a job (use instead of send)
@@ -24,7 +25,7 @@
 #                                  procs under an idle agent), heavy (> FLEET_HEAVY_MB); --report feeds the sidebar
 #
 # Env: FLEET="name:kind ..." (default: DROVER_ROSTER) FLEET_ROOT (default: DROVER_REPO) FLEET_WORKTREES=1
-#      FLEET_SEED_WIP=1 FLEET_ADOPT=0 FLEET_OPENCODE_MODEL FLEET_CLAUDE_MODEL FLEET_AGY_MODEL FLEET_FORCE=1 (rm dirty)
+#      FLEET_SEED_WIP=1 FLEET_ADOPT=0 FLEET_CLAUDE_MODEL FLEET_AGY_MODEL FLEET_FORCE=1 (rm dirty)
 #      FLEET_BOOTSTRAP="cmd" FLEET_TIMEOUT(ms) FLEET_TAIL FLEET_STALE_MIN=10 (minutes) FLEET_HEAVY_MB=2048
 #      DROVER_CLONE_DIRS DROVER_COPY_FILES DROVER_BUILD DROVER_TEST — see examples/config
 _fleet_lib=$(cd "$(dirname "$0")" && pwd)/../lib/fleet_usage.py
@@ -63,7 +64,6 @@ FLEET_ADOPT="${FLEET_ADOPT:-0}"
 # that is already up: existing agents keep whatever they were spawned with until they are removed and
 # respawned. Read the live value from `fleet models`, never from this line — and never infer a
 # seat's model from its name. Empty = the harness's own default.
-FLEET_OPENCODE_MODEL="${FLEET_OPENCODE_MODEL:-}"
 FLEET_AGY_MODEL="${FLEET_AGY_MODEL:-}"       # agy = Antigravity CLI; pin a model to keep its reviews cross-model
 FLEET_TIMEOUT="${FLEET_TIMEOUT:-900000}"     # ms to wait in `task` (15 min)
 FLEET="${FLEET:-$DROVER_ROSTER}"
@@ -124,6 +124,12 @@ H
 fleet review <coder> [reviewer] [bean]
 Send a coder's branch to a reviewer on a different harness.
 --dry-run  print agent, brief, branch=fleet/<coder>, prompt; do nothing
+H
+      ;;
+    review-request) cat <<'H'
+fleet review-request <coder> <bean> [reviewer]
+A coder routes its own review at REVIEW-READY: the least-busy free reviewer on a different
+harness (or the named one; a same-harness reviewer is refused). Logged to the ledger.
 H
       ;;
     land) cat <<'H'
@@ -372,8 +378,9 @@ agent_args() {  # kind [seat] -> native CLI args: no approval prompts (+ model p
   [ "$FLEET_YOLO" = 1 ] || return 0
   case $1 in
     claude)   printf '%s' "--dangerously-skip-permissions${FLEET_CLAUDE_MODEL:+ --model $FLEET_CLAUDE_MODEL}" ;;
-    codex)    printf '%s' "--dangerously-bypass-approvals-and-sandbox" ;;
-    opencode) printf '%s' "--auto${FLEET_OPENCODE_MODEL:+ --model $FLEET_OPENCODE_MODEL}" ;;
+    # request_user_input off: codex's synchronous question box parks a seat's turn until someone types into its pane.
+    codex)    printf '%s' "--dangerously-bypass-approvals-and-sandbox -c tools.experimental_request_user_input.enabled=false" ;;
+    opencode) printf '%s' "--auto"; return 0 ;;   # opencode v2 rejects --model; pin the model in opencode's own config
     cursor)   printf '%s' "--yolo --approve-mcps --trust" ;;
     grok)     printf '%s' "--always-approve" ;;
     agy)      printf '%s' "--dangerously-skip-permissions${FLEET_AGY_MODEL:+ --model $FLEET_AGY_MODEL}" ;;
@@ -681,6 +688,7 @@ Work ONLY in this worktree ($(cwd_of "$1")). Your branch for THIS bean is \`flee
 3. Verify, and keep the output — you will paste it. Run ${DROVER_BUILD:-the project build} and the tests you added or affected${DROVER_TEST:+ ($DROVER_TEST)}. A build that did not finish is not a passing build; wait for it. Grep compiler output for the real error shape (TypeScript errors start with a file path, not with the word error).
 3a. JEST RULE: run jest only as \`npx jest --runInBand --cacheDirectory /tmp/jest-cache-\$USER <files>\`. In a read-only sandbox point --cacheDirectory at a writable directory. Never run jest through \`node -e\` or patch jest internals: jest-worker forks children that re-run the inline script and fork more, without bound.
 3b. PROVE THE FIX FIRES. Revert your change, watch your new test fail, restore it, watch it pass. A test you have never seen fail is not a test. This is what caught a fail-open gate in the lead's own commit this week.
+3c. REVIEW-READY (the bean or the lead asks for a cross-model review): run \`fleet review-request $1 $3\` yourself. It picks a free reviewer on a different harness; never ask the lead to route it and never wait in a question box.
 4. Preserve the human's pre-existing changes. Commit ONLY files you changed plus the bean file on branch fleet/$1-$3. $publication Never reset/stash the human's files, apply database migrations or start a shared dev server.
 5. Keep the bean checklist current with \`beans update $3 --body-replace-old '- [ ] ...' --body-replace-new '- [x] ...'\`.
 6. When done, write $REPORTS/$1-$3.md: summary, files changed, decisions, open questions, and the PASTED output of the build and the tests. A command you did not run cannot appear there.
@@ -866,6 +874,25 @@ cmd_review() {
   # three of four review dispatches were lost this way before the change.
   prompt_agent "$rev" "Review task: read $bf and follow it exactly. It reviews $bean on branch fleet/$coder-$bean (fall back to fleet/$coder if that ref does not exist)." | jq -r --arg b "$bean" --arg c "$coder" '"\(.result.agent.name) <- review \($b) (by \($c)): \(.result.agent.agent_status)"'
 }
+# A coder routes its own cross-harness review at REVIEW-READY; the lead reads the ledger row and is not in the path.
+review_request_reviewer() {  # <coder> <bean> [reviewer] -> the reviewer, or a refusal (2 = bad request, 1 = none free)
+  local coder=$1 bean=$2 rev=${3:-} limited
+  case $(role_of "$coder") in coder|coder[0-9]*) ;; *) echo "review-request: $coder is not a coder seat" >&2; return 2 ;; esac
+  kind_of "$coder" >/dev/null || return 2
+  [ -n "$rev" ] || rev=$(pick_least reviewer review "$(kind_of "$coder")")
+  if [ -z "$rev" ]; then
+    limited=$(python3 -B "$DROVER_SRC/lib/seat_liveness.py" list 2>/dev/null | awk -F'\t' '$1 ~ /reviewer$/ {printf "%s (%s); ", $1, $2}')
+    echo "review-request: no reviewer on a harness other than $(kind_of "$coder") is free${limited:+; usage-limited: ${limited%; }}; the lead routes $bean" >&2
+    return 1
+  fi
+  printf '%s' "$rev"
+}
+cmd_review_request() {
+  local coder=${1:?usage: fleet review-request <coder> <bean> [reviewer]} bean=${2:?usage: fleet review-request <coder> <bean> [reviewer]} rev
+  rev=$(review_request_reviewer "$coder" "$bean" "${3:-}") || return $?
+  cmd_review "$coder" "$rev" "$bean" || return $?
+  log review-request "$coder" "$(kind_of "$coder")" coder "$bean" "reviewer=$rev"
+}
 cmd_finish() {
   local kind
   kind=$(kind_of "$1") || exit 2
@@ -1042,7 +1069,7 @@ PY
 # directory creation, ledger writes, file writes, signals, worktrees, keys, or prompts.
 has_preview() {
   case $1 in
-    assign|review|land|rm|sync|send|followup|up|finish|cancel|task|note|keys|stale|rules) return 0 ;;
+    assign|review|review-request|land|rm|sync|send|followup|up|finish|cancel|task|note|keys|stale|rules) return 0 ;;
     models) [ "${2:-}" = --report ];;
     *) return 1 ;;
   esac
@@ -1082,6 +1109,8 @@ if [ "$FLEET_DRY_RUN" = 1 ]; then
   case "${1:-}" in
     assign)   preview_assign "$2" "${3:-}" "${4:-}" ;;
     review)   preview_review "$2" "${3:-}" "${4:-}" ;;
+    review-request) rev=$(review_request_reviewer "${2:?usage: fleet review-request <coder> <bean> [reviewer]}" "${3:?usage: fleet review-request <coder> <bean> [reviewer]}" "${4:-}") || exit $?
+              preview_review "$2" "$rev" "$3" ;;
     land)     preview "$2" "" "fleet/$2" "merge fleet/$2 into main" ;;
     rm)       preview "$2" "" "fleet/$2" "rm workspace" ;;
     sync)
@@ -1116,6 +1145,7 @@ case "${1:-}" in
   up)      shift; cmd_up "$@" ;;
   assign)  cmd_assign "$2" "${3:-}" "${4:-}" ;;
   review)  cmd_review "$2" "${3:-}" "${4:-}" ;;
+  review-request) cmd_review_request "${2:-}" "${3:-}" "${4:-}" ;;
   finish)  cmd_finish "$2" "${3:-}" ;;
   note)    log note lead claude lead - "$2"; echo "noted" ;;
   followup)

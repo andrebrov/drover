@@ -11,6 +11,9 @@ Owns implementation and its tests, on branch `fleet/<name>-<bean>`, against one 
 - Announce with `fleet-done <name> <bean> DONE|BLOCKED|CHANGES "<one line>" <report> --check build=<exit> --check test=<exit> [--sha <sha> --status landed]`. Pass the REAL exit codes of what you ran: DONE without a passing build and test check, a failing check, or a landed claim whose sha is not an ancestor of the main branch is announced as PARTIAL with the reason.
 - `--status` is one of: started implemented review-pass review-fail blocked-access needs-human failed landed.
 
+## Getting a review
+- At REVIEW-READY run `fleet review-request <you> <bean>`: a free reviewer on a different harness, recorded in the ledger. Never ask the lead to route it.
+
 ## Asking the lead
 - Never ask in the TUI: a keystroke answer can hit the wrong pane. Run `fleet-ask <you> <bean> "<question>" [option ...]`, note the id, and END YOUR TURN. The lead answers with `fleet-answer`; you are woken by a prompt carrying the decision, which is also appended to the bean. One answer per question; do not re-ask.
 

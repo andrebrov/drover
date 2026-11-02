@@ -330,7 +330,7 @@ values as `${VAR:-value}` so an environment variable still wins. See [`examples/
 | `FLEET_TICK` | `60` | Watcher tick, seconds. |
 | `DROVER_YOLO` | `1` | Launch seats with the harness's approval-bypass flag. `0` makes every seat stop at permission prompts (and stop being unattended). |
 | `DROVER_SWEEP_SCRATCHPADS` | `0` | Let `fleet-sweep` delete stale >= 50 MB dirs inside Claude Code scratchpads. Only on a machine where every session is a seat. |
-| `FLEET_OPENCODE_MODEL`, `FLEET_CLAUDE_MODEL`, `FLEET_AGY_MODEL` | harness default | Spawn-time model pins. |
+| `FLEET_CLAUDE_MODEL`, `FLEET_AGY_MODEL` | harness default | Spawn-time model pins. OpenCode v2 rejects `--model`: pin its model in OpenCode's own config. |
 | `DROVER_MIGRATIONS_DIR` | — (required for `fleet-mignum`) | Where migration files live, relative to `DROVER_REPO`. No safe generic default. |
 | `DROVER_PROD_LOG_GROUP`, `DROVER_PROD_LOG_REGION` | empty | Optional: a production log group `fleet-observe` checks hourly for post-deploy errors. Unset = that check is skipped entirely. |
 | `FLEET_MCP_LEAK_PATTERN`, `FLEET_MCP_LEAK_MAX_MB` | empty | Optional: `fleet-alert heartbeat` flags an MCP server process matching this pattern (ERE) once its RSS exceeds the cap. Unset pattern = no-op; verify the pattern's HEALTHY footprint before setting the cap, or it flags every healthy instance (see `docs/LESSONS.md`, "Every instrument ships with its own known-bad and known-good case"). |

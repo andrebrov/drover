@@ -38,7 +38,7 @@ ONLY = [a for a in sys.argv[1:] if not a.startswith('--')]
 
 FLAG = {  # must match agent_args() in fleet
     'claude': ['--dangerously-skip-permissions'],
-    'codex': ['--dangerously-bypass-approvals-and-sandbox'],
+    'codex': ['--dangerously-bypass-approvals-and-sandbox', '-c', 'tools.experimental_request_user_input.enabled=false'],  # no blocking question box
     'opencode': ['--auto'],
     'cursor': ['--yolo', '--approve-mcps', '--trust'],
     'grok': ['--always-approve'],
@@ -221,10 +221,11 @@ def restart(name, kind, pane, pid, cmd):
         resume = ['--continue']
     else:
         resume = []
-    # Preserve the seat's own --model across the restart unless --model=... overrides it. opencode
-    # has no model flag on a bare relaunch either way, so it falls back to the spawn-time default.
+    # Preserve the seat's own --model across the restart unless --model=... overrides it.
     mm = re.search(r'--model[= ](\S+)', cmd)
-    model = MODEL or (mm.group(1) if mm else None) or SEAT_MODEL.get(name) or (kind == 'opencode' and os.environ.get('FLEET_OPENCODE_MODEL')) or None
+    model = MODEL or (mm.group(1) if mm else None) or SEAT_MODEL.get(name) or None
+    if kind == 'opencode':
+        model = None   # opencode v2 rejects --model ("Unrecognized flag"); its pin lives in opencode's own config
     args = FLAG[kind] + resume + (['--model', model] if model else [])
     if DRY:
         log(f'  WOULD RESTART {name} ({kind}, {pane}) with: {" ".join(args)}')
