@@ -1450,3 +1450,12 @@ A scoreboard is not a file-presence check. Its writer publishes payload, complet
 Help must exit before configuration, credential or network access. Installation must check every destination before writing any; an unknown installed-only patch is a reconciliation problem, not a reason to add a force bypass. Keep hooks in source, not in runtime text replacements.
 
 A main monitor publishes the revision it actually evaluated before looking at newer main. A missing fixture lease is UNAVAILABLE; a failing green base cannot identify a new code culprit. Run timeout children in an owned process group and reap the group before releasing its lease. Keep branch/ref strings in argv, never in evaluated shell text.
+
+## Push admission is a queue, not a lottery (2026-11-01)
+Every push waiter polled the free push slots once a second, so whichever woke first took a freed slot. Over three days
+of one fleet's slot log the median wait was small but p90 was about an hour and the worst wait about three hours: a push
+could lose the race to later arrivals indefinitely. Now each push waiter takes a numbered ticket under a short admission
+lock and only the queue head may try a slot; the admission lock is released before the gate runs, so the configured
+number of push gates still run in parallel. Liveness is the ticket's own flock, not its PID: a stopped waiter keeps its
+turn, a killed one is skipped, and a reused PID cannot keep an abandoned ticket alive. Fairness does not shorten a gate
+or bound waits under sustained overload; measure the wait distribution again after a day before claiming an improvement.

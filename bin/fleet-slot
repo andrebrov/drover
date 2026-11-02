@@ -18,7 +18,8 @@ gates that pass alone start going red. 0 means no push limit at all: every gate 
 (see docs/LESSONS.md, "Pushes stay parallel; a lost race is fixed in the gate").
 FLEET_HEAVY_SLOTS (default 2): general slots 2..N, so the default is ONE general job (slot 1 was once the
 single push slot). Default maximum concurrency is therefore FOUR: three push gates plus one general run. Jobs in the
-same pool wait for each other. 0 disables the limiter.
+same pool wait for each other. 0 disables the limiter. Push waiters take FIFO tickets (push-queue/), so admission
+follows arrival order; a dead waiter's ticket is skipped by kernel lock liveness.
 
 A child started by `run` gets FLEET_SLOT_HELD=<slot>; a nested `fleet-slot run` sees it and runs directly,
 so a gate that calls a script that also takes a slot never deadlocks waiting on itself.
@@ -86,24 +87,84 @@ def slots(push):
     return [f'p{i}' for i in range(1, P + 1)] if push else list(range(2, N + 1))
 
 
-def acquire(push):
-    os.makedirs(DIR, exist_ok=True)
-    start, said = time.time(), 0
-    while True:
-        for i in slots(push):
-            fd = os.open(os.path.join(DIR, f'slot-{i}.lock'), os.O_RDWR | os.O_CREAT, 0o644)
+def push_queue_head(queue, ticket):
+    """Called under the admission lock. A ticket whose flock is held belongs to a live waiter, even a stopped one;
+    unlike PID metadata this cannot mistake a reused PID for an abandoned waiter. A crash releases the ticket's
+    flock, and the next waiter removes that abandoned ticket."""
+    for name in sorted(n for n in os.listdir(queue) if n.endswith('.ticket')):
+        path = os.path.join(queue, name)
+        if path == ticket:
+            return True
+        fd = os.open(path, os.O_RDWR)
+        try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                os.ftruncate(fd, 0)
-                os.write(fd, f'{os.getpid()} {int(time.time())}\n'.encode())
-                log('acquire', slot=i, waited=int(time.time() - start), push=push)
-                return fd, i
             except BlockingIOError:
-                os.close(fd)
-        if time.time() - start >= said + 30:
-            said += 30
-            print(f'[fleet-slot] waiting for a {"push" if push else "heavy-run"} slot ({said}s)', file=sys.stderr, flush=True)
-        time.sleep(1)
+                return False
+            os.unlink(path)
+        finally:
+            os.close(fd)
+    return False
+
+
+def acquire(push):
+    """Push waiters are admitted in arrival order: each takes a numbered ticket and only the queue head may try a
+    slot. Without it, admission was a lottery in which one push waited far longer than any other."""
+    os.makedirs(DIR, exist_ok=True)
+    start, said = time.monotonic(), 0
+    queue = queue_fd = ticket_fd = ticket = None
+    try:
+        if push:
+            queue = os.path.join(DIR, 'push-queue')
+            os.makedirs(queue, exist_ok=True)
+            queue_fd = os.open(os.path.join(queue, 'admission.lock'), os.O_RDWR | os.O_CREAT, 0o644)
+            fcntl.flock(queue_fd, fcntl.LOCK_EX)
+            try:   # allocate under the lock: independent of wall-clock changes and PID order
+                numbers = [int(n[:-7]) for n in os.listdir(queue) if n.endswith('.ticket')]
+                ticket = os.path.join(queue, f'{max(numbers, default=0) + 1:020d}.ticket')
+                ticket_fd = os.open(ticket, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+                fcntl.flock(ticket_fd, fcntl.LOCK_EX)
+                os.write(ticket_fd, f'{os.getpid()}\n'.encode())
+            finally:
+                fcntl.flock(queue_fd, fcntl.LOCK_UN)
+        while True:
+            if queue_fd is not None:
+                fcntl.flock(queue_fd, fcntl.LOCK_EX)
+            try:
+                # Only the head tries a slot. Admission is released before the child runs, so successive heads
+                # still fill every free push slot in parallel.
+                eligible = not push or push_queue_head(queue, ticket)
+                for i in slots(push) if eligible else ():
+                    fd = os.open(os.path.join(DIR, f'slot-{i}.lock'), os.O_RDWR | os.O_CREAT, 0o644)
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        os.close(fd)
+                        continue
+                    try:
+                        os.ftruncate(fd, 0)
+                        os.write(fd, f'{os.getpid()} {int(time.time())}\n'.encode())
+                        log('acquire', slot=i, waited=int(time.monotonic() - start), push=push)
+                        return fd, i
+                    except BaseException:
+                        os.close(fd)
+                        raise
+            finally:
+                if queue_fd is not None:
+                    fcntl.flock(queue_fd, fcntl.LOCK_UN)
+            if time.monotonic() - start >= said + 30:
+                said += 30
+                print(f'[fleet-slot] waiting for a {"push" if push else "heavy-run"} slot ({said}s)', file=sys.stderr, flush=True)
+            time.sleep(1)
+    finally:
+        if queue_fd is not None:
+            try:
+                fcntl.flock(queue_fd, fcntl.LOCK_EX)
+                if ticket_fd is not None:
+                    os.unlink(ticket)
+                    os.close(ticket_fd)
+            finally:
+                os.close(queue_fd)
 
 
 def busy(i):
